@@ -147,14 +147,23 @@ lifetime.
 
 ## The `no-gc` build
 
-clojurust can also be built with the `no-gc` Cargo feature, which removes the
-tracing GC entirely and makes regions the *only* allocator. In that mode every
-function call and every `loop` iteration pushes a scratch region that is freed
-when the scope exits, return values are evaluated in the caller's region, and
-program-lifetime values (from `def`, `defn`, `atom`, and friends) live in a
-global static arena. This trades the GC's generality for zero collection pauses
-and is documented separately; the default distribution ships with the GC
-enabled.
+The `no-gc` Cargo feature disables tracing collection. Calls and loop iterations
+use scratch regions. Returned values retain their backing storage through
+ownership leases. Replaced values release that ownership after their last reader.
+This configuration is currently experimental and may panic.
+
+Namespace and Var containers use program storage. Their current payloads have
+replaceable leases. Immutable definition data and metadata use compact arenas.
+Function and mutable-cell roots use separate small regions. Relocation preserves
+Clojure identity and shared aliases. Opaque captures can retain unrelated
+allocations in the same source region.
+
+Rust callers use a read scope while borrowing managed values. Owning snapshots
+remain valid across cell replacement. Discarded source results, transient writes,
+and asynchronous tasks have explicit ownership boundaries.
+
+This build has no collection pauses. The default distribution includes the
+tracing collector. The no-GC AOT compiler retains its existing escape restrictions.
 
 ## See also
 

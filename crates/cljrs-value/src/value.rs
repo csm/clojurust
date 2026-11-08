@@ -13,7 +13,7 @@ use crate::hash::{
 use crate::keyword::Keyword;
 use crate::regex::{Matcher, Pattern};
 use crate::resource::ResourceHandle;
-use crate::shared::SharedAtom;
+use crate::shared::{ByteBlob, SharedAtom};
 use crate::symbol::Symbol;
 use crate::types::{
     Agent, Atom, BoundFn, CljxCons, CljxFn, CljxFuture, CljxPromise, Delay, LazySeq, MultiFn,
@@ -33,13 +33,29 @@ impl ObjectArray {
     }
 }
 
+impl Drop for ObjectArray {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
+    }
+}
 impl Trace for ObjectArray {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        for (index, value) in self.0.lock().unwrap().iter().enumerate() {
+            let lease = cljrs_gc::region::RegionLease::for_value(value);
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                index,
+                &lease,
+            );
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut MarkVisitor) {
-        {
-            let guard = self.0.lock().unwrap();
-            for v in guard.iter() {
-                v.trace(visitor);
-            }
+        for value in self.0.lock().unwrap().iter() {
+            value.trace(visitor);
         }
     }
 
@@ -53,7 +69,7 @@ impl Trace for ObjectArray {
 ///
 /// UUID equality is value-based, while `identical?` compares the containing
 /// `GcPtr`; keeping the bits in a traced leaf provides both semantics.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UuidValue(pub u128);
 
 impl Trace for UuidValue {
@@ -118,17 +134,17 @@ pub enum Value {
     // ── Mutable state ─────────────────────────────────────────────────────────
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
-    /// Cross-isolate mutable reference backed by `Arc<ArcSwap<SharedValue>>`.
+    /// Cross-isolate mutable reference backed by `Arc<ArcSwap<SharedSlot>>`.
     /// Unlike `Atom`, a `SharedAtom` can cross the isolate boundary (the `Arc`
     /// is cloned, not deep-copied) and its contents are lock-free CAS-swapped.
     SharedAtom(std::sync::Arc<SharedAtom>),
     /// Immutable refcounted byte buffer (the BEAM off-heap-binary trick).
     /// Shared without copy across the isolate boundary; refcount drops to zero
     /// only when every isolate releases its reference.
-    ByteBlob(std::sync::Arc<[u8]>),
+    ByteBlob(std::sync::Arc<ByteBlob>),
 
     // ── Reduced (early termination sentinel for reduce/transduce) ───────────
-    Reduced(Box<Value>),
+    Reduced(Arc<Value>),
 
     // ── Other ─────────────────────────────────────────────────────────────────
     Namespace(GcPtr<Namespace>),
@@ -162,7 +178,7 @@ pub enum Value {
 
     // ── Metadata wrapper ─────────────────────────────────────────────────────
     /// A value with attached metadata. Transparent for equality, hashing, display.
-    WithMeta(Box<Value>, Box<Value>),
+    WithMeta(Arc<Value>, Arc<Value>),
 
     // Errors
     Error(GcPtr<ExceptionInfo>),
@@ -375,6 +391,7 @@ impl Eq for Value {}
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        crate::realization::check_stack();
         // Strip metadata — it is ignored for equality in Clojure.
         if let Value::WithMeta(inner, _) = self {
             return inner.as_ref() == other;
@@ -400,14 +417,14 @@ impl PartialEq for Value {
         // A lazy-seq that realizes to nil is an empty sequence, which is equal
         // to both nil and any empty sequential collection (matching Clojure).
         if let Value::LazySeq(ls) = self {
-            let realized = ls.get().realize();
+            let realized = crate::realization::for_trait(ls.get());
             if realized == Value::Nil && other.is_sequential() {
                 return value_to_seq_vec(other).is_empty();
             }
             return realized == *other;
         }
         if let Value::LazySeq(ls) = other {
-            let realized = ls.get().realize();
+            let realized = crate::realization::for_trait(ls.get());
             if realized == Value::Nil && self.is_sequential() {
                 return value_to_seq_vec(self).is_empty();
             }
@@ -550,7 +567,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
     // Iteratively unwrap lazy seqs.
     let mut v = v.clone();
     while let Value::LazySeq(ls) = &v {
-        v = ls.get().realize();
+        v = crate::realization::for_trait(ls.get());
     }
     match &v {
         Value::List(l) => l.get().iter().cloned().collect(),
@@ -571,7 +588,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
                         tail = next_c.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        tail = ls.get().realize();
+                        tail = crate::realization::for_trait(ls.get());
                     }
                     _ => break,
                 }
@@ -586,6 +603,7 @@ fn value_to_seq_vec(v: &Value) -> Vec<Value> {
 
 impl ClojureHash for Value {
     fn clojure_hash(&self) -> u32 {
+        crate::realization::check_stack();
         match self {
             Value::WithMeta(inner, _) => inner.clojure_hash(),
             Value::Reduced(inner) => inner.clojure_hash(),
@@ -743,11 +761,8 @@ impl ClojureHash for Value {
                 h
             }
             Value::ObjectArray(a) => {
-                let mut h: u32 = 0;
-                for item in a.get().0.lock().unwrap().iter() {
-                    h = hash_combine_ordered(h, item.clojure_hash())
-                }
-                h
+                let values = a.get().0.lock().unwrap().clone();
+                crate::collections::hash_values(values)
             }
 
             Value::SharedAtom(a) => Arc::as_ptr(a) as u32,
@@ -776,7 +791,7 @@ impl ClojureHash for Value {
             Value::Macro(f) => f.get() as *const _ as u32,
             Value::BigDecimal(d) => hash_string(&d.get().to_string()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
-            Value::LazySeq(ls) => ls.get().realize().clojure_hash(),
+            Value::LazySeq(ls) => crate::realization::for_trait(ls.get()).clojure_hash(),
             Value::Protocol(p) => p.get() as *const _ as u32,
             Value::ProtocolFn(pf) => pf.get() as *const _ as u32,
             Value::MultiFn(mf) => mf.get() as *const _ as u32,
@@ -823,6 +838,8 @@ impl std::hash::Hash for Value {
 impl fmt::Display for Value {
     /// Prints in `pr-str` style (readable): strings are quoted, chars use `\` notation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "no-gc")]
+        let _reads = cljrs_gc::region::ReadScope::enter();
         pr_str(self, f, true)
     }
 }
@@ -832,12 +849,15 @@ pub struct PrintValue<'a>(pub &'a Value);
 
 impl fmt::Display for PrintValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(feature = "no-gc")]
+        let _reads = cljrs_gc::region::ReadScope::enter();
         pr_str(self.0, f, false)
     }
 }
 
 /// Print a value.  `readably = true` quotes strings and escapes chars.
 pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Result {
+    crate::realization::check_stack();
     match v {
         Value::WithMeta(inner, _) => pr_str(inner, f, readably),
         Value::Reduced(inner) => {
@@ -1022,7 +1042,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
             }
             write!(f, ")")
         }
-        Value::LazySeq(ls) => pr_str(&ls.get().realize(), f, readably),
+        Value::LazySeq(ls) => pr_str(&crate::realization::for_trait(ls.get()), f, readably),
         Value::Cons(c) => {
             write!(f, "(")?;
             pr_str(&c.get().head, f, readably)?;
@@ -1043,7 +1063,7 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
                         tail = next_c.get().tail.clone();
                     }
                     Value::LazySeq(ls) => {
-                        tail = ls.get().realize();
+                        tail = crate::realization::for_trait(ls.get());
                     }
                     other => {
                         write!(f, " . ")?;
@@ -1125,6 +1145,85 @@ pub fn pr_str(v: &Value, f: &mut fmt::Formatter<'_>, readably: bool) -> fmt::Res
 // ── Keyword-argument rest normalization ──────────────────────────────────────
 
 impl Value {
+    /// Compare Clojure object identity across execution tiers.
+    pub fn identical(&self, other: &Value) -> bool {
+        macro_rules! peq {
+            ($a:expr, $b:expr) => {
+                GcPtr::identity_eq($a, $b)
+            };
+        }
+        match (self, other) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Long(a), Value::Long(b)) => a == b,
+            (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+            (Value::Char(a), Value::Char(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => GcPtr::identity_eq(a, b),
+            (Value::BigInt(a), Value::BigInt(b)) => GcPtr::identity_eq(a, b),
+            (Value::BigDecimal(a), Value::BigDecimal(b)) => GcPtr::identity_eq(a, b),
+            (Value::Ratio(a), Value::Ratio(b)) => GcPtr::identity_eq(a, b),
+            (Value::Str(a), Value::Str(b)) => GcPtr::identity_eq(a, b),
+            (Value::Symbol(a), Value::Symbol(b)) => GcPtr::identity_eq(a, b),
+            (Value::Keyword(a), Value::Keyword(b)) => a.get() == b.get(),
+            (Value::List(a), Value::List(b)) => peq!(a, b),
+            (Value::Vector(a), Value::Vector(b)) => peq!(a, b),
+            (Value::Map(a), Value::Map(b)) => match (a, b) {
+                (MapValue::Array(a), MapValue::Array(b)) => peq!(a, b),
+                (MapValue::Hash(a), MapValue::Hash(b)) => peq!(a, b),
+                (MapValue::Sorted(a), MapValue::Sorted(b)) => peq!(a, b),
+                _ => false,
+            },
+            (Value::Set(a), Value::Set(b)) => match (a, b) {
+                (SetValue::Hash(a), SetValue::Hash(b)) => peq!(a, b),
+                (SetValue::Sorted(a), SetValue::Sorted(b)) => peq!(a, b),
+                _ => false,
+            },
+            (Value::Queue(a), Value::Queue(b)) => peq!(a, b),
+            (Value::NativeFunction(a), Value::NativeFunction(b)) => peq!(a, b),
+            (Value::Fn(a), Value::Fn(b)) => peq!(a, b),
+            (Value::Macro(a), Value::Macro(b)) => peq!(a, b),
+            (Value::Var(a), Value::Var(b)) => peq!(a, b),
+            (Value::Atom(a), Value::Atom(b)) => peq!(a, b),
+            (Value::Namespace(a), Value::Namespace(b)) => peq!(a, b),
+            (Value::LazySeq(a), Value::LazySeq(b)) => peq!(a, b),
+            (Value::Cons(a), Value::Cons(b)) => peq!(a, b),
+            (Value::Protocol(a), Value::Protocol(b)) => peq!(a, b),
+            (Value::ProtocolFn(a), Value::ProtocolFn(b)) => peq!(a, b),
+            (Value::MultiFn(a), Value::MultiFn(b)) => peq!(a, b),
+            (Value::Volatile(a), Value::Volatile(b)) => peq!(a, b),
+            (Value::Delay(a), Value::Delay(b)) => peq!(a, b),
+            (Value::Promise(a), Value::Promise(b)) => peq!(a, b),
+            (Value::Future(a), Value::Future(b)) => peq!(a, b),
+            (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
+            (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
+            (Value::NativeObject(a), Value::NativeObject(b)) => peq!(a, b),
+            (Value::BoundFn(a), Value::BoundFn(b)) => peq!(a, b),
+            (Value::ObjectArray(a), Value::ObjectArray(b)) => peq!(a, b),
+            (Value::IntArray(a), Value::IntArray(b)) => peq!(a, b),
+            (Value::LongArray(a), Value::LongArray(b)) => peq!(a, b),
+            (Value::ShortArray(a), Value::ShortArray(b)) => peq!(a, b),
+            (Value::ByteArray(a), Value::ByteArray(b)) => peq!(a, b),
+            (Value::FloatArray(a), Value::FloatArray(b)) => peq!(a, b),
+            (Value::DoubleArray(a), Value::DoubleArray(b)) => peq!(a, b),
+            (Value::BooleanArray(a), Value::BooleanArray(b)) => peq!(a, b),
+            (Value::CharArray(a), Value::CharArray(b)) => peq!(a, b),
+            (Value::TransientMap(a), Value::TransientMap(b)) => peq!(a, b),
+            (Value::TransientSet(a), Value::TransientSet(b)) => peq!(a, b),
+            (Value::TransientVector(a), Value::TransientVector(b)) => peq!(a, b),
+            (Value::Error(a), Value::Error(b)) => peq!(a, b),
+            (Value::Pattern(a), Value::Pattern(b)) => peq!(a, b),
+            (Value::Matcher(a), Value::Matcher(b)) => peq!(a, b),
+            (Value::SharedAtom(a), Value::SharedAtom(b)) => Arc::ptr_eq(a, b),
+            (Value::ByteBlob(a), Value::ByteBlob(b)) => Arc::ptr_eq(a, b),
+            (Value::Resource(a), Value::Resource(b)) => Arc::ptr_eq(&a.0, &b.0),
+            (Value::Reduced(a), Value::Reduced(b)) => Arc::ptr_eq(a, b),
+            (Value::WithMeta(a, am), Value::WithMeta(b, bm)) => {
+                Arc::ptr_eq(a, b) && Arc::ptr_eq(am, bm)
+            }
+            _ => false,
+        }
+    }
+
     /// Normalize a variadic rest sequence into the value a *map-shaped* rest
     /// pattern (`[& {:keys [a b]}]`) destructures against.
     ///
@@ -1197,8 +1296,8 @@ impl Value {
     /// Return a new value with metadata attached.
     pub fn with_meta(self, meta: Value) -> Value {
         match self {
-            Value::WithMeta(inner, _) => Value::WithMeta(inner, Box::new(meta)),
-            other => Value::WithMeta(Box::new(other), Box::new(meta)),
+            Value::WithMeta(inner, _) => Value::WithMeta(inner, Arc::new(meta)),
+            other => Value::WithMeta(Arc::new(other), Arc::new(meta)),
         }
     }
 }
@@ -1327,6 +1426,10 @@ impl Value {
 }
 
 impl cljrs_gc::Trace for Value {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         match self {
@@ -1650,6 +1753,7 @@ impl PartialOrd for Value {
 
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
+        crate::realization::check_stack();
         // Strip metadata for comparison.
         let a = self.unwrap_meta();
         let b = other.unwrap_meta();

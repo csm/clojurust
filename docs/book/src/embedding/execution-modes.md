@@ -100,7 +100,6 @@ set_osr_threshold(5_000);  // loop iterations before on-stack replacement
 | `CLJRS_OSR_THRESHOLD` | Loop iterations before on-stack replacement. |
 | `CLJRS_EAGER_LOWER=1` | Lower every function at definition time instead of when it gets hot. Expensive; useful for reproducing lowering bugs. |
 | `CLJRS_IR_CACHE_TTL` | Seconds an idle lowered arity survives before the cold-IR sweep drops it (default 600). |
-| `CLJRS_NO_ASYNC_JIT` | Disables JIT compilation of `^:async` function bodies. |
 
 The programmatic setters take precedence over the environment variables, which
 in turn override the defaults. Note that `CLJRS_NO_JIT` is read by the **CLI**,

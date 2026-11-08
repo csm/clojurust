@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_runtime::env::error::EvalError;
@@ -152,10 +152,39 @@ fn isolate_take_resolves_a_put_value() {
         // Stash the channel ends in vars so both forms see the same channel.
         eval_sync("(def ch (isolate-chan))", &mut env);
         eval_sync("(isolate-put! (first ch) [:hello 99])", &mut env);
-        let r = eval_async(&parse_one("(await (isolate-take! (second ch)))"), &mut env)
+        let r = eval_form_unrooted(&parse_one("(await (isolate-take! (second ch)))"), &mut env)
             .await
             .unwrap();
         let expected = eval_sync("[:hello 99]", &mut env);
         assert_eq!(r, expected);
+    });
+}
+
+#[test]
+fn byte_limited_channel_reports_full_at_put_site() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = user_env(globals);
+        let err = try_eval(
+            "(let [[tx _] (isolate-chan 300)]
+               (isolate-put! tx (apply str (repeat 200 \"x\")))
+               (isolate-put! tx (apply str (repeat 200 \"x\"))))",
+            &mut env,
+        )
+        .expect_err("the second message does not fit");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("isolate channel is full"), "got: {msg}");
+
+        let v = eval_sync(
+            "(let [[tx rx] (isolate-chan 300)]
+               (isolate-put! tx (apply str (repeat 200 \"x\")))
+               (isolate-poll! rx)
+               (isolate-put! tx 1))",
+            &mut env,
+        );
+        assert_eq!(v, Value::Bool(true), "a receive frees capacity");
+
+        let err = try_eval("(isolate-chan 0)", &mut env).expect_err("zero limit");
+        assert!(format!("{err:?}").contains("must be positive"));
     });
 }

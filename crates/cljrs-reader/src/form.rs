@@ -1,20 +1,50 @@
 use std::mem;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cljrs_types::span::Span;
 
 /// A parsed Clojure form with its source location.
 ///
-/// `PartialEq` ignores spans so test assertions can compare forms without
-/// constructing exact span values.
-#[derive(Debug, Clone)]
+/// `PartialEq` ignores spans (and the expansion cache) so test assertions can
+/// compare forms without constructing exact span values.
+#[derive(Debug)]
 pub struct Form {
     pub kind: FormKind,
     pub span: Span,
+    /// Memoized macro expansion of this form when it is a macro call site.
+    ///
+    /// Owned by the form so it lives exactly as long as the call site does:
+    /// a function body or `loop` that evaluates the same form repeatedly
+    /// expands its macros once, while a freshly read form (a new REPL input)
+    /// always starts empty. See [`ExpansionCache`].
+    pub expansion: ExpansionCache,
+}
+
+impl Clone for Form {
+    fn clone(&self) -> Self {
+        // Only a list can be a macro call site. Its clones share one cache
+        // slot: `(fn ...)` copies its body into every closure it creates, and
+        // an expansion made while running one closure must serve the next.
+        let expansion = if matches!(self.kind, FormKind::List(_)) {
+            self.expansion.share()
+        } else {
+            ExpansionCache::default()
+        };
+        Self {
+            kind: self.kind.clone(),
+            span: self.span.clone(),
+            expansion,
+        }
+    }
 }
 
 impl Form {
     pub fn new(kind: FormKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            kind,
+            span,
+            expansion: ExpansionCache::default(),
+        }
     }
 
     /// Total heap bytes owned by this form tree (excluding the `Form` itself).
@@ -298,6 +328,92 @@ impl PartialEq for Form {
     }
 }
 
+// ── Macro-expansion cache ─────────────────────────────────────────────────────
+
+/// One memoized macro expansion: valid while the call site resolves to the
+/// same macro (`macro_id`) and is evaluated in the same namespace (`ns`).
+#[derive(Debug)]
+pub struct CachedExpansion {
+    /// Identity of the macro function that produced `form` (its first arity's
+    /// process-unique id). Redefining the macro mints a new id, so a stale
+    /// expansion is never reused.
+    pub macro_id: u64,
+    /// Namespace the call site was expanded in; `::kw` and syntax-quote
+    /// resolution depend on it.
+    pub ns: Arc<str>,
+    /// The expansion. Held in an `Arc` so its own nested call sites keep a
+    /// stable address and therefore their own caches across evaluations.
+    pub form: Arc<Form>,
+}
+
+/// Per-call-site slot holding the last macro expansion of a [`Form`].
+///
+/// The tree-walking evaluator otherwise re-expands every macro call on every
+/// evaluation (converting the forms to values, running the macro, converting
+/// the result back), which dominated the cost of e.g. a `when` inside a hot
+/// `loop`. Clojure itself expands each call site once, at compile time, so
+/// reusing the expansion matches its semantics.
+///
+/// Clones of a list form share the slot (see `Form::clone`), so a function
+/// body copied into many closures expands each call site once in total. The
+/// shared cell is allocated lazily, on first store or first clone, so a form
+/// that is parsed and evaluated once pays nothing beyond an empty word.
+///
+/// A form whose `kind` is mutated in place after cloning must not be
+/// evaluated as a macro call afterwards, since it would share its source's
+/// expansion; no evaluator path does this (rewrites build fresh forms).
+#[derive(Default)]
+pub struct ExpansionCache(OnceLock<Arc<ExpansionSlot>>);
+
+type ExpansionSlot = Mutex<Option<Arc<CachedExpansion>>>;
+
+impl ExpansionCache {
+    /// The cached expansion, if one was made by `macro_id` in `ns`.
+    pub fn get(&self, macro_id: u64, ns: &str) -> Option<Arc<Form>> {
+        let slot = self.0.get()?.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_ref() {
+            Some(c) if c.macro_id == macro_id && c.ns.as_ref() == ns => Some(c.form.clone()),
+            _ => None,
+        }
+    }
+
+    /// Record `form` as the expansion made by `macro_id` in `ns`, replacing
+    /// any previous entry. Returns the stored `Arc` so the caller evaluates
+    /// the very form the cache holds.
+    pub fn store(&self, macro_id: u64, ns: Arc<str>, form: Form) -> Arc<Form> {
+        let form = Arc::new(form);
+        let entry = Arc::new(CachedExpansion {
+            macro_id,
+            ns,
+            form: form.clone(),
+        });
+        *self.slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+        form
+    }
+
+    /// Drop any cached expansion (for every form sharing this slot).
+    pub fn clear(&self) {
+        if let Some(slot) = self.0.get() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// A handle to the same slot, for a clone of the owning form.
+    fn share(&self) -> Self {
+        Self(OnceLock::from(self.slot().clone()))
+    }
+
+    fn slot(&self) -> &Arc<ExpansionSlot> {
+        self.0.get_or_init(Default::default)
+    }
+}
+
+impl std::fmt::Debug for ExpansionCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExpansionCache")
+    }
+}
+
 /// The payload of a `Form` node.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FormKind {
@@ -365,4 +481,54 @@ pub enum FormKind {
 
 fn vec_heap_size(forms: &[Form]) -> usize {
     mem::size_of_val(forms) + forms.iter().map(|f| f.heap_size()).sum::<usize>()
+}
+
+#[cfg(test)]
+mod expansion_cache_tests {
+    use super::*;
+
+    fn span() -> Span {
+        Span::new(Arc::new("<t>".to_string()), 0, 0, 1, 1)
+    }
+
+    fn list() -> Form {
+        Form::new(
+            FormKind::List(vec![Form::new(FormKind::Symbol("m".into()), span())]),
+            span(),
+        )
+    }
+
+    #[test]
+    fn empty_until_stored() {
+        assert!(list().expansion.get(1, "user").is_none());
+    }
+
+    #[test]
+    fn hit_requires_same_macro_and_namespace() {
+        let site = list();
+        site.expansion
+            .store(7, Arc::from("user"), Form::new(FormKind::Int(1), span()));
+        assert!(site.expansion.get(7, "user").is_some());
+        assert!(site.expansion.get(8, "user").is_none());
+        assert!(site.expansion.get(7, "other").is_none());
+    }
+
+    #[test]
+    fn clones_of_a_list_share_the_slot() {
+        let site = list();
+        let copy = site.clone();
+        copy.expansion
+            .store(7, Arc::from("user"), Form::new(FormKind::Int(1), span()));
+        assert!(site.expansion.get(7, "user").is_some());
+        site.expansion.clear();
+        assert!(copy.expansion.get(7, "user").is_none());
+    }
+
+    #[test]
+    fn non_list_clones_do_not_allocate_a_slot() {
+        let sym = Form::new(FormKind::Symbol("x".into()), span());
+        let copy = sym.clone();
+        assert!(sym.expansion.0.get().is_none());
+        assert!(copy.expansion.0.get().is_none());
+    }
 }

@@ -11,8 +11,11 @@ fixed **64 MB** soft limit instead of consulting total system RAM.
 raw-pointer implementation) — implemented.  `no-gc` mode (Phases 1–8 of
 `docs/archive/no-gc-plan.md`) — implemented.  B3 (`StaticGcPtr`, `static_alloc`) —
 implemented.  Process memory governor
-(`docs/managed-memory-governor-plan.md`) — Phases 0–2 (observe-only
-accounting with chunked allocation credit) implemented.
+(`docs/managed-memory-governor-plan.md`) — Phases 0–5 (chunked allocation
+credit; region, shared-value, message-queue, static, and code memory;
+fallible allocation and opt-in strict hard-limit admission; allocation-rate
+collection targets; separate cross-isolate request epoch; Linux cgroup v2
+soft-limit; RSS emergency pressure signal; load-shedding hooks) implemented.
 
 ---
 
@@ -34,14 +37,13 @@ stack as a root (`region::trace_active_regions`), so heap objects reachable
 only through a live region are still kept alive.  `GcPtr::raw()` masks the tag
 on every dereference; `GcPtr::is_region_alloc()` exposes it.
 
-**`no-gc` build:** every function call and every `loop` iteration pushes a
-scratch `Region`; intermediates are freed when the scope exits.  Return values
-and `recur` arguments are evaluated in the caller's context (the
-"return-expression-in-caller" mechanism).  Static-sink expressions (`def`,
-`defn`, `defmacro`, `atom`, `agent`, `volatile!`, `reset!`, `vreset!`,
-`swap!`, `vswap!`, `alter-var-root`, `intern`) go to the global `StaticArena`
-and live for the program lifetime.
-No `GcHeap`, no stop-the-world pauses, no `Trace` overhead at runtime.
+**`no-gc` build:** every function call and every `loop` iteration pushes a scratch `Region`.
+The evaluator transfers ownership of returned backing scopes into the caller before the scratch guard exits.
+Unused intermediates are freed when their scope exits.
+Static expressions use the global `StaticArena` and live for the program lifetime.
+Region-local publication transfers backing scopes without evaluating lazy sequences.
+Static publication copies proven finite immutable data and retains opaque backing scopes.
+There is no `GcHeap` or stop-the-world collection.
 
 An isolated invocation can instead install `alloc_ctx::InvocationGuard`. In
 that profile every allocation uses one bounded region; nested `ScratchGuard`
@@ -64,7 +66,8 @@ src/
                     leaf Trace impls; conditional GC vs no-gc implementations
   gc_header       — (GC mode only) GcBoxHeader, drop/trace fns
   gc_full         — (GC mode only) GcHeap, HeapProxy, HEAP (per-isolate proxy),
-                    ALLOC_ROOTS, AllocRootGuard
+                    ALLOC_ROOTS, AllocRootGuard (push_alloc_frame();
+                    release() unroots the frame's allocations so far)
   nogc_stubs      — (no-gc mode) stub GcHeap, GcConfig, cancellation stubs
   static_arena.rs — (no-gc mode) global program-lifetime bump allocator;
                     in debug builds, tracks chunk ranges for is_static_addr()
@@ -80,7 +83,18 @@ src/
                     IsolateCancellation thread-local (per-isolate STW state), GcParked
   governor.rs     — process-wide managed-memory governor: MemoryConfig,
                     ProcessMemoryGovernor, IsolateAccount, IsolateControl,
-                    MemoryCharge, MemorySnapshot, pressure policy
+                    strict admission, critical sections, runtime-fault slot,
+                    MemoryCharge, MemorySnapshot, pressure policy; region
+                    chunk, permanent (static), and queue-wait accounting;
+                    Phase 5: allocation-rate collection targets, separate
+                    cross-isolate request epoch, RSS emergency pressure signal,
+                    load-shedding hooks (ShedHookId, register_shed_hook,
+                    unregister_shed_hook), Linux cgroup v2 soft-limit
+  fiber.rs        — optional scheduler hooks, native-frame diagnostics, and governed fiber stack reservations
+  mutator.rs      — per-mutator state for virtual threads: MutatorSlot registry
+                    (link-time, via inventory), mutator_slot! macro,
+                    MutatorState save/restore/swap, TrackedMutex guard counting
+                    in every build, can_park() and assert_parkable()
   stats.rs        — process-global GcStats counters: GC allocations,
                     region (bump) allocations, GC pauses + freed bytes/objects,
                     isolate-boundary crossings (bytes copied + serialize time)
@@ -90,6 +104,8 @@ tests/
                     collection requests, credit returned by collection
                     and thread exit, idle capacity borrowed by an active
                     isolate
+  no_gc_strict.rs — (no-gc mode) strict admission: fallible allocation uses
+                    charged chunks at the hard limit and refuses new ones
   no_gc_alloc.rs  — (no-gc mode) integration tests for the allocation context stack:
                     ScratchGuard, StaticCtxGuard, InvocationGuard,
                     pop_for_return protocol, nested guards, destructor ordering
@@ -97,6 +113,8 @@ examples/
   credit_bench.rs — allocation throughput and credit-refill rate for several
                     credit chunk sizes (`cargo run --release -p cljrs-gc
                     --example credit_bench`)
+  region_bench.rs — cost of a region scope (create, allocate four objects,
+                    drop), including its governor charge
 ```
 
 ---
@@ -150,7 +168,9 @@ engine.
 pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 
 impl<T: Trace + 'static> GcPtr<T> {
-    pub fn new(value: T) -> Self        // allocates on HEAP (or ctx in no-gc)
+    pub fn new(value: T) -> Self        // allocates on HEAP (or ctx in no-gc); infallible
+    pub fn try_new(value: T) -> Result<Self, AllocError<T>>  // strict governor may refuse
+    pub fn new_critical(value: T) -> Self  // may use the critical reserve; never faults
     pub fn get(&self) -> &T             // borrow; invalid after collect frees it
     pub fn ptr_eq(a: &Self, b: &Self) -> bool
 
@@ -158,11 +178,28 @@ impl<T: Trace + 'static> GcPtr<T> {
     pub fn is_region_alloc(&self) -> bool  // true if bump-allocated in a Region
 
     // no-gc + debug_assertions only:
-    pub fn is_static_alloc(&self) -> bool  // true if allocated in StaticArena
+    pub fn is_static_alloc(&self) -> bool  // true for static or permanently retained storage
 }
 impl<T: Trace + 'static> Clone for GcPtr<T> { /* O(1) raw-pointer copy */ }
 impl<T: Trace + 'static> Drop  for GcPtr<T> { /* no-op */ }
+
+/// A refused allocation; owns the value that was not allocated.
+pub struct AllocError<T> { /* value, error */ }
+impl<T> AllocError<T> {
+    pub fn error(&self) -> MemoryLimitExceeded;
+    pub fn into_inner(self) -> T;
+    pub fn into_parts(self) -> (T, MemoryLimitExceeded);
+}
+// Debug, Display, Error; From<AllocError<T>> for MemoryLimitExceeded
 ```
+
+`try_new` asks the thread's account for the object's bytes before the object
+exists (`governor::try_reserve_current`).  In `no-gc` builds it asks only when
+the active region or the static arena must add a chunk
+(`Region::chunk_needed`, `StaticArena::try_alloc` / `try_alloc_val`), so an
+object that fits in memory already charged is never refused.  `new` cannot refuse: in strict
+mode a refused allocation takes the critical reserve and raises the thread's
+runtime fault, which the interpreter resolves at its next safepoint.
 
 ### `StaticGcPtr<T: 'static>` (always available — Phase B3)
 
@@ -183,6 +220,8 @@ impl<T: 'static> Clone for StaticGcPtr<T> { /* O(1) NonNull copy */ }
 /// Allocate `value` as program-lifetime memory.
 /// no-gc: StaticArena bump-alloc; GC: Box::leak.
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+/// Fallible form: the strict governor may refuse `size_of::<T>()`.
+pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>>;
 ```
 
 ### Free functions
@@ -190,6 +229,7 @@ pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
 ```rust
 // always:
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T>;
+pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>>;
 
 // no-gc only:
 pub fn static_arena() -> &'static StaticArena;
@@ -269,8 +309,15 @@ impl Region {
     pub fn accounted_bytes(&self) -> usize
     pub fn byte_limit(&self) -> Option<usize>
     pub fn object_count(&self) -> usize
+    pub fn chunk_bytes(&self) -> usize   // chunk memory held (its governor charge)
 }
 ```
+
+Each chunk is charged to the calling thread's `IsolateAccount`
+(`charge_region`) when it is allocated and released when it is freed, so
+region memory uses thread-local credit and appears under
+`MemoryClass::Region`.  `close_region` moves a poisoned region's charge to
+the retired-region count; it stays charged until the thread exits.
 
 `with_limit` raises the typed `RegionLimitExceeded` panic payload when the
 managed allocation budget is exhausted. It charges boxes plus
@@ -286,11 +333,15 @@ impl InvocationGuard {
     pub fn object_count(&self) -> usize;
 }
 pub fn invocation_is_active() -> bool;
+pub fn invocation_cache_get(kind: &'static str, key: &str) -> Option<usize>;
+pub fn invocation_cache_insert(kind: &'static str, key: String, address: usize);
 ```
 
 All `GcPtr::new` calls within the guard use its single arena, including calls
 made beneath evaluator scratch/static guards. Copy or serialize results before
 the guard drops.
+The invocation cache holds raw addresses owned by that arena. The guard clears the cache before releasing its storage.
+Callers must keep these addresses out of program caches and compiled call-site slots.
 
 Bump allocator for short-lived objects. ~2.6x faster than `GcHeap::alloc`
 (no mutex, no `Box::new`). Objects are NOT in the GC heap linked list.
@@ -309,6 +360,10 @@ RAII guard that pushes a `Region` onto the thread-local stack. Use with
 /// scope closes.  No-op when no region is active.
 pub fn poison_active_regions();
 
+/// True when every active region must remain alive after its scope closes.
+/// Publishers can skip graph scans in this state.
+pub fn active_regions_are_poisoned() -> bool;
+
 /// Close a region whose scope ended: pop the thread-local stack entry, then
 /// reset/drop the region — or retire it if poisoned.  All owners of
 /// stack-registered regions (rt_abi, the IR interpreter) close through here.
@@ -326,21 +381,30 @@ dangle; `GcHeap::collect` traces them as roots alongside the active stack.
 Every isolate keeps its private heap; the governor owns counters, pressure
 policy, and thread-safe control handles.  Each isolate allocates from local
 credit that the governor grants in chunks; granted credit counts as committed.
-**Observe-only:** no grant is refused; a grant that ends above the hard limit
-is counted as an over-limit event.
+**Observe-only by default:** no grant is refused; a grant that ends above the
+hard limit is counted as an over-limit event.  **Strict mode**
+(`MemoryConfig::strict`, `CLJRS_MEMORY_STRICT=1`) refuses application grants
+that would take committed bytes above the hard limit; see *Strict admission*
+below.  Region chunks use the same local credit
+and are reported under `Region`.  Shared values (`cljrs-value`), queued
+isolate-channel messages (`cljrs-async`), and JIT code (`cljrs-compiler`) hold
+a `MemoryCharge`; static allocations are recorded with `charge_permanent`.
 
 ```rust
-pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime }
-pub enum PressureLevel { Green, Yellow, Red }   // < soft, >= soft, > hard
+pub enum MemoryClass { GcHeap, Region, SharedValue, MessageQueue, Static, Code, Runtime, FiberStack }
+pub enum PressureLevel { Green, Yellow, Red }   // < soft, >= soft, > hard (or strict refusal)
+pub enum Admission { Application, Critical }    // <= hard, <= hard + critical reserve
 
 pub const DEFAULT_CREDIT_CHUNK: usize;             // 64 KiB
 pub const DEFAULT_RETAINED_CREDIT_CHUNKS: usize;   // 2
 pub const ACCOUNTING_UNIT: usize;                  // 4 KiB; rounding for large grants
 pub const MIN_COLLECTION_HEADROOM: usize;          // 1 MiB
+pub const STRICT_ENV: &str;                         // "CLJRS_MEMORY_STRICT"
 
 pub struct MemoryConfig { pub soft_limit, pub hard_limit, pub critical_reserve,
-                          pub credit_chunk, pub retained_credit_chunks,
-                          pub queue_limit }   // bytes, except the chunk count
+                          pub credit_chunk, pub retained_credit_chunks, pub queue_limit,
+                          pub strict, pub collection_target_interval_ms,
+                          pub rss_pressure_percent }
 impl MemoryConfig {
     pub fn with_limits(soft: usize, hard: usize) -> Result<Self, MemoryConfigError>;
     pub fn from_optional_limits(soft: Option<usize>, hard: Option<usize>)
@@ -350,10 +414,12 @@ impl MemoryConfig {
     pub fn from_lookup(lookup, warn) -> Result<Self, MemoryConfigError>;
     pub fn validate(&self) -> Result<(), MemoryConfigError>;
 }
-pub fn default_hard_limit() -> usize;                   // cgroup limit, else physical / 2
-pub fn default_soft_limit(hard: usize) -> usize;        // 75%
-pub fn default_critical_reserve(hard: usize) -> usize;  // max(4 MiB, 1%), <= 256 MiB
-pub fn container_memory_limit() -> Option<usize>;       // not on wasm32
+pub fn default_hard_limit() -> usize;                        // cgroup limit, else physical / 2
+pub fn default_soft_limit(hard: usize) -> usize;             // 75%
+pub fn default_critical_reserve(hard: usize) -> usize;       // max(4 MiB, 1%), <= 256 MiB
+pub fn container_memory_limit() -> Option<usize>;            // not on wasm32
+pub fn container_soft_memory_limit() -> Option<usize>;       // cgroup v2 memory.high; Linux only
+pub fn process_rss_bytes() -> Option<usize>;                 // /proc/self/status VmRSS; Linux only
 
 pub struct ProcessMemoryGovernor { /* atomics + weak isolate registry */ }
 impl ProcessMemoryGovernor {
@@ -363,58 +429,113 @@ impl ProcessMemoryGovernor {
     pub fn config(&self) -> MemoryConfig;
     pub fn register_isolate(&'static self, name: impl Into<Arc<str>>) -> IsolateAccount;
     pub fn reserve_shared(&'static self, class: MemoryClass, bytes: usize)
-        -> Result<MemoryCharge, MemoryLimitExceeded>;   // never Err while observe-only
+        -> Result<MemoryCharge, MemoryLimitExceeded>;   // Err only in strict mode
+    pub fn reserve_critical(&'static self, class: MemoryClass, bytes: usize)
+        -> Result<MemoryCharge, MemoryLimitExceeded>;   // may use the critical reserve
+    pub fn reserve_reported(&'static self, class: MemoryClass, bytes: usize)
+        -> MemoryCharge;                                // never refused (JIT code)
+    pub fn reserve_infallible(&'static self, class: MemoryClass, bytes: usize)
+        -> MemoryCharge;   // always the full size; a strict refusal raises a fault and
+                           // uses the reserve, or overruns it (counted)
+    pub fn charge_permanent(&'static self, class: MemoryClass, bytes: usize);  // never returned;
+                                                        // a strict refusal raises a fault
+    pub fn try_charge_permanent(&'static self, class: MemoryClass, bytes: usize)
+        -> Result<(), MemoryLimitExceeded>;
+    pub fn is_strict(&self) -> bool;
+    pub fn within_hard_limit(&self) -> bool;
+    pub fn record_queue_wait(&self, waited: Duration);
+    pub fn record_queue_rejection(&self);
     pub fn class_bytes(&self, class: MemoryClass) -> usize;
     pub fn committed_bytes(&self) -> usize;     // exact: used + free credit
     pub fn free_credit_bytes(&self) -> usize;   // as last published by each isolate
     pub fn min_headroom(&self) -> usize;        // max(16 chunks, MIN_COLLECTION_HEADROOM)
+    pub fn collection_target_interval_ms(&self) -> u32;   // Phase 5: dynamic target interval
     pub fn pressure(&self) -> PressureLevel;
     pub fn snapshot(&self) -> MemorySnapshot;
+    // Phase 5 — load-shedding hooks (called on every pressure transition):
+    pub fn register_shed_hook(&self, hook: ShedHook) -> ShedHookId;
+    pub fn unregister_shed_hook(&self, id: ShedHookId);
 }
+pub type ShedHookId = u64;
+pub type ShedHook = Arc<dyn Fn(PressureLevel) + Send + Sync>;
 pub fn governor() -> &'static ProcessMemoryGovernor;   // the process instance
 
 pub struct IsolateAccount { /* single-threaded (!Sync) Cells */ }
-// Drop: returns used bytes and free credit, unregisters.
+// Drop: returns used bytes, region bytes, and free credit, unregisters.
 impl IsolateAccount {
     pub fn charge(&self, bytes: usize);   // thread-local until credit runs out, then refills
+    pub fn try_reserve_credit(&self, bytes: usize) -> Result<(), MemoryLimitExceeded>;
+    pub fn try_charge(&self, bytes: usize) -> Result<(), MemoryLimitExceeded>;
     pub fn release(&self, bytes: usize);  // sweep: used bytes become free credit
+    pub fn charge_region(&self, bytes: usize);                  // new region chunk
+    pub fn retire_region(&self, bytes: usize);                  // active -> retired
+    pub fn release_region(&self, bytes: usize, retired: bool);  // freed chunk; trims excess credit
     pub fn publish(&self);                // metrics poll
     pub fn poll(&self) -> bool;           // safepoint: serve a recall; collection requested?
     pub fn record_collection(&self, r: CollectionReport);   // epoch, next target, trim credit
     pub fn used_bytes(&self) -> usize;
     pub fn free_credit_bytes(&self) -> usize;
-    pub fn committed_bytes(&self) -> usize;
+    pub fn region_bytes(&self) -> usize;
+    pub fn retired_region_bytes(&self) -> usize;
+    pub fn committed_bytes(&self) -> usize;   // used + region + retired + free credit
     pub fn control(&self) -> &Arc<IsolateControl>;
 }
 pub struct IsolateControl { /* atomics */ }
 impl IsolateControl {
     pub fn id(&self) -> IsolateId;
     pub fn name(&self) -> Arc<str>;
-    pub fn request_collection(&self);
+    pub fn request_collection(&self);          // wakes registered service wakers
     pub fn collection_requested(&self) -> bool;
     pub fn take_collection_request(&self) -> bool;
-    pub fn request_recall(&self);
+    pub fn request_recall(&self);              // wakes registered service wakers
     pub fn recall_requested(&self) -> bool;
+    // Runtime service tasks (the async GC service) suspend until a request:
+    // register before checking for work; each request drains the list.
+    pub fn register_service_waker(&self, waker: &Waker);
+    pub fn unregister_service_waker(&self, waker: &Waker);
+    pub fn service_waker_count(&self) -> usize;
     pub fn used_bytes(&self) -> usize;
     pub fn free_credit_bytes(&self) -> usize;
+    pub fn region_bytes(&self) -> usize;
+    pub fn retired_region_bytes(&self) -> usize;
     pub fn collection_target(&self) -> usize;
     pub fn collection_epoch(&self) -> u64;
     pub fn collection_requests(&self) -> u64;
     pub fn credit_refills(&self) -> u64;
 }
-pub struct CollectionReport { pub bytes_before, pub bytes_after, pub bytes_returned, pub duration }
+pub struct CollectionReport { pub bytes_before, pub bytes_after, pub bytes_returned, pub bytes_pending, pub duration }
 pub struct MemoryCharge;   // RAII; Drop returns its bytes once
 pub struct MemoryLimitExceeded { pub class, pub requested, pub committed, pub hard_limit }
-pub struct MemorySnapshot { /* limits, pressure, committed/used/free credit and peaks,
-                               per class, per isolate, transitions, requests,
-                               refills, returned credit, recalls, over-limit events */ }
+pub struct MemorySnapshot { /* strict flag, limits, pressure, committed/used/free
+                               credit and peaks, per class, per isolate, transitions,
+                               requests, refills, returned credit, recalls, over-limit
+                               events, retired region bytes, queue waits and rejections,
+                               rejected reservations/bytes, critical grants, reserve
+                               overruns, runtime faults raised and cleared */ }
 pub struct IsolateSnapshot { /* per-isolate counters */ }
 
 // Calling thread:
 pub fn register_current_isolate(name: &str) -> Option<Arc<IsolateControl>>;
 pub fn with_current_account<R>(f: impl FnOnce(&IsolateAccount) -> R) -> Option<R>;
+pub fn with_registered_account<R>(f: impl FnOnce(&IsolateAccount) -> R) -> Option<R>;  // never registers
 pub fn current_control() -> Option<Arc<IsolateControl>>;
 pub fn snapshot() -> MemorySnapshot;   // flushes this thread's account first
+pub fn try_reserve_current(bytes: usize) -> Result<(), MemoryLimitExceeded>;
+
+// Critical sections (calling thread):
+pub struct CriticalSection;            // guard; !Send; nests
+pub fn enter_critical() -> CriticalSection;
+pub fn with_critical<R>(f: impl FnOnce() -> R) -> R;
+pub fn in_critical_section() -> bool;   // a fiber must never park inside one
+pub fn critical_active() -> bool;
+
+// Runtime-fault slot (calling thread; fixed-size, never allocates):
+pub fn raise_runtime_fault(fault: MemoryLimitExceeded);    // keeps the first; asks to collect
+pub fn confirm_runtime_fault(fault: MemoryLimitExceeded);  // delivered unconditionally
+pub fn runtime_fault_possible() -> bool;                    // one relaxed global load
+pub fn pending_runtime_fault() -> Option<MemoryLimitExceeded>;
+pub fn take_runtime_fault() -> Option<MemoryLimitExceeded>;
+pub fn resolve_runtime_fault() -> Option<MemoryLimitExceeded>;  // clears if back within limit
 ```
 
 `GcHeap::alloc` charges the thread's account; `GcHeap::collect` releases the
@@ -438,15 +559,103 @@ collection from another thread.  At `Yellow` the governor requests collection
 from the allocating isolate and from the largest heap, at most once per
 collection epoch and only above the isolate's post-collection target (the
 surviving bytes plus the larger of half of them or `min_headroom()`; after a
-zero-yield collection, the larger of all of them or `min_headroom()`); at
+zero-yield collection, the larger of all of them or `min_headroom()`).
+Surviving bytes exclude `bytes_pending`, the unreachable objects sweep keeps
+for their grace cycle, and a collection with pending bytes is not zero-yield,
+so the follow-up collection that frees them is requested promptly; at
 `Red` the target is ignored.  Pressure transitions log at `info` and
 over-limit events at `debug` under the `memory` tracing target.
 
+Class split: credit is granted under `GcHeap`.  Each time an account
+publishes (refill, collection, poll, trim), the governor moves the account's
+region bytes from `GcHeap` to `Region`, so committed bytes stay exact and the
+class split lags by at most the account's free credit.  A freed region chunk
+becomes free credit; credit above the retained limit returns to the governor
+at once, because a `no-gc` isolate has no collection to trim it.
+
+Static: `static_alloc` records `size_of::<T>()` in GC builds; the `no-gc`
+`StaticArena` records each chunk.
+
+Strict admission: `admit` commits a grant with a compare-and-swap on the
+committed counter, so concurrent requests never commit past the bound.  An
+application grant must keep committed bytes at or below the hard limit; a
+critical one (inside a `CriticalSection`, `reserve_critical`, `new_critical`)
+at or below the hard limit plus the critical reserve.  A refused credit chunk
+is retried at the exact shortfall.  A refusal changes no counter, counts as a
+rejected reservation, logs at `info`, holds pressure at `Red` until a normal
+chunk fits again, and requests collection.  Fallible callers get the
+`MemoryLimitExceeded`.  An infallible charge (`GcPtr::new`, region chunks,
+`charge_permanent`) raises the thread's runtime fault and takes the shortfall
+from the critical reserve; if the reserve is exhausted too, it is admitted
+anyway and counted as a reserve overrun (logged at `warn`).  The runtime
+resolves the fault at its next safepoint: after collecting, it continues if
+committed bytes are within the hard limit and fails the evaluation otherwise.
+
 Gaps: the isolate heap is not torn down at thread exit, so
 `IsolateAccount::drop` stops counting bytes that stay allocated until process
-exit; regions, shared values, queues, static data, and code are not charged;
+exit (region chunks freed after the account is gone are not released twice);
 an idle isolate that never polls is not woken by a recall, so it keeps up to
 its retained chunks.
+
+### `mutator` — per-mutator state (virtual threads, Phases 0–1)
+
+Thread-locals that belong to a *running computation* (root shadow stacks,
+region stack, binding frames, eval contexts, gas meters, …) are registered as
+slots so a fiber scheduler can swap them in and out around a context switch.
+See `docs/virtual-threads-plan.md`.
+
+```rust
+pub struct MutatorSlot {
+    pub name: &'static str,              // "<crate>/<STATIC_NAME>", unique
+    pub init: fn() -> Box<dyn Any>,      // a fresh mutator's value
+    pub swap: fn(&mut dyn Any),          // exchange with the thread-local
+    pub trace: fn(&dyn Any, &mut MarkVisitor), // detached GC roots
+    pub check: fn(),                    // assert borrow discipline before swapping
+    pub can_swap: fn() -> bool,          // non-panicking borrow preflight
+}
+pub fn slots() -> &'static [&'static MutatorSlot]; // sorted by name
+pub fn slot_names() -> Vec<&'static str>;
+
+// Register a thread-local (`RefCell<T>` or `Cell<T>`, T: Default):
+cljrs_gc::mutator_slot!("my-crate/MY_STACK", refcell MY_STACK: Vec<Frame>);
+cljrs_gc::mutator_slot!("my-crate/MY_FLAG", cell MY_FLAG: bool);
+
+pub struct MutatorState;                 // !Send; one value per slot
+impl MutatorState {
+    pub fn fresh() -> Self;              // a not-yet-started computation
+    pub fn unregistered() -> Self;       // empty placeholder; touches no thread-locals, never installed
+    pub fn save() -> Self;               // detach current; thread gets fresh defaults
+    pub fn restore(self);                // reinstall a saved state
+    pub fn swap_with_current(&mut self); // exchange (scheduler resume/park)
+}
+
+pub fn guards_held() -> usize;           // TrackedMutex guards held in every build
+pub fn can_park() -> bool;               // optional yield: locks, borrows, critical sections, unwinding
+pub fn assert_parkable();                // explicit park: assert lock/borrow/critical discipline
+pub struct TrackedMutex<T>;              // std::sync::Mutex API subset; guards are counted
+pub struct TrackedMutexGuard<'a, T>;
+```
+
+Slots are collected at link time, so a crate's slots exist only in binaries
+that link that crate. Before a switch changes state, it checks every slot for active borrows.
+A borrowed `RefCell` causes a panic before any slot changes.
+
+`assert_parkable` runs at every explicit park and at the start of every fiber poll.
+Since Phase 4 it enforces, in release builds as well as debug builds, that no
+`TrackedMutex` guard is held and no governor critical section is open. Earlier
+releases checked these only in debug builds, so a host that drives or polls a fiber
+while holding a runtime lock now panics instead of risking a carrier deadlock: the
+fiber could block on that same non-reentrant lock. Release the guard before
+`block_on`, `run_root`, or polling a fiber. Optional automatic yields use
+`can_park()` and defer instead.
+
+Each detached state registers weakly with its isolate. Registration is O(1) amortized:
+dead entries are swept at each collection, or by `MutatorState::fresh` once the registry
+has doubled since the last sweep. Collection traces saved slot values
+through callbacks declared with `mutator_slot!(..., trace trace_saved)`.
+The callback takes `&T` and `&mut MarkVisitor`.
+The scheduler keeps root addresses valid until it restores the state and unwinds the owning stack.
+Completed fibers leave the registry before their stacks return to the pool.
 
 ### `GcConfig`
 
@@ -518,7 +727,8 @@ programs and the AOT test harness call it once at exit.
   decremented by the same value when the object is freed.  Types that own
   significant out-of-line heap (Form AST trees in `CljxFn`, String capacity)
   override `gc_size_extra` so the GC threshold fires before the process OOMs.
-- **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed),
+- **Fixed-headroom GC suppression**: after a zero-yield collection (nothing freed
+  and nothing newly unreachable in its grace period),
   GC is suppressed until `memory_in_use` grows by another `soft_limit/10` bytes
   (a fixed additive headroom, not a percentage of current memory).  Using a
   percentage of current memory as headroom would compound across consecutive
@@ -546,3 +756,204 @@ programs and the AOT test harness call it once at exit.
 - Weak references (`WeakGcPtr<T>`) — deferred
 - Safepoint integration with JIT frames — Phase 10+
 - Automatic collection trigger (threshold-based) — deferred
+
+No-gc task captures use `region::RegionLease::capture_active() -> RegionLease`.
+`RegionLease::enter() -> LeaseScope` conveys leases into nested tasks for one poll
+or fiber execution. Completion and cancellation release these leases.
+Closed regions remain in a deferred registry only while a task can use them.
+The last external lease permits storage reclamation and releases the governor charge.
+Weak dependency edges let mutually dependent closed scopes be reclaimed together.
+Reclamation removes both halves of each edge, including entries in live neighbors.
+`ScratchGuard` keeps each scope discoverable through result ownership transfer.
+
+No-gc publication preserves value identity and laziness. `retain_regions_for(value: &impl Trace)`
+retains only actual backing scopes for program-lifetime destinations.
+`RegionLease::for_value(value)` traces those scopes without evaluating user code.
+`RegionLease::for_values<T: Trace>(values: &[T])` leases several values with one visited set.
+`RegionLease` implements `Default`, `Clone`, and `Debug`.
+`RegionLease::protect_current()` borrows backing scopes into the current read scope.
+Without a read scope, it transfers ownership into the current allocation destination.
+`AllocationOwner::current()` and `for_address(address)` return weak destination handles.
+Their `protect(value)` method keeps source scopes alive for that destination's lifetime.
+`AllocationOwner::is_permanent()` identifies a static or permanently retained destination.
+`AllocationSnapshot::capture()` retains a task's allocation destination.
+Its `enter()` method installs that destination until the returned `alloc_ctx::ContextGuard` drops.
+Its `protect(value)` method transfers result ownership into the captured destination.
+Ordinary scratch scopes create no lease metadata until sharing occurs.
+The address index and incoming ownership edges limit cleanup to affected scopes.
+Live callers stop traversal. Task polls do not scan unrelated deferred scopes.
+`alloc_ctx::is_static_context()` identifies a program-lifetime allocation destination.
+Bounded isolated allocation invocations retain their original lifetime rules.
+
+`static_arena::is_static_addr(address)` and `GcPtr::is_static_alloc()` are available
+in release no-gc builds for publication decisions.
+No-gc `MarkVisitor` implements `Default` and traverses values only for explicit ownership transfer.
+
+`RegionLease::downgrade() -> WeakRegionLease` caches backing scopes without an external ownership root.
+`WeakRegionLease` implements `Default` and `Debug`. Its `upgrade() -> RegionLease` acquires temporary ownership.
+`AllocationOwner::adopt(&RegionLease)` stores cached ownership for the full destination lifetime.
+Store operations never route ownership into temporary read scopes.
+`AllocationOwner::replaceable(&RegionLease) -> RegionDependency` creates counted edges for one replaceable slot.
+Dropping that slot removes its edges. Other slots and durable stores retain their own edges.
+`RegionDependency` implements `Default` and `Debug`; `snapshot()` acquires a temporary `RegionLease`.
+`RegionLease::extend(&RegionLease)` merges owners with a set indexed by scope ID.
+
+`region::ReadScope::enter() -> Option<ReadScope>` starts the outermost evaluation read scope.
+Nested calls return `None`. Bounded invocations also return `None`.
+`ReadScope::is_active()` identifies an active read scope.
+`ReadScope::epoch() -> u64` identifies the current borrowing lifetime; zero means there is no scope.
+Nested scopes and task polls change the epoch. Fibers save it with their mutator state.
+Var reads use it to acquire ownership once per binding and scope.
+`finish(self) -> RegionLease` removes the scope and returns its leases while the final result escapes.
+Drop releases a scope on unwind. A scope stays on its creating thread.
+Fibers swap this state with their other mutator slots.
+Each scratch guard opens a nested read scope for one call or iteration.
+`pop_for_return()` removes this scope while retaining its leases until result transfer finishes.
+`ReadScope::nested()` also opens a nested scope explicitly.
+Task capture excludes temporary read scopes. Callers must declare captured managed values.
+Low-level embedders can use a read scope to bound temporary reads outside the evaluator.
+Keep the scope alive while using borrowed results. Discard the results before dropping the scope.
+Without an enclosing caller scope, raw escaping results receive program-lifetime ownership.
+
+
+### No-GC borrowed reads and mutable storage
+
+`RegionLease::protect_read()` protects a raw borrowed result in the current read scope or allocation destination.
+Without either, the result receives program-lifetime ownership. Use scopes or owning snapshots to bound host reads.
+`AllocationOwner::adopt` remains a durable store operation.
+
+`SlotId` identifies a mutable field with `Index(usize)` or `Named(String)`.
+It implements `From<usize>`, `From<String>`, `Clone`, `Debug`, equality, and ordering.
+`AllocationOwner::set_slot(address, slot: impl Into<SlotId>, &RegionLease)` replaces one field's ownership.
+`read_slot(address, slot)` borrows that cached ownership. `clear_slots(address)` releases an object's fields at destruction.
+Static fields own leases; regional fields use counted edges. Both release overwritten values.
+
+`ReadContext` owns the read scopes of one asynchronous computation and implements `Default`.
+`enter(&mut self) -> ReadContextGuard<'_>` installs that context for one poll.
+The guard restores the polling caller's scopes on drop, including unwind.
+Contexts and guards remain on their creating thread.
+
+`Trace::init_ownership(&self)` is a default no-GC allocation hook.
+Managed allocators call it after constructing the pointee. Mutable containers use it to establish their initial field leases.
+The hook must not park or evaluate user code.
+
+`GcPtr::identity_eq(a, b) -> bool` compares logical object identity.
+In native GC builds, this is pointer identity.
+No-GC boxes hold a unique 62-bit identity. Two reserved bits store relocation and ownership-cache flags without increasing box size.
+`unsafe GcPtr::clone_immutable(&self) -> Self`, available under no-GC, copies an immutable scalar with that identity.
+The pointee must contain no mutable state, and its clone must represent the same value.
+`GcPtr::ptr_eq` continues to compare physical allocation addresses.
+
+### Compact roots and explicit result publication
+
+`alloc_ctx::ScratchGuard::with_capacity(capacity: usize) -> Self` selects the initial chunk size.
+Later chunks double in size up to the default growth size, or grow enough for a larger object.
+Compact scalar boxes use initial chunks sized to their representation.
+`GcPtr::is_relocated_immutable() -> bool` identifies a compact immutable copy under no-GC.
+Stores reuse these copies instead of copying them again.
+`GcPtr::new_isolated(value: T) -> Self` allocates a separate root region under no-GC.
+The caller's scope owns the result. Static and invocation destinations keep their allocation rules.
+Native GC builds use ordinary allocation.
+`unsafe GcPtr::relocate_immutable(&self, value: T) -> Self` preserves the source identity under no-GC.
+The replacement must represent the same immutable object, including its children's identities.
+
+`RegionLease::for_address(address: usize) -> Self` leases a containing region without tracing the object.
+`RegionLease::publish_return()` explicitly transfers a raw escaping result.
+An unscoped static result has program lifetime. This fallback also applies to unscoped host reads.
+Explicit scopes and owning snapshots permit earlier reclamation.
+`RegionDependency::protect_read()` borrows cached weak sources without constructing an owning snapshot.
+Durable regional dependencies use counted edges held until their destination dies.
+They do not turn replaceable edge counts into permanent markers.
+
+
+`Trace::immutable_children(&self) -> bool` is a default no-GC hook that returns false.
+Return true only when managed child references cannot change through interior mutability.
+Publication visits each immutable object's child graph once and caches counted region dependencies.
+Later walks stop at that object. `GcPtr::get_mut` invalidates its cache before returning mutable access.
+Ownership walks use an explicit work stack, including long Cons chains.
+Mutable containers continue to maintain replaceable field ownership.
+
+
+Under no-GC, `GcPtr::get_mut(&mut self) -> GcMut<'_, T>` returns a mutation guard.
+`GcMut` implements `Deref<Target = T>`, `DerefMut`, and `Drop`.
+Drop acquires ownership of the changed child graph, including when unwinding.
+Cached parents remain valid because the mutated object's region retains its new children.
+Native GC builds keep the existing `get_mut(&mut self) -> &mut T` signature.
+
+
+## Fiber safepoints and stack accounting (virtual threads Phase 4)
+
+`fiber` has no executor dependency. Native drivers install `Hooks` once with
+`fiber::install(Hooks)`. Before installation, the hooks do nothing.
+
+```rust,ignore
+pub enum SafepointError { StackOverflow(String), Cancelled }
+pub struct Hooks {
+    pub safepoint: fn() -> Result<bool, SafepointError>, // true when a yield is due
+    pub yield_now: fn() -> Result<(), SafepointError>,
+    pub reclaim_stacks: fn(), // drop idle pooled stacks on every carrier
+    pub enter_native: fn(&Arc<str>, &NativeDiagnosticId) -> usize, // previous frame token
+    pub enter_gc_pause: fn() -> usize, // marks a GC pause; previous frame token
+    pub exit_native: fn(usize),
+}
+pub fn install(hooks: Hooks);
+pub fn safepoint() -> Result<(), SafepointError>;
+pub fn safepoint_with(around_yield: impl FnOnce(fn() -> Result<(), SafepointError>)
+    -> Result<(), SafepointError>) -> Result<(), SafepointError>;
+pub struct NativeDiagnosticId; // Default (0 = unassigned) + Clone + Debug; get()/set(usize)
+pub fn native_frame(name: &Arc<str>, id: &NativeDiagnosticId) -> NativeFrameGuard;
+pub fn gc_pause() -> NativeFrameGuard; // held by heap collection and STW waits
+pub struct NativeFrameGuard; // !Send + !Sync; Drop restores the previous native frame.
+pub const STACK_COMMIT_ESTIMATE: usize; // 64 KiB budgeted per stack
+pub struct StackReservation; // Drop releases its charges and live/pool count.
+impl StackReservation {
+    pub fn new(bytes: usize) -> Result<Self, MemoryLimitExceeded>;
+    pub fn account_actual_bytes(&mut self, requested: usize, actual: usize)
+        -> Result<(), MemoryLimitExceeded>;
+    pub fn set_pooled(&mut self, pooled: bool);
+}
+pub fn reserved_stack_bytes() -> usize; // active and pooled reservations
+pub fn stack_pointer() -> usize; // machine stack register (address of a local on wasm)
+pub const NATIVE_STACK_MARGIN: usize; // 128 KiB kept free below native recursion probes
+pub fn set_native_stack_limit(limit: usize) -> usize; // 0 clears; returns previous limit
+pub fn native_stack_low() -> Option<usize>; // Some(remaining) within the margin on a fiber
+```
+
+Recursive native code (printing, equality, hashing, comparison) never reaches a
+safepoint. The fiber driver publishes the running fiber's stack limit with
+`set_native_stack_limit` on every resume and restores the outer value when the
+resume ends; `native_stack_low` compares it with `stack_pointer()`. Off a fiber
+the limit is zero and the probe always returns `None`. The probe only reports;
+`cljrs-value`'s `realization::check_stack` turns it into a catchable error.
+
+`SafepointError` implements `Debug`. `Cancelled` carries cancellation across native
+ABI frames through the runtime's uncatchable resource-error path.
+The fiber resumes Rust cancellation at its outer computation boundary.
+`safepoint_with` runs its callback only when an automatic yield will happen.
+The interpreter uses it to root the current environment during that yield.
+`StackReservation::new` applies strict admission before stack allocation.
+It charges `MemoryClass::FiberStack` with at most `STACK_COMMIT_ESTIMATE` bytes,
+because the OS commits stack pages lazily. `account_actual_bytes` adds page
+rounding and guard pages after allocation, and records the full reservation in
+`reserved_stack_bytes`. A pooled reservation keeps its charge. Its live count
+resumes when the driver reuses it. Destroying the pool releases its bytes.
+When a strict admission of any class would exceed the hard limit, the governor
+calls `reclaim_stacks` once and retries, so idle stacks never block other work.
+Charges dropped during that reclaim skip pressure evaluation, so no shed hook runs
+inside the admission while the caller may hold locks; the next evaluation observes them.
+
+`MemorySnapshot` adds public `usize` fields `fiber_count`, `peak_fiber_count`,
+`pooled_fiber_stacks`, and `reserved_fiber_stack_bytes`. Counts cover native fibers
+across the process, including unstarted fibers and root fibers. Completed results do
+not count as live fibers. `class_bytes(MemoryClass::FiberStack)` is the budgeted
+charge of active and pooled stacks; `reserved_fiber_stack_bytes` is their address space.
+The snapshot's `Display` implementation includes these counts and stack bytes,
+so both `--gc-stats` and `stats_report()` show them.
+
+
+Strict stack admission budgets the commit estimate, not the reservation. A small
+hard limit still admits the default 64 MiB root stack, and thousands of mostly idle
+fibers do not push the governor into pressure that collection cannot relieve. A
+fiber whose recursion commits more than the estimate is under-counted; the stack
+margin check and guard page bound that growth. Observe-only mode reports the same
+bytes without refusing stack reservations.

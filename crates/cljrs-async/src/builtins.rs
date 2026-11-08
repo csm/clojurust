@@ -4,9 +4,12 @@
 //! a `Value::Future` immediately and resolve on the `LocalSet` executor, so they
 //! compose with `await` exactly like an `^:async` call. `close!`, `poll!`, and
 //! `offer!` act on a channel synchronously and return their result directly.
-//! `async-spawn` runs a thunk on the `LocalSet` as an async task (the runtime
-//! backing the `go` macro).
+//! `async-spawn` runs a thunk concurrently and returns a future: on a fiber on
+//! native targets, as a colored task on wasm32. `go` expands to `thread-call`,
+//! which returns a result channel. On native targets
+//! `<!`, `>!`, and `alts!` are the parking `<!!`, `>!!`, and `alts!!`.
 
+use rand::seq::SliceRandom;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,18 +17,18 @@ use std::time::Duration;
 
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
-use cljrs_runtime::env::error::EvalResult;
+use cljrs_runtime::env::error::{EvalError, EvalResult};
 use cljrs_runtime::interp::destructure::value_to_seq_vec;
 use cljrs_value::{
     Arity, NativeFn, NativeObjectBox, PersistentVector, Value, ValueError, ValueResult,
     gc_native_object,
 };
 
-use crate::channel::{CHANNEL_TAG, CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
-use crate::eval_async::{await_value, spawn_future};
+use crate::channel::{CljChannel, CljMult, MULT_TAG};
+use crate::task::{await_value, spawn_future_with_roots};
 
 /// One branch of an `alts` race: awaits a future and tags it with its index.
-type AltBranch = Pin<Box<dyn Future<Output = (EvalResult, usize)>>>;
+type AltBranch = Pin<Box<dyn Future<Output = (EvalResult, usize, bool)>>>;
 
 /// Register the async native functions into the given namespace.
 pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
@@ -33,6 +36,7 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         // Phase D: timeout and alts
         ("timeout", Arity::Fixed(1), builtin_timeout),
         ("alts", Arity::Fixed(1), builtin_alts),
+        ("alts!!", Arity::Variadic { min: 1 }, builtin_alts_blocking),
         // Phase E: channels
         ("chan", Arity::Variadic { min: 0 }, builtin_chan),
         ("take!", Arity::Fixed(1), builtin_take),
@@ -54,6 +58,34 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ("<!!", Arity::Fixed(1), builtin_take_blocking),
         (">!!", Arity::Fixed(2), builtin_put_blocking),
     ];
+    // Phase 5: `go` bodies run on fibers, so the parking ops are ordinary
+    // functions that park the fiber. wasm32 defines them as `await` macros in
+    // `core_async_wasm.cljrs` because its `go` bodies stay colored.
+    #[cfg(not(target_arch = "wasm32"))]
+    let fns = {
+        let mut fns = fns;
+        fns.extend([
+            (
+                "<!",
+                Arity::Fixed(1),
+                builtin_take_parking as fn(&[Value]) -> ValueResult<Value>,
+            ),
+            (">!", Arity::Fixed(2), builtin_put_parking),
+            ("alts!", Arity::Variadic { min: 1 }, builtin_alts_parking),
+        ]);
+        fns
+    };
+    // The future-returning exactly-one selection. wasm32's `alts!` macro
+    // awaits it; colored bodies on any target can `(await (alts!-future ...))`.
+    let fns = {
+        let mut fns = fns;
+        fns.push((
+            "alts!-future",
+            Arity::Variadic { min: 1 },
+            builtin_alts_future as fn(&[Value]) -> ValueResult<Value>,
+        ));
+        fns
+    };
     for (name, arity, func) in fns {
         let nf = NativeFn::new(name, arity, func);
         globals.intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(nf)));
@@ -71,7 +103,7 @@ fn builtin_timeout(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    Ok(spawn_future(async move {
+    Ok(spawn_future_with_roots(args.to_vec(), async move {
         platform_sleep(ms).await;
         Ok(Value::Nil)
     }))
@@ -93,35 +125,60 @@ async fn platform_sleep(ms: u64) {
 /// `coll` resolves first.
 fn builtin_alts(args: &[Value]) -> ValueResult<Value> {
     let futures = match args.first() {
-        Some(v) => value_to_seq_vec(v),
+        Some(v) => value_to_seq_vec(v)?,
         None => Vec::new(),
     };
-    Ok(spawn_future(async move { Ok(alts_select(futures).await) }))
+    Ok(spawn_future_with_roots(futures.clone(), async move {
+        alts_select(futures).await
+    }))
 }
 
 /// Await all `futures` concurrently; return `[value index]` of the first to
 /// complete. An empty input resolves to `nil`. A future that completes with an
-/// error contributes `nil` as its value.
-async fn alts_select(futures: Vec<Value>) -> Value {
+/// ordinary error contributes `nil`; resource-limit errors propagate.
+#[allow(clippy::result_large_err)]
+async fn alts_select(futures: Vec<Value>) -> EvalResult {
     if futures.is_empty() {
-        return Value::Nil;
+        return Ok(Value::Nil);
     }
     let branches: Vec<AltBranch> = futures
         .into_iter()
         .enumerate()
         .map(|(i, v)| {
             Box::pin(async move {
-                let result = await_value(v).await;
-                (result, i)
+                let result = await_value(v.clone()).await;
+                // A producer interrupted by cancellation fails the select,
+                // rather than contributing nil like an ordinary failure.
+                let interrupted = result.is_err()
+                    && matches!(&v, Value::Future(future) if matches!(
+                        &*future.get().state.lock().unwrap(),
+                        cljrs_value::FutureState::Interrupted
+                    ));
+                (result, i, interrupted)
             }) as AltBranch
         })
         .collect();
-    let ((result, idx), _, _) = futures_util::future::select_all(branches).await;
-    let value = result.unwrap_or(Value::Nil);
-    Value::Vector(GcPtr::new(PersistentVector::from_iter([
+    let ((result, idx, interrupted), _, _) = futures_util::future::select_all(branches).await;
+    let value = match result {
+        // Return the uncatchable `Cancelled`, like `take!`. Run as a spawned
+        // future (`alts`), the select then settles as Interrupted, so its
+        // awaiters see the catchable cancellation exception and an unread
+        // result is not reported. A direct caller of `alts_select` receives
+        // `Cancelled` itself.
+        Err(_) if interrupted => return Err(EvalError::Cancelled),
+        Err(
+            error @ (EvalError::GasExhausted
+            | EvalError::Cancelled
+            | EvalError::MemoryLimitExceeded(_)),
+        ) => {
+            return Err(error);
+        }
+        other => other.unwrap_or(Value::Nil),
+    };
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
         value,
         Value::Long(idx as i64),
-    ])))
+    ]))))
 }
 
 // ── Channels ────────────────────────────────────────────────────────────────
@@ -131,7 +188,9 @@ async fn alts_select(futures: Vec<Value>) -> Value {
 /// task.
 fn channel_arg(args: &[Value]) -> ValueResult<GcPtr<NativeObjectBox>> {
     match args.first() {
-        Some(Value::NativeObject(obj)) if obj.get().type_tag() == CHANNEL_TAG => Ok(obj.clone()),
+        Some(value @ Value::NativeObject(obj)) if crate::channel::as_channel(value).is_some() => {
+            Ok(obj.clone())
+        }
         other => Err(ValueError::WrongType {
             expected: "channel",
             got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
@@ -173,9 +232,20 @@ fn builtin_chan(args: &[Value]) -> ValueResult<Value> {
 /// event-driven notification rather than busy-polling.
 fn builtin_take(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
-    Ok(spawn_future(
-        async move { Ok(chan_ref(ch.get()).take().await) },
-    ))
+    Ok(spawn_future_with_roots(args.to_vec(), async move {
+        let channel = chan_ref(ch.get());
+        let value = channel.take().await;
+        match channel.failure_kind() {
+            // Settle as Interrupted, like the cancelled producer: awaiters get
+            // the catchable cancellation exception, and `alts` can tell it
+            // from `future-cancel`. Discarding it unread is not reported.
+            Some(crate::channel::ChannelFailure::Cancelled) => Err(EvalError::Cancelled),
+            Some(failure) => Err(cljrs_runtime::env::error::value_error_to_eval_error(
+                failure.reader_error(),
+            )),
+            None => Ok(value),
+        }
+    }))
 }
 
 /// `(put! ch val)` — a Future that resolves `true` once `val` is delivered (for
@@ -184,7 +254,7 @@ fn builtin_take(args: &[Value]) -> ValueResult<Value> {
 fn builtin_put(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
     let val = args.get(1).cloned().unwrap_or(Value::Nil);
-    Ok(spawn_future(async move {
+    Ok(spawn_future_with_roots(args.to_vec(), async move {
         Ok(Value::Bool(chan_ref(ch.get()).put(val).await))
     }))
 }
@@ -200,7 +270,12 @@ fn builtin_close(args: &[Value]) -> ValueResult<Value> {
 /// channel is empty or closed. Never parks.
 fn builtin_poll(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
-    Ok(chan_ref(ch.get()).try_take().unwrap_or(Value::Nil))
+    let channel = chan_ref(ch.get());
+    let value = channel.try_take().unwrap_or(Value::Nil);
+    if let Some(error) = channel.failure() {
+        return Err(error);
+    }
+    Ok(value)
 }
 
 /// `(offer! ch val)` — non-blocking put. Returns `true` if `val` was buffered
@@ -219,45 +294,78 @@ fn builtin_offer(args: &[Value]) -> ValueResult<Value> {
 
 // ── Phase H: blocking sync-context channel ops (<!! / >!!) ──────────────────
 
-/// `(<!! ch)` — blocking take from a synchronous (non-async) context.
+/// `(<!! ch)` — take from a channel, parking the calling fiber.
 ///
-/// Parks the calling OS thread until a value is available on `ch`, or returns
-/// `nil` if `ch` is closed and drained. Must **not** be called from inside an
-/// `^:async` function — use `(await (take! ch))` there instead.
+/// Parks a fiber until data arrives, or blocks the OS thread outside a fiber.
+/// Returns nil on a closed, drained channel. Colored async callers use take!.
+/// An `^:async` call returns a future; a take of a future or promise waits for
+/// its value.
 fn builtin_take_blocking(args: &[Value]) -> ValueResult<Value> {
-    if cljrs_runtime::env::callback::current_is_async() {
-        return Err(ValueError::Other(
-            "<!! (blocking take) must not be called inside an ^:async function; \
-             use (await (take! ch)) instead"
-                .into(),
-        ));
-    }
-    let ch = channel_arg(args)?;
-    Ok(chan_ref(ch.get()).take_blocking())
+    take_parking("<!!", args)
 }
 
-/// `(>!! ch val)` — blocking put from a synchronous (non-async) context.
-///
-/// Parks the calling OS thread until `val` is accepted by `ch` (buffered or
-/// handed off in a rendezvous). Returns `true` on success, `false` if `ch` is
-/// closed. Must **not** be called from inside an `^:async` function — use
-/// `(await (put! ch val))` there instead.
-fn builtin_put_blocking(args: &[Value]) -> ValueResult<Value> {
-    if cljrs_runtime::env::callback::current_is_async() {
-        return Err(ValueError::Other(
-            ">!! (blocking put) must not be called inside an ^:async function; \
-             use (await (put! ch val)) instead"
-                .into(),
-        ));
+/// `(<! ch)` — the parking take, under its core.async name (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_take_parking(args: &[Value]) -> ValueResult<Value> {
+    take_parking("<!", args)
+}
+
+/// What a colored body should call instead of a parking `alts`: the same
+/// exactly-one selection, awaited. (`alts` over `take!` futures would lose the
+/// values its losing takes consume.)
+#[cfg(target_arch = "wasm32")]
+const ALTS_COLORED_HINT: &str = "(alts! ports)";
+#[cfg(not(target_arch = "wasm32"))]
+const ALTS_COLORED_HINT: &str = "(await (alts!-future ports))";
+
+/// Reject a carrier wait from a colored (wasm32 `eval_async`) body, naming the
+/// operation the caller used.
+fn reject_colored_wait(name: &str, instead: &str) -> ValueResult<()> {
+    if cljrs_runtime::env::callback::current_is_async() && cljrs_value::parking::current().is_none()
+    {
+        return Err(ValueError::Other(format!(
+            "{name} must not be called directly inside a colored async body; use {instead} instead"
+        )));
     }
+    Ok(())
+}
+
+fn take_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait(name, "(await (take! ch))")?;
+    if let Some(pending @ (Value::Future(_) | Value::Promise(_))) = args.first() {
+        return cljrs_runtime::interp::eval::deref_value(pending.clone())
+            .map_err(cljrs_runtime::env::callback::eval_error_to_value_error);
+    }
+    let ch = channel_arg(args)?;
+    crate::channel::take_sync(&args[0], chan_ref(ch.get()))
+}
+
+/// `(>!! ch val)` — put onto a channel, parking the calling fiber.
+///
+/// Parks a fiber until accepted, or blocks the OS thread outside a fiber.
+/// Returns true on success and false when closed. Colored async callers use put!.
+fn builtin_put_blocking(args: &[Value]) -> ValueResult<Value> {
+    put_parking(">!!", args)
+}
+
+/// `(>! ch val)` — the parking put, under its core.async name (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_put_parking(args: &[Value]) -> ValueResult<Value> {
+    put_parking(">!", args)
+}
+
+fn put_parking(name: &str, args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait(name, "(await (put! ch val))")?;
     let ch = channel_arg(args)?;
     let val = args.get(1).cloned().unwrap_or(Value::Nil);
     Ok(Value::Bool(chan_ref(ch.get()).put_blocking(val)))
 }
 
-/// `(async-spawn thunk)` — run a zero-arg function as an async task on the
-/// `LocalSet`, returning a `Value::Future`. The thunk body runs in an async
-/// context, so `await` inside it yields. This is the runtime behind `go`.
+/// `(async-spawn thunk)` — run a zero-arg function concurrently, returning a
+/// `Value::Future` of its value. (`go` returns a result channel through
+/// `thread-call` instead.) Native targets run the thunk on its own fiber, where
+/// `await`, `<!`, and other waits park the fiber. wasm32 runs it as a colored
+/// `eval_async` task.
 fn builtin_async_spawn(args: &[Value]) -> ValueResult<Value> {
     let thunk = args.first().cloned().unwrap_or(Value::Nil);
     let (globals, ns) = cljrs_runtime::env::callback::capture_eval_context()
@@ -278,10 +386,10 @@ fn builtin_async_spawn(args: &[Value]) -> ValueResult<Value> {
 /// propagates immediately.
 fn builtin_join_all(args: &[Value]) -> ValueResult<Value> {
     let futures = match args.first() {
-        Some(v) => value_to_seq_vec(v),
+        Some(v) => value_to_seq_vec(v)?,
         None => Vec::new(),
     };
-    Ok(spawn_future(async move {
+    Ok(spawn_future_with_roots(args.to_vec(), async move {
         let branches: Vec<_> = futures
             .into_iter()
             .map(|v| Box::pin(await_value(v)))
@@ -297,9 +405,10 @@ fn builtin_join_all(args: &[Value]) -> ValueResult<Value> {
     }))
 }
 
-/// `(thread-call f)` — run zero-arg function `f` as an async task on the
-/// `LocalSet` and return a channel that receives the result. This is the
-/// runtime backing the `thread` macro.
+/// Run a zero-arg function in a native fiber and return its result channel.
+/// A non-nil result is delivered before closure; nil/errors only close it.
+/// On wasm32, use the existing async task path.
+#[allow(clippy::result_large_err)]
 fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let thunk = args.first().cloned().unwrap_or(Value::Nil);
     let (globals, ns) = cljrs_runtime::env::callback::capture_eval_context()
@@ -310,18 +419,63 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
     let result_ch = gc_native_object(CljChannel::new(1));
     let ch_val = Value::NativeObject(result_ch.clone());
     let call_env = Env::new(globals, &ns);
-    let fut = rt.spawn_async_call(thunk, Vec::new(), call_env);
-    spawn_future(async move {
-        let v = await_value(fut).await.unwrap_or(Value::Nil);
-        loop {
-            if chan_ref(result_ch.get()).try_put_buffered(&v).is_some() {
-                break;
-            }
-            tokio::task::yield_now().await;
+    // Native: the fiber's own executor task delivers its result, so a `go`
+    // costs one LocalSet task and one root state (issue #458). The channel is
+    // among the fiber's roots, which stay registered through delivery.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = rt;
+        let task = crate::runtime::call_fiber(thunk, Vec::new(), call_env, vec![ch_val.clone()])
+            .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?
+            .into_task();
+        crate::fiber::spawn_delivering(task, move |result| {
+            let _ = deliver_thread_result(chan_ref(result_ch.get()), result);
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let body = crate::task::await_value(
+            rt.spawn_fiber_call(thunk, Vec::new(), call_env)
+                .map_err(cljrs_runtime::env::callback::eval_error_to_value_error)?,
+        );
+        let anchor = ch_val.clone();
+        let delivery = spawn_future_with_roots(args.to_vec(), async move {
+            let _root = cljrs_runtime::env::gc_roots::root_value(&anchor);
+            deliver_thread_result(chan_ref(result_ch.get()), body.await)
+        });
+        if let Value::Future(future) = delivery {
+            future.get().mark_observed();
         }
-        Ok(Value::Nil)
-    });
+    }
     Ok(ch_val)
+}
+
+/// Send a `thread-call` body's non-nil result to its channel and close it, or
+/// fail the channel for an interrupt, exhausted gas or memory limit. Other
+/// errors are reported and only close the channel.
+#[allow(clippy::result_large_err)]
+fn deliver_thread_result(channel: &CljChannel, result: EvalResult) -> EvalResult {
+    match result {
+        Ok(value) if !matches!(value, Value::Nil) => {
+            channel.try_put_buffered(&value);
+        }
+        Ok(_) => {}
+        Err(error @ EvalError::Cancelled) => {
+            channel.fail(crate::channel::ChannelFailure::Cancelled);
+            return Err(error);
+        }
+        Err(error @ EvalError::GasExhausted) => {
+            channel.fail(crate::channel::ChannelFailure::Gas);
+            return Err(error);
+        }
+        Err(EvalError::MemoryLimitExceeded(fault)) => {
+            channel.fail(crate::channel::ChannelFailure::Memory(fault));
+            return Err(EvalError::MemoryLimitExceeded(fault));
+        }
+        Err(error) => eprintln!("[clojurust thread error] {error}"),
+    }
+    channel.close();
+    Ok(Value::Nil)
 }
 
 /// `(onto-chan! ch coll)` — put every value from `coll` onto `ch` and then
@@ -331,36 +485,13 @@ fn builtin_thread_call(args: &[Value]) -> ValueResult<Value> {
 fn builtin_onto_chan(args: &[Value]) -> ValueResult<Value> {
     let ch = channel_arg(args)?;
     let coll = args.get(1).cloned().unwrap_or(Value::Nil);
-    let values = value_to_seq_vec(&coll);
-    let rendezvous = chan_ref(ch.get()).is_rendezvous();
-    Ok(spawn_future(async move {
+    let values = value_to_seq_vec(&coll)?;
+    Ok(spawn_future_with_roots(args.to_vec(), async move {
         for v in values {
-            if rendezvous {
-                let token = loop {
-                    match chan_ref(ch.get()).rv_offer(&v) {
-                        RvOffer::Offered(t) => break t,
-                        RvOffer::Closed => return Ok(Value::NativeObject(ch)),
-                        RvOffer::Full => {}
-                    }
-                    tokio::task::yield_now().await;
-                };
-                loop {
-                    match chan_ref(ch.get()).rv_status(token) {
-                        RvStatus::Taken => break,
-                        RvStatus::ClosedUntaken => return Ok(Value::NativeObject(ch)),
-                        RvStatus::Waiting => {}
-                    }
-                    tokio::task::yield_now().await;
-                }
-            } else {
-                loop {
-                    match chan_ref(ch.get()).try_put_buffered(&v) {
-                        Some(true) => break,
-                        Some(false) => return Ok(Value::NativeObject(ch)),
-                        None => {}
-                    }
-                    tokio::task::yield_now().await;
-                }
+            // Parks until a taker (or buffer slot) accepts the value; `false`
+            // means the channel closed first, so stop without closing again.
+            if !chan_ref(ch.get()).put(v).await {
+                return Ok(Value::NativeObject(ch));
             }
         }
         chan_ref(ch.get()).close();
@@ -373,19 +504,14 @@ fn builtin_onto_chan(args: &[Value]) -> ValueResult<Value> {
 /// immediately.
 fn builtin_to_chan(args: &[Value]) -> ValueResult<Value> {
     let coll = args.first().cloned().unwrap_or(Value::Nil);
-    let values = value_to_seq_vec(&coll);
+    let values = value_to_seq_vec(&coll)?;
     let capacity = values.len().max(1);
     let ch = gc_native_object(CljChannel::new(capacity));
     let ch_val = Value::NativeObject(ch.clone());
-    spawn_future(async move {
+    spawn_future_with_roots(args.to_vec(), async move {
         for v in values {
-            loop {
-                match chan_ref(ch.get()).try_put_buffered(&v) {
-                    Some(true) => break,
-                    Some(false) => return Ok(Value::Nil),
-                    None => {}
-                }
-                tokio::task::yield_now().await;
+            if !chan_ref(ch.get()).put(v).await {
+                return Ok(Value::Nil);
             }
         }
         chan_ref(ch.get()).close();
@@ -419,58 +545,28 @@ fn builtin_mult(args: &[Value]) -> ValueResult<Value> {
     let mult = gc_native_object(CljMult::new());
     let mult_val = Value::NativeObject(mult.clone());
 
-    spawn_future(async move {
+    spawn_future_with_roots(args.to_vec(), async move {
         loop {
-            // Take the next value from the source channel.
-            let v = loop {
-                match chan_ref(source_ch.get()).try_take() {
-                    // `nil` from try_take means the channel is closed and drained.
-                    Some(Value::Nil) => {
-                        let taps = mult_ref(mult.get()).taps.lock().unwrap().clone();
-                        for (tap_ch, close_on_done) in &taps {
-                            if *close_on_done {
-                                chan_ref(tap_ch.get()).close();
-                            }
-                        }
-                        return Ok(Value::Nil);
+            // Park until the source yields a value; `nil` means it is closed
+            // and drained.
+            let v = chan_ref(source_ch.get()).take().await;
+            if matches!(v, Value::Nil) {
+                let taps = mult_ref(mult.get()).taps.lock().unwrap().clone();
+                for (tap_ch, close_on_done) in &taps {
+                    if *close_on_done {
+                        chan_ref(tap_ch.get()).close();
                     }
-                    Some(v) => break v,
-                    None => {}
                 }
-                tokio::task::yield_now().await;
-            };
+                return Ok(Value::Nil);
+            }
 
             // Snapshot the tap list to avoid holding the lock during puts.
             let taps: Vec<(GcPtr<NativeObjectBox>, bool)> =
                 mult_ref(mult.get()).taps.lock().unwrap().clone();
 
+            // Each put parks until that tap accepts the value or closes.
             for (tap_ch, _) in &taps {
-                if chan_ref(tap_ch.get()).is_rendezvous() {
-                    let token = loop {
-                        match chan_ref(tap_ch.get()).rv_offer(&v) {
-                            RvOffer::Offered(t) => break Some(t),
-                            RvOffer::Closed => break None,
-                            RvOffer::Full => {}
-                        }
-                        tokio::task::yield_now().await;
-                    };
-                    if let Some(token) = token {
-                        loop {
-                            match chan_ref(tap_ch.get()).rv_status(token) {
-                                RvStatus::Taken | RvStatus::ClosedUntaken => break,
-                                RvStatus::Waiting => {}
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                } else {
-                    loop {
-                        if chan_ref(tap_ch.get()).try_put_buffered(&v).is_some() {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                }
+                let _ = chan_ref(tap_ch.get()).put(v.clone()).await;
             }
         }
     });
@@ -514,4 +610,163 @@ fn builtin_untap_all(args: &[Value]) -> ValueResult<Value> {
     let mult_obj = mult_arg(args, 0)?;
     mult_ref(mult_obj.get()).taps.lock().unwrap().clear();
     Ok(Value::NativeObject(mult_obj))
+}
+
+/// Select exactly one take or `[channel value]` put. Options are :priority
+/// (input order) and :default (return immediately when nothing is ready).
+fn builtin_alts_blocking(args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait("alts!!", ALTS_COLORED_HINT)?;
+    let (requests, default) = alts_requests("alts!!", args)?;
+    // The guard records the slice's address, so the Vec must outlive it.
+    let roots = alts_roots(&requests, &default);
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&roots);
+    cljrs_value::parking::block_on(alts_select_ports(requests, default))
+}
+
+/// `(alts! ports & opts)` — `alts!!` under its core.async name (native targets).
+#[cfg(not(target_arch = "wasm32"))]
+fn builtin_alts_parking(args: &[Value]) -> ValueResult<Value> {
+    reject_colored_wait("alts!", ALTS_COLORED_HINT)?;
+    let (requests, default) = alts_requests("alts!", args)?;
+    // The guard lives on the parked fiber's own root stack and records the
+    // slice's address, so the Vec must outlive it.
+    let roots = alts_roots(&requests, &default);
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&roots);
+    cljrs_value::parking::block_on(alts_select_ports(requests, default))
+}
+
+/// `(alts!-future ports & opts)` — the same selection as a future, which the
+/// wasm32 `alts!` macro awaits inside colored `go` bodies. Unlike `alts` over
+/// `take!` futures, it completes exactly one operation and returns `[val ch]`.
+fn builtin_alts_future(args: &[Value]) -> ValueResult<Value> {
+    let (requests, default) = alts_requests("alts!-future", args)?;
+    // The task's captured roots keep the ports alive; no guard spans an await.
+    let roots = alts_roots(&requests, &default);
+    Ok(spawn_future_with_roots(roots, async move {
+        alts_select_ports(requests, default)
+            .await
+            .map_err(cljrs_runtime::env::error::value_error_to_eval_error)
+    }))
+}
+
+/// One parsed `alts` port: a channel, and the value to put (`None` for a take).
+type AltsRequest = (GcPtr<NativeObjectBox>, Option<Value>);
+
+/// The managed values a selection must keep alive: channels, put values, and
+/// the default. Callers root these for the selection's whole wait.
+fn alts_roots(requests: &[AltsRequest], default: &Option<Value>) -> Vec<Value> {
+    requests
+        .iter()
+        .flat_map(|(channel, value)| {
+            std::iter::once(Value::NativeObject(channel.clone())).chain(value.clone())
+        })
+        .chain(default.clone())
+        .collect()
+}
+
+/// Parse `alts!`/`alts!!` ports and options, naming `name` in errors. Ports
+/// are shuffled unless `:priority` is set.
+fn alts_requests(name: &str, args: &[Value]) -> ValueResult<(Vec<AltsRequest>, Option<Value>)> {
+    let alternatives = value_to_seq_vec(&args[0])?;
+    let _roots = cljrs_runtime::env::gc_roots::root_values(&alternatives);
+    let mut default = None;
+    let mut priority = false;
+    let mut option = |key: &Value, value: &Value| -> ValueResult<()> {
+        match key {
+            Value::Keyword(k)
+                if k.get().namespace.is_none() && k.get().name.as_ref() == "default" =>
+            {
+                default = Some(value.clone())
+            }
+            Value::Keyword(k)
+                if k.get().namespace.is_none() && k.get().name.as_ref() == "priority" =>
+            {
+                priority = !matches!(value, Value::Nil | Value::Bool(false))
+            }
+            _ => {
+                return Err(ValueError::Other(format!(
+                    "{name} accepts only :default and :priority options"
+                )));
+            }
+        }
+        Ok(())
+    };
+    if let [Value::Map(options)] = &args[1..] {
+        for (key, value) in options.iter() {
+            option(key, value)?;
+        }
+    } else {
+        if !(args.len() - 1).is_multiple_of(2) {
+            return Err(ValueError::Other(format!(
+                "{name} options require key/value pairs"
+            )));
+        }
+        for [key, value] in args[1..].as_chunks::<2>().0 {
+            option(key, value)?;
+        }
+    }
+    if alternatives.is_empty() && default.is_none() {
+        return Err(ValueError::Other(format!(
+            "{name} requires at least one channel or a :default option"
+        )));
+    }
+    let mut requests = Vec::with_capacity(alternatives.len());
+    for alternative in &alternatives {
+        let (channel, value) = if let Value::Vector(pair) = alternative {
+            if pair.get().count() != 2 {
+                return Err(ValueError::Other(format!(
+                    "{name} put alternatives require [channel value]"
+                )));
+            }
+            let value = pair.get().nth(1).unwrap().clone();
+            if matches!(value, Value::Nil) {
+                return Err(ValueError::Other("cannot put nil on a channel".into()));
+            }
+            (
+                channel_arg(std::slice::from_ref(pair.get().nth(0).unwrap()))?,
+                Some(value),
+            )
+        } else {
+            (channel_arg(std::slice::from_ref(alternative))?, None)
+        };
+        requests.push((channel, value));
+    }
+    if !priority {
+        requests.shuffle(&mut rand::rng());
+    }
+    Ok((requests, default))
+}
+
+/// Complete exactly one of `requests` (or return `default`), yielding
+/// `[value channel]`, or `[default :default]`. The caller roots
+/// [`alts_roots`] for the whole wait.
+async fn alts_select_ports(
+    requests: Vec<AltsRequest>,
+    default: Option<Value>,
+) -> ValueResult<Value> {
+    let ops = requests
+        .iter()
+        .map(|(channel, value)| {
+            let ch = chan_ref(channel.get());
+            match value {
+                Some(value) => crate::channel::SelectOp::Put(ch, value.clone()),
+                None => crate::channel::SelectOp::Take(ch),
+            }
+        })
+        .collect();
+    let (value, index) = crate::channel::select(ops, default).await;
+    if index != usize::MAX
+        && requests[index].1.is_none()
+        && let Some(error) = chan_ref(requests[index].0.get()).failure()
+    {
+        return Err(error);
+    }
+    let channel = if index == usize::MAX {
+        Value::keyword(cljrs_value::Keyword::simple("default"))
+    } else {
+        Value::NativeObject(requests[index].0.clone())
+    };
+    Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter([
+        value, channel,
+    ]))))
 }

@@ -289,6 +289,8 @@ fn lower_namespace(
     verbose: bool,
 ) -> Result<(usize, usize), String> {
     // Collect all var names and their values from the namespace's interns.
+    #[cfg(feature = "no-gc")]
+    let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
     let var_entries: Vec<(Arc<str>, Value)> = {
         let ns_map = globals.namespaces.read().unwrap();
         let ns = ns_map

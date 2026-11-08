@@ -8,6 +8,8 @@ thread_local! {
     static TRANSACTION_DEPTH: Cell<usize> = const { Cell::new(0) };
     static TRANSACTION_GENSYM: Cell<u64> = const { Cell::new(0) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/TRANSACTION_DEPTH", cell TRANSACTION_DEPTH: usize);
+cljrs_gc::mutator_slot!("cljrs-runtime/TRANSACTION_GENSYM", cell TRANSACTION_GENSYM: u64);
 
 /// Installs the side-effect-free transaction policy for its dynamic extent.
 #[must_use = "dropping the guard removes the transaction execution policy"]

@@ -50,13 +50,13 @@ fn checkpoint_after_yield() -> cljrs_value::Value {
 /// task stops.
 #[test]
 fn an_interrupt_stops_only_tasks_of_the_interrupted_evaluation() {
+    use cljrs_runtime::env::gas::InterruptFlag;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
 
     block_on_local(async {
         let bystander = checkpoint_after_yield();
 
-        let flag = Arc::new(AtomicBool::new(true));
+        let flag = Arc::new(InterruptFlag::new(true));
         let _guard = cljrs_runtime::env::gas::InterruptGuard::install(flag);
         let own = checkpoint_after_yield();
 
@@ -83,20 +83,20 @@ proptest::proptest! {
         driver in proptest::bool::ANY,
     ) {
         use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
+        use cljrs_runtime::env::gas::InterruptFlag;
         use cljrs_runtime::env::gas::InterruptGuard;
 
         let stopped = block_on_local(async {
             let tasks: Vec<cljrs_value::Value> = spawners
                 .iter()
                 .map(|interrupted| {
-                    let _eval = InterruptGuard::install(Arc::new(AtomicBool::new(*interrupted)));
+                    let _eval = InterruptGuard::install(Arc::new(InterruptFlag::new(*interrupted)));
                     checkpoint_after_yield()
                 })
                 .collect();
             // A settled future is no longer rooted by its task.
             let _tasks_root = cljrs_runtime::env::gc_roots::root_values(&tasks);
-            let _driver = InterruptGuard::install(Arc::new(AtomicBool::new(driver)));
+            let _driver = InterruptGuard::install(Arc::new(InterruptFlag::new(driver)));
             let mut stopped = Vec::with_capacity(tasks.len());
             for task in &tasks {
                 let outcome = await_value(task.clone()).await;

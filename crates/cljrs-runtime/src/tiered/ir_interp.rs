@@ -167,6 +167,12 @@ fn region_alloc_val<T: cljrs_gc::Trace + 'static>(
     target: Option<*mut cljrs_gc::region::Region>,
     val: T,
 ) -> cljrs_gc::GcPtr<T> {
+    #[cfg(feature = "no-gc")]
+    {
+        let _ = target;
+        GcPtr::new(val)
+    }
+    #[cfg(not(feature = "no-gc"))]
     match target {
         // SAFETY: handles are only bound to regions owned by a live
         // `RegionEntry` of this or a caller's frame.
@@ -290,7 +296,15 @@ fn try_osr_enter(slot: &OsrSlot, regs: &Registers, env: &mut Env) -> Option<Eval
     // Same as `call_jit_native`: an uncaught `(throw …)` inside native code
     // stashes the thrown value and returns the nil sentinel — surface it as an
     // error while the alloc frame still roots it.
-    if let Some(thrown) = env.globals.jit().take_pending_exception() {
+    let pending_exception = env.globals.jit().take_pending_exception();
+    let resource_error = env.globals.jit().take_pending_resource_error();
+    if let Some(error) = resource_error {
+        return Some(Err(crate::env::error::value_error_to_eval_error(error)));
+    }
+    if let Err(fault) = crate::env::gc_roots::check_memory_fault() {
+        return Some(Err(fault));
+    }
+    if let Some(thrown) = pending_exception {
         return Some(Err(crate::env::error::EvalError::Thrown(thrown)));
     }
     Some(Ok(result))
@@ -346,8 +360,40 @@ fn interpret_ir_inner(
     osr_arity_id: Option<u64>,
     inherited_region: Option<*mut cljrs_gc::region::Region>,
 ) -> EvalResult {
-    // GC safepoint at function entry.
-    crate::env::gc_roots::gc_safepoint(env);
+    cljrs_value::realization::catch(|| {
+        interpret_ir_body(
+            ir_func,
+            args,
+            globals,
+            ns,
+            env,
+            osr_arity_id,
+            inherited_region,
+        )
+    })
+    .unwrap_or_else(|message| {
+        Err(value_error_to_eval_error(cljrs_value::ValueError::Other(
+            message,
+        )))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn interpret_ir_body(
+    ir_func: &IrFunction,
+    args: Vec<Value>,
+    globals: &Arc<GlobalEnv>,
+    ns: &Arc<str>,
+    env: &mut Env,
+    osr_arity_id: Option<u64>,
+    inherited_region: Option<*mut cljrs_gc::region::Region>,
+) -> EvalResult {
+    // GC safepoint at function entry.  Root the arguments first: a caller
+    // such as a native `reduce` may hold the only reference to them.
+    {
+        let _args_root = crate::env::gc_roots::root_values(&args);
+        crate::env::gc_roots::gc_safepoint(env)?;
+    }
 
     let mut regs = Registers::new(ir_func.next_var);
     // Keep all values in the register file alive across GC safepoints.
@@ -367,6 +413,13 @@ fn interpret_ir_inner(
             regs.set(*var_id, Value::Nil);
         }
     }
+
+    // Mark where this call's heap allocations start in ALLOC_ROOTS.  Each loop
+    // back-edge releases them (see `RecurJump` below).  The frame is never
+    // dropped: on return the allocations made since the last back-edge,
+    // including the result, stay rooted in the caller's frame as they did
+    // before IR calls had a frame, since native callers rely on that.
+    let alloc_frame = std::mem::ManuallyDrop::new(cljrs_gc::push_alloc_frame());
 
     // Build a block index for O(1) lookup.
     // In the common case (dense sequential IDs), this is None and we use
@@ -472,8 +525,14 @@ fn interpret_ir_inner(
                 current_block_idx = resolve(target);
             }
             Terminator::RecurJump { target, args: _ } => {
+                // Every value live across the back-edge is in the register
+                // file, which is rooted for the whole call, so the previous
+                // iterations' allocations need no alloc-frame roots: release
+                // them so the dead intermediates are collectable.
+                alloc_frame.release();
+
                 // GC safepoint at loop back-edge.
-                crate::env::gc_roots::gc_safepoint(env);
+                crate::env::gc_roots::gc_safepoint(env)?;
 
                 // Loop back-edge counter: a hot header triggers background OSR
                 // compilation; the transfer happens at the header entry above.
@@ -588,14 +647,14 @@ fn execute_inst(
 
         Inst::CallKnown(dst, known_fn, args) => {
             // GC safepoint before call.
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_known_fn(known_fn, arg_vals, env)?;
             regs.set(*dst, result);
         }
 
         Inst::Call(dst, callee, args) => {
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let callee_val = regs.get_cloned(*callee);
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_or_sentinel(callee_val, arg_vals, globals, ns, env)?;
@@ -603,7 +662,7 @@ fn execute_inst(
         }
 
         Inst::CallDirect(dst, name, args) => {
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let arg_vals: Vec<Value> = args.iter().map(|v| regs.get_cloned(*v)).collect();
             let result = dispatch_sentinel_by_name(name, arg_vals, globals, ns, env)?;
             regs.set(*dst, result);
@@ -701,7 +760,7 @@ fn execute_inst(
         }
 
         Inst::CallWithRegion(dst, name, args, region) => {
-            crate::env::gc_roots::gc_safepoint(env);
+            crate::env::gc_roots::gc_safepoint(env)?;
             let target = ir_func
                 .subfunctions
                 .iter()
@@ -735,9 +794,10 @@ fn execute_inst(
         // in practice.  They provide a graceful sync-context fallback for the
         // cases where they are reached (e.g. in tests or non-async callers).
         Inst::Await { src, dst } => {
-            // Sync fallback: block the OS thread until the future/promise resolves.
+            // Same as the tree-walker's `await`: park (or block outside a
+            // fiber) until the future, promise, or channel delivers.
             let val = regs.get_cloned(*src);
-            let resolved = crate::interp::eval::deref_value(val)?;
+            let resolved = crate::interp::eval::await_value_sync(val, globals)?;
             regs.set(*dst, resolved);
         }
 
@@ -939,7 +999,7 @@ fn alloc_closure(
     globals: &Arc<GlobalEnv>,
     ns: &Arc<str>,
 ) -> EvalResult {
-    let captured_values: Vec<Value> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
+    let captured_values: Arc<[Value]> = capture_vars.iter().map(|v| regs.get_cloned(*v)).collect();
 
     // Build a CljxFn-like wrapper using NativeFunction.
     // Each arity maps to a named subfunction in ir_func.subfunctions.
@@ -982,6 +1042,9 @@ fn alloc_closure(
 
     // Create a native function that dispatches to the IR interpreter.
     let nf = NativeFn {
+        blocking_func: None,
+        diagnostic_id: Default::default(),
+        captures: captured_values.clone(),
         name: fn_name.as_deref().unwrap_or("<ir-closure>").into(),
         arity: if param_counts.len() == 1 && !is_variadic[0] {
             cljrs_value::Arity::Fixed(param_counts[0])
@@ -1027,7 +1090,7 @@ fn alloc_closure(
                 let subfunc = &subfuncs[idx];
 
                 // Build full args: captures + call_args (+ rest list for variadic).
-                let mut full_args = captured_values.clone();
+                let mut full_args = captured_values.to_vec();
                 if is_variadic[idx] {
                     let pc = param_counts[idx];
                     // Fixed params.
@@ -1324,7 +1387,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
         }
         KnownFn::KwargsMap => {
             let rest = args.into_iter().next().unwrap_or(Value::Nil);
-            let items = value_to_seq_vec(&rest);
+            let items =
+                value_to_seq_vec(&rest).map_err(crate::env::error::value_error_to_eval_error)?;
             Value::from_kwargs_rest(items).map_err(value_error_to_eval_error)
         }
         KnownFn::Aget => builtin_call_native("aget", &args),
@@ -1459,7 +1523,8 @@ fn dispatch_known_fn(known_fn: &KnownFn, args: Vec<Value>, env: &mut Env) -> Eva
             let mut args = args;
             let f = args.remove(0);
             let last = args.pop().unwrap();
-            let spread = crate::interp::destructure::value_to_seq_vec(&last);
+            let spread = crate::interp::destructure::value_to_seq_vec(&last)
+                .map_err(crate::env::error::value_error_to_eval_error)?;
             args.extend(spread);
             apply_value(&f, args, env)
         }

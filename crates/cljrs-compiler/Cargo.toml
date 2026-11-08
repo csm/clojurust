@@ -27,6 +27,7 @@ aot_full_test = []
 no-gc = ["cljrs-gc/no-gc", "cljrs-value/no-gc", "cljrs-runtime/no-gc", "cljrs-stdlib/no-gc", "cljrs-async/no-gc"]
 
 [dependencies]
+cljrs-export-macro = { workspace = true }
 cljrs-runtime = { workspace = true }
 tracing        = { workspace = true }
 # The async runtime is an ABI dependency, not a product extension: codegen and
@@ -57,6 +58,7 @@ wasm-encoder       = { version = "0.244", optional = true }
 serde_json         = "1"
 
 [dev-dependencies]
+cljrs-interop = { workspace = true }
 # Extensions the end-to-end tests compile programs against, exactly as a host
 # would supply them.
 cljrs-io      = { workspace = true }

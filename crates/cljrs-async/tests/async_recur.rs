@@ -9,12 +9,15 @@
 //!
 //! A deadlock stalls a test binary instead of failing it, so every case here
 //! runs on a watchdog thread and the assertion is on `recv_timeout`.
+//!
+//! Since virtual-threads Phase 5 these cases run on fibers (`fiber::eval_form`);
+//! the colored `eval_async` evaluator they first targeted is wasm32-only.
 
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use cljrs_async::eval_async::eval_async;
+use cljrs_async::fiber::eval_form_unrooted;
 use cljrs_reader::Parser;
 use cljrs_runtime::env::env::{Env, GlobalEnv};
 use cljrs_value::Value;
@@ -57,7 +60,9 @@ fn eval_async_src(src: &str) -> Option<String> {
             let mut parser = Parser::new(src, "<test>".to_string());
             let mut result = Value::Nil;
             for form in parser.parse_all().expect("parse error") {
-                result = eval_async(&form, &mut env).await.expect("eval error");
+                result = eval_form_unrooted(&form, &mut env)
+                    .await
+                    .expect("eval error");
             }
             format!("{result}")
         });

@@ -119,6 +119,7 @@ pub enum EvalError {
     Runtime(String),
     Read(CljxError),             // reader/parse failure, carries file/line/col
     GasExhausted,                // the execution-credit budget ran out
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded), // strict memory governor refused an allocation
     ForbiddenEffect(String),     // a capability denied by the transaction policy
     Recur(Vec<Value>),           // `recur` outside a loop — never escapes normal code
     CommitSignatureVerificationFailed { commit: String, reason: String },
@@ -126,7 +127,9 @@ pub enum EvalError {
 ```
 
 Guest exceptions arrive as `Thrown`, carrying the thrown value; the rest are the
-evaluator's own failures. A host that reports to users will want to map these to
+evaluator's own failures. `GasExhausted` and `MemoryLimitExceeded` are not
+catchable by guest `try`/`catch`; the latter appears only when the process
+memory governor runs in strict mode (`CLJRS_MEMORY_STRICT=1`). A host that reports to users will want to map these to
 its own error type — `EvalError::to_error_value` converts one into a Clojure
 error *value* if you would rather hand the failure back to guest code than
 propagate it into Rust.

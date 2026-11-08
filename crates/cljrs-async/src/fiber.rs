@@ -1,0 +1,1044 @@
+//! Stackful, thread-pinned computations driven by a Tokio LocalSet.
+//!
+//! `park_on` can wait through arbitrary synchronous Rust/Clojure frames. The
+//! future stays pinned on the fiber stack, so it may borrow stack locals. The
+//! driver polls it with the fiber's mutator state installed. Cancellation
+//! unwinds that stack with the same state installed before returning it to the
+//! bounded stack pool.
+//!
+//! As with other Rust tasks, opaque closure/future captures are not precise GC
+//! roots. Use `with_roots`/`spawn_rooted` for captured Values, and the runtime's
+//! root guards for locals that must survive a park or a collecting safepoint.
+
+#![allow(clippy::result_large_err)]
+
+use std::cell::{Cell, RefCell};
+use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
+
+use cljrs_gc::mutator::{MutatorState, assert_parkable};
+use cljrs_runtime::env::error::{EvalError, EvalResult};
+use cljrs_runtime::env::gc_roots::root_values;
+use cljrs_value::Value;
+use corosensei::stack::{DefaultStack, Stack};
+
+mod scheduler;
+use cljrs_gc::fiber::StackReservation;
+use corosensei::{Coroutine, CoroutineResult, Yielder};
+use scheduler::Scheduling;
+
+/// Default fiber stack reservation. `go`, `future`, `thread` and `^:async`
+/// bodies run on fibers. In release builds the default tiered mode uses about
+/// 3 KB of machine stack per Clojure call level and the pure tree-walker about
+/// 6 KB, so 16 MiB leaves room for about 5,000 (tiered) or 2,500 (tree-walk)
+/// levels of non-tail recursion after the 256 KiB safepoint margin; 1 MiB
+/// allowed only ~400 (#454). Unoptimized builds use an order of magnitude more
+/// stack per interpreter frame, so debug builds reserve 32 MiB. Pages are
+/// committed lazily (a parked fiber with a trivial body touches about 8 KB), so
+/// the larger reservation costs address space, not memory.
+#[cfg(not(debug_assertions))]
+const DEFAULT_STACK_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(debug_assertions)]
+const DEFAULT_STACK_BYTES: usize = 32 * 1024 * 1024;
+const MAX_POOLED_STACKS: usize = 32;
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static STACK_POOL: Mutex<Vec<(usize, DefaultStack, StackReservation)>> = Mutex::new(Vec::new());
+
+fn reclaim_idle_stacks() {
+    let idle = std::mem::take(&mut *STACK_POOL.lock().unwrap());
+    drop(idle);
+}
+
+#[derive(Clone, Copy)]
+enum Resume {
+    Run,
+    Cancel,
+}
+use cljrs_value::parking::{catch_cancelled, resume_cancelled};
+
+type FiberCoroutine = Coroutine<Resume, Park, EvalResult>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FiberId(u64);
+
+#[derive(Clone, Copy)]
+struct Current {
+    id: FiberId,
+    yielder: *const Yielder<Resume, Park>,
+    scheduling: *const Scheduling,
+}
+
+thread_local! {
+    // Driver metadata, never computation state: set only around resume/unwind.
+    static CURRENT: Cell<Option<Current>> = const { Cell::new(None) };
+}
+
+/// The running fiber, or None on the carrier thread (including future polls).
+pub fn current() -> Option<FiberId> {
+    CURRENT.with(|current| current.get().map(|c| c.id))
+}
+
+const MIN_STACK_BYTES: usize = 512 * 1024;
+
+/// The configured fiber stack size, read from `CLJRS_FIBER_STACK_KB` once per
+/// process: `std::env::var` takes the environment lock and allocates, and
+/// every `go`/`future` builds a fiber (issue #458).
+fn stack_bytes() -> Result<usize, EvalError> {
+    static STACK_BYTES: OnceLock<Result<usize, String>> = OnceLock::new();
+    STACK_BYTES
+        .get_or_init(read_stack_bytes)
+        .clone()
+        .map_err(EvalError::Runtime)
+}
+
+fn read_stack_bytes() -> Result<usize, String> {
+    match std::env::var("CLJRS_FIBER_STACK_KB") {
+        Ok(value) => {
+            let bytes = value
+                .parse::<usize>()
+                .ok()
+                .and_then(|kb| kb.checked_mul(1024))
+                .ok_or_else(|| {
+                    "CLJRS_FIBER_STACK_KB must be a size that fits in usize".to_string()
+                })?;
+            if bytes < MIN_STACK_BYTES {
+                // Smaller stacks cannot hold the safepoint margin. Clamp, as
+                // earlier releases accepted these values. Read once, so this
+                // warns once.
+                eprintln!(
+                    "warning: CLJRS_FIBER_STACK_KB={value} is below the 512 KiB minimum; using 512"
+                );
+                return Ok(MIN_STACK_BYTES);
+            }
+            Ok(bytes)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_STACK_BYTES),
+        Err(_) => Err("invalid CLJRS_FIBER_STACK_KB".to_string()),
+    }
+}
+
+// Private lifetime-erased borrow of a Future pinned on the suspended stack.
+// It is used only until that stack resumes or unwinds, never owned or dropped
+// by the carrier. Keeping this private prevents callers from extending it.
+struct Park {
+    ptr: *mut (),
+    poll: unsafe fn(*mut (), &mut Context<'_>) -> Poll<()>,
+}
+
+impl Park {
+    fn new<F: Future<Output = ()>>(future: Pin<&mut F>) -> Self {
+        unsafe fn poll<F: Future<Output = ()>>(ptr: *mut (), cx: &mut Context<'_>) -> Poll<()> {
+            // SAFETY: park_on pins F on the live coroutine stack; the driver
+            // never resumes/unwinds the coroutine concurrently with this call.
+            unsafe { Pin::new_unchecked(&mut *ptr.cast::<F>()) }.poll(cx)
+        }
+        Self {
+            // SAFETY: the pointee stays pinned until the park returns.
+            ptr: unsafe { future.get_unchecked_mut() } as *mut F as *mut (),
+            poll: poll::<F>,
+        }
+    }
+}
+
+/// Suspend this fiber until `future` completes. May borrow fiber stack locals.
+/// Panics outside a fiber or when a runtime lock/critical section is held.
+/// Managed values retained by the future must have precise GC root guards.
+pub fn park_on<F: Future>(future: F) -> F::Output {
+    park_on_impl(future)
+}
+
+fn park_on_impl<F: Future>(future: F) -> F::Output {
+    if scheduling().is_some_and(Scheduling::is_cancelled) {
+        resume_cancelled();
+    }
+    assert_parkable();
+    // The awaited event may be a guard a queued fiber still holds (a lazy-seq
+    // realization or a monitor); release those before suspending on it.
+    run_deferred_cancels();
+    let current = CURRENT
+        .with(Cell::get)
+        .expect("park_on called outside a fiber");
+    // A parked fiber reaches no execution-credit checkpoint, so race the wait
+    // against the evaluation's interrupt flags (issue #446). The flags are
+    // captured here, on the fiber: the park future is polled by the driver.
+    let interrupts = cljrs_runtime::env::gas::active_interrupts();
+    if interrupts.iter().any(|flag| flag.is_set()) {
+        resume_cancelled();
+    }
+    let mut future = pin!(future);
+    let mut interrupt = pin!(cljrs_runtime::env::gas::interrupted(&interrupts));
+    let mut output = None;
+    let mut was_interrupted = false;
+    {
+        let mut wait = pin!(poll_fn(|cx| {
+            if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                output = Some(value);
+                return Poll::Ready(());
+            }
+            if interrupt.as_mut().poll(cx).is_ready() {
+                was_interrupted = true;
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        }));
+        let park = Park::new(wait.as_mut());
+        // SAFETY: CURRENT is installed only while this coroutine is resumed or
+        // unwound; its Yielder remains at a stable address on its own stack.
+        if matches!(unsafe { &*current.yielder }.suspend(park), Resume::Cancel) {
+            resume_cancelled();
+        }
+    }
+    if was_interrupted {
+        // Unwind like a cancellation: native boundaries turn it into the
+        // uncatchable `Cancelled` error, and the fiber body boundary below
+        // returns it as the fiber's result.
+        resume_cancelled();
+    }
+    output.expect("fiber resumed before its park future completed")
+}
+
+struct CurrentGuard(Option<Current>);
+impl CurrentGuard {
+    fn enter(current: Option<Current>) -> Self {
+        Self(CURRENT.with(|slot| slot.replace(current)))
+    }
+}
+impl Drop for CurrentGuard {
+    fn drop(&mut self) {
+        CURRENT.with(|slot| slot.set(self.0));
+    }
+}
+
+/// An unstarted fiber. Construction is lazy; spawning requires a LocalSet.
+/// All execution and destruction must stay on the creating isolate thread.
+pub struct Fiber {
+    task: FiberTask,
+}
+
+// The pointee belongs to the live FiberTask; it stays boxed across task moves.
+fn scheduling() -> Option<&'static Scheduling> {
+    CURRENT.with(Cell::get).map(|c| unsafe { &*c.scheduling })
+}
+
+fn yield_slice() -> Result<(), cljrs_gc::fiber::SafepointError> {
+    // `yield_now` defers its wake, so count this fiber as ready now: the
+    // watchdog must see it while a sibling pins the carrier (issue #445).
+    if let Some(scheduling) = scheduling() {
+        scheduling.wake.mark_ready();
+    }
+    catch_cancelled(|| park_on_impl(tokio::task::yield_now()))
+        .map_err(|_| cljrs_gc::fiber::SafepointError::Cancelled)
+}
+
+fn install_parking_hooks() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        cljrs_gc::fiber::install(cljrs_gc::fiber::Hooks {
+            safepoint: || scheduling().map_or(Ok(false), Scheduling::safepoint),
+            yield_now: yield_slice,
+            reclaim_stacks: reclaim_idle_stacks,
+            enter_native: |name, id| scheduling().map_or(0, |s| s.enter_native(name, id)),
+            enter_gc_pause: || scheduling().map_or(0, Scheduling::enter_gc_pause),
+            exit_native: |previous| {
+                if let Some(s) = scheduling() {
+                    s.exit_native(previous);
+                }
+            },
+        });
+        cljrs_gc::governor().register_shed_hook(std::sync::Arc::new(|pressure| {
+            if pressure != cljrs_gc::PressureLevel::Green {
+                reclaim_idle_stacks();
+            }
+        }));
+        cljrs_value::parking::install(cljrs_value::parking::Hooks {
+            current: || current().map(|id| id.0),
+            cancelled: || scheduling().is_some_and(Scheduling::is_cancelled),
+            park: |future, timeout| {
+                park_on(async {
+                    match timeout {
+                        Some(duration) => tokio::time::timeout(duration, future).await.is_ok(),
+                        None => {
+                            future.await;
+                            true
+                        }
+                    }
+                })
+            },
+            sleep: |duration| park_on(tokio::time::sleep(duration)),
+            blocking: |job| {
+                park_on(async {
+                    crate::worker_pool::WorkerPool::global()
+                        .handle()
+                        .spawn_blocking(job)
+                        .await
+                        .expect("blocking worker panicked")
+                })
+            },
+        });
+    });
+}
+
+impl Fiber {
+    pub fn new(body: impl FnOnce() -> EvalResult + 'static) -> Result<Self, EvalError> {
+        Self::with_roots(Vec::new(), body)
+    }
+
+    /// Keep captured values rooted before the first poll and until completion.
+    /// GC builds poison active regions for opaque captures. No-gc builds
+    /// lease those regions only until task completion or cancellation.
+    pub fn with_roots(
+        roots: Vec<Value>,
+        body: impl FnOnce() -> EvalResult + 'static,
+    ) -> Result<Self, EvalError> {
+        // SAFETY: this constructor requires a static body.
+        unsafe { Self::with_stack_bytes(roots, body, stack_bytes()?) }
+    }
+
+    // SAFETY: borrowed bodies must be fully driven or dropped before returning
+    // to their caller. Only run_root may use a non-static body.
+    unsafe fn with_stack_bytes(
+        roots: Vec<Value>,
+        body: impl FnOnce() -> EvalResult,
+        bytes: usize,
+    ) -> Result<Self, EvalError> {
+        install_parking_hooks();
+        let cached = {
+            let mut pool = STACK_POOL.lock().unwrap();
+            pool.iter()
+                .position(|(size, _, _)| *size == bytes)
+                .map(|i| pool.swap_remove(i))
+        };
+        let (stack, mut reservation) = if let Some((_, stack, mut reservation)) = cached {
+            reservation.set_pooled(false);
+            (stack, reservation)
+        } else {
+            let reservation =
+                StackReservation::new(bytes).map_err(EvalError::MemoryLimitExceeded)?;
+            let stack = DefaultStack::new(bytes)
+                .map_err(|e| EvalError::Runtime(format!("cannot allocate fiber stack: {e}")))?;
+            (stack, reservation)
+        };
+        // corosensei's `limit()` is the bottom of the mapping, below the guard
+        // page, so this span includes the guard and page rounding.
+        reservation
+            .account_actual_bytes(bytes, stack.base().get() - stack.limit().get())
+            .map_err(EvalError::MemoryLimitExceeded)?;
+        let id = FiberId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        #[cfg(not(feature = "no-gc"))]
+        cljrs_gc::region::poison_active_regions();
+        #[cfg(feature = "no-gc")]
+        let lease = cljrs_gc::region::RegionLease::capture_active();
+        #[cfg(feature = "no-gc")]
+        let allocation = cljrs_gc::region::AllocationSnapshot::capture();
+        #[cfg(feature = "no-gc")]
+        let lease = {
+            let mut lease = lease;
+            lease.extend(&cljrs_gc::region::RegionLease::for_values(&roots));
+            lease
+        };
+        let reports = crate::channel::FailureReports::current();
+        #[cfg(feature = "no-gc")]
+        let result_lease = std::rc::Rc::new(RefCell::new(cljrs_gc::region::RegionLease::default()));
+        let roots = roots.into_boxed_slice();
+        let state = MutatorState::fresh();
+        let scheduling = Box::new(Scheduling::new(id, stack.limit().get(), bytes));
+        let scheduling_ptr = &*scheduling as *const Scheduling;
+        // Register captures in the fiber's detached state, not the caller's.
+        let mut task = FiberTask {
+            co: None,
+            scheduling,
+            reservation: Some(reservation),
+            state,
+            pending: None,
+            roots,
+            roots_guard: None,
+            bytes,
+            id,
+            yielder: std::ptr::null(),
+            root: false,
+            #[cfg(feature = "no-gc")]
+            result_lease: result_lease.clone(),
+            #[cfg(feature = "no-gc")]
+            owned_result: false,
+            #[cfg(feature = "no-gc")]
+            _captures: lease.clone(),
+            #[cfg(feature = "no-gc")]
+            allocation: allocation.clone(),
+        };
+        task.state.swap_with_current();
+        reports.install();
+        task.roots_guard = Some(root_values(&task.roots));
+        task.state.swap_with_current();
+        task.co = Some(unsafe {
+            Coroutine::with_stack_unchecked(stack, move |yielder, _resume: Resume| {
+                CURRENT.with(|slot| {
+                    slot.set(Some(Current {
+                        id,
+                        yielder,
+                        scheduling: scheduling_ptr,
+                    }))
+                });
+                let _monitors = cljrs_runtime::env::monitor::MonitorCleanup;
+                #[cfg(feature = "no-gc")]
+                let _lease_scope = lease.enter();
+                #[cfg(feature = "no-gc")]
+                let _allocation_scope = allocation.enter();
+                #[cfg(feature = "no-gc")]
+                let _scratch = cljrs_gc::alloc_ctx::ScratchGuard::new();
+                // An interrupted park unwinds with the cancellation payload
+                // though the fiber is not being cancelled; one that reaches
+                // the body without passing a native boundary ends it here.
+                let result = match catch_cancelled(body) {
+                    Ok(result) => result,
+                    Err(_) if !(&*scheduling_ptr).is_cancelled() => Err(EvalError::Cancelled),
+                    Err(_) => resume_cancelled(),
+                };
+                // Cancellation returns through foreign frames as an uncatchable
+                // error, then resumes Rust unwinding at this safe boundary.
+                if (&*scheduling_ptr).is_cancelled() {
+                    resume_cancelled();
+                }
+                #[cfg(feature = "no-gc")]
+                match &result {
+                    Ok(value) | Err(EvalError::Thrown(value)) => {
+                        *result_lease.borrow_mut() = cljrs_gc::region::RegionLease::for_value(value)
+                    }
+                    _ => {}
+                }
+                result
+            })
+        });
+        Ok(Self { task })
+    }
+
+    pub fn id(&self) -> FiberId {
+        self.task.id
+    }
+    pub fn into_task(self) -> FiberTask {
+        self.task.scheduling.wake.schedule();
+        self.task
+    }
+}
+
+/// A thread-pinned future that drives a stackful fiber.
+pub struct FiberTask {
+    co: Option<FiberCoroutine>,
+    scheduling: Box<Scheduling>,
+    reservation: Option<StackReservation>,
+    state: MutatorState,
+    pending: Option<Park>,
+    // Boxed: addresses registered in state must survive moving the task.
+    roots: Box<[Value]>,
+    roots_guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
+    bytes: usize,
+    id: FiberId,
+    yielder: *const Yielder<Resume, Park>,
+    root: bool,
+    #[cfg(feature = "no-gc")]
+    result_lease: std::rc::Rc<RefCell<cljrs_gc::region::RegionLease>>,
+    #[cfg(feature = "no-gc")]
+    owned_result: bool,
+    #[cfg(feature = "no-gc")]
+    _captures: cljrs_gc::region::RegionLease,
+    #[cfg(feature = "no-gc")]
+    allocation: cljrs_gc::region::AllocationSnapshot,
+}
+
+impl FiberTask {
+    fn release_stack(&mut self) {
+        let co = self.co.take().expect("fiber already completed");
+        let stack = co.into_stack();
+        self.scheduling.wake.close();
+        let mut reservation = self.reservation.take().unwrap();
+        {
+            let mut pool = STACK_POOL.lock().unwrap();
+            if pool.len() < MAX_POOLED_STACKS
+                && cljrs_gc::governor().pressure() == cljrs_gc::PressureLevel::Green
+            {
+                reservation.set_pooled(true);
+                pool.push((self.bytes, stack, reservation));
+            }
+        }
+    }
+
+    fn unwind(&mut self) {
+        // A suspended fiber, whether parked explicitly or at an automatic
+        // yield, resumes with a cancellation token. Explicit parks raise the
+        // private Cancelled payload, which NativeFn wrappers and C-ABI bridges
+        // turn into an uncatchable error, so nothing unwinds through foreign
+        // frames. Cleanup then runs as this fiber: its scheduling context is
+        // entered, as for a normal resume. Fibers that never started or have
+        // already finished run no code. Callers ensure the carrier can park
+        // (see `cancel`), so cleanup never runs under a caller's locks.
+        self.pending.take();
+        let Some(co) = &mut self.co else { return };
+        if !co.started() || co.done() {
+            co.force_unwind();
+            return;
+        }
+        let _current = CurrentGuard::enter(Some(Current {
+            id: self.id,
+            yielder: self.yielder,
+            scheduling: &*self.scheduling,
+        }));
+        self.scheduling.cancel();
+        let _running = self.scheduling.enter();
+        let outcome = catch_cancelled(|| co.resume(Resume::Cancel));
+        match outcome {
+            Err(cljrs_value::ValueError::Cancelled) => {}
+            Err(_) => unreachable!(),
+            Ok(CoroutineResult::Return(_)) => {}
+            Ok(CoroutineResult::Yield(_)) => unreachable!("cancelled fiber suspended"),
+        }
+    }
+}
+
+impl Future for FiberTask {
+    type Output = EvalResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        assert!(this.co.is_some(), "fiber polled after completion");
+        assert_parkable();
+        run_deferred_cancels();
+        this.scheduling.wake.poll(cx.waker());
+        let cx = &mut Context::from_waker(&this.scheduling.waker);
+        this.state.swap_with_current();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _current = CurrentGuard::enter(None);
+            if let Some(park) = &mut this.pending {
+                // SAFETY: this coroutine has not resumed since yielding Park.
+                if unsafe { (park.poll)(park.ptr, cx) }.is_pending() {
+                    return Poll::Pending;
+                }
+                this.pending = None;
+            }
+            loop {
+                if !this.yielder.is_null() {
+                    CURRENT.with(|slot| {
+                        slot.set(Some(Current {
+                            id: this.id,
+                            yielder: this.yielder,
+                            scheduling: &*this.scheduling,
+                        }))
+                    });
+                }
+                let outcome = {
+                    let _running = this.scheduling.enter();
+                    this.co.as_mut().unwrap().resume(Resume::Run)
+                };
+                match outcome {
+                    CoroutineResult::Return(result) => return Poll::Ready(result),
+                    CoroutineResult::Yield(park) => {
+                        this.yielder = CURRENT.with(|slot| slot.get().unwrap().yielder);
+                        CURRENT.with(|slot| slot.set(None));
+                        // Poll immediately so Pending registers the task's waker.
+                        if unsafe { (park.poll)(park.ptr, cx) }.is_pending() {
+                            this.pending = Some(park);
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => {
+                this.unwind();
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                Poll::Ready(Err(EvalError::Runtime(format!(
+                    "fiber panicked: {message}"
+                ))))
+            }
+        };
+        if result.is_ready() {
+            this.roots_guard.take();
+        }
+        this.state.swap_with_current();
+        if result.is_ready() {
+            #[cfg(feature = "no-gc")]
+            let _handoff = this._captures.enter();
+            #[cfg(feature = "no-gc")]
+            if !this.root && !this.owned_result {
+                this.result_lease.borrow().publish_return();
+            }
+            if !this.root {
+                this.state = MutatorState::fresh();
+            }
+            this.release_stack();
+        }
+        result
+    }
+}
+
+impl FiberTask {
+    fn cancel(&mut self) {
+        let suspended = self
+            .co
+            .as_ref()
+            .is_some_and(|co| co.started() && !co.done());
+        if suspended && !cljrs_gc::mutator::can_park() {
+            // Dropped where its cleanup cannot run now (a runtime lock held,
+            // a critical section, a borrowed slot, or unwinding). A forced
+            // unwind could cross extern "C" or JIT frames and abort, and
+            // leaking would strand guards held across the park (lazy-seq
+            // realization, monitors). Queue it; it is cancelled as soon as
+            // this carrier can park.
+            // A queued task is no longer in the LocalSet: close its wake so
+            // a later wakeup cannot count it as a ready fiber.
+            self.scheduling.wake.close();
+            let id = self.id;
+            let mut task = Some(std::mem::replace(self, FiberTask::empty(id)));
+            // `try_with`: this can run during unwinding or TLS teardown.
+            let _ = DEFERRED_CANCELS.try_with(|queue| {
+                if let Ok(mut queue) = queue.try_borrow_mut() {
+                    queue.0.push(task.take().unwrap());
+                }
+            });
+            if let Some(task) = task {
+                // The queue is gone (thread teardown): last resort.
+                std::mem::forget(task);
+            }
+            return;
+        }
+        if self.co.is_some() {
+            self.state.swap_with_current();
+            self.unwind();
+            self.roots_guard.take();
+            self.state.swap_with_current();
+            if !self.root {
+                self.state = MutatorState::fresh();
+            }
+            self.release_stack();
+            run_deferred_cancels();
+        }
+    }
+
+    /// A completed placeholder left behind when a task is moved out to be
+    /// cancelled later. Dropping it does nothing, and building it touches no
+    /// thread-locals, since this runs in `Drop`.
+    fn empty(id: FiberId) -> Self {
+        Self {
+            co: None,
+            scheduling: Box::new(Scheduling::placeholder(id)),
+            reservation: None,
+            state: MutatorState::unregistered(),
+            pending: None,
+            roots: Box::new([]),
+            roots_guard: None,
+            bytes: 0,
+            id,
+            yielder: std::ptr::null(),
+            root: false,
+            #[cfg(feature = "no-gc")]
+            result_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            owned_result: false,
+            #[cfg(feature = "no-gc")]
+            _captures: Default::default(),
+            #[cfg(feature = "no-gc")]
+            allocation: Default::default(),
+        }
+    }
+}
+
+/// Fibers whose cancellation was deferred because they were dropped where
+/// the carrier could not park. Their detached mutator states stay registered
+/// with the isolate, so queued roots are still traced.
+#[derive(Default)]
+struct DeferredCancels(Vec<FiberTask>);
+impl Drop for DeferredCancels {
+    fn drop(&mut self) {
+        // Thread teardown: thread-locals the cleanup needs may already be
+        // gone, so the remaining stacks are leaked rather than resumed.
+        for task in self.0.drain(..) {
+            std::mem::forget(task);
+        }
+    }
+}
+
+thread_local! {
+    // Carrier driver state, like STACK_POOL: never a computation's state.
+    static DEFERRED_CANCELS: RefCell<DeferredCancels> = RefCell::new(DeferredCancels::default());
+    // Set while a drain runs, so cancelling a queued task does not recurse.
+    static DRAINING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Cancel queued fibers once the carrier can park. Runs at every fiber poll,
+/// before every explicit park, after every completed cancellation, and when a
+/// root drive or its executor finishes. Only the outermost call loops.
+fn run_deferred_cancels() {
+    if DRAINING
+        .try_with(|draining| draining.replace(true))
+        .unwrap_or(true)
+    {
+        return;
+    }
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let _ = DRAINING.try_with(|draining| draining.set(false));
+        }
+    }
+    let _done = Done;
+    while cljrs_gc::mutator::can_park() {
+        let Some(task) = DEFERRED_CANCELS
+            .try_with(|queue| {
+                queue
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut queue| queue.0.pop())
+            })
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        drop(task);
+    }
+}
+
+impl Drop for FiberTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// A completed result kept precisely rooted while queued in a JoinHandle.
+/// Consume it immediately before evaluating or rooting the returned value.
+pub struct FiberResult {
+    result: Option<EvalResult>,
+    state: MutatorState,
+    guard: Option<cljrs_runtime::env::gc_roots::ValueRootGuard>,
+    _roots: Box<[Value]>,
+    #[cfg(feature = "no-gc")]
+    leases: Vec<cljrs_gc::region::RegionLease>,
+}
+
+impl FiberResult {
+    fn new(result: EvalResult) -> Self {
+        let roots: Box<[Value]> = match &result {
+            Ok(value) | Err(EvalError::Thrown(value)) => vec![value.clone()].into_boxed_slice(),
+            Err(EvalError::Recur(values)) => values.clone().into_boxed_slice(),
+            _ => Box::new([]),
+        };
+        #[cfg(feature = "no-gc")]
+        let leases = roots
+            .iter()
+            .map(cljrs_gc::region::RegionLease::for_value)
+            .collect();
+        let mut state = MutatorState::fresh();
+        state.swap_with_current();
+        let guard = root_values(&roots);
+        state.swap_with_current();
+        Self {
+            result: Some(result),
+            state,
+            guard: Some(guard),
+            _roots: roots,
+            #[cfg(feature = "no-gc")]
+            leases,
+        }
+    }
+
+    /// Borrow the result while it stays rooted, across any number of yields.
+    ///
+    /// Borrow-only: a `Value` cloned out of it must not outlive this
+    /// `FiberResult`. Dropping it releases the result's ownership (in `no-gc`
+    /// builds, its region leases) without publishing to the caller. To keep a
+    /// value past the `FiberResult`, take it with [`Self::into_result`] and root
+    /// it yourself.
+    pub fn get(&self) -> &EvalResult {
+        self.result.as_ref().unwrap()
+    }
+
+    pub fn into_result(mut self) -> EvalResult {
+        #[cfg(feature = "no-gc")]
+        for lease in &self.leases {
+            lease.publish_return();
+        }
+        self.result.take().unwrap()
+    }
+}
+
+impl Drop for FiberResult {
+    fn drop(&mut self) {
+        self.state.swap_with_current();
+        self.guard.take();
+        self.state.swap_with_current();
+    }
+}
+
+/// Spawn a concurrent fiber on the current LocalSet.
+pub fn spawn(
+    body: impl FnOnce() -> EvalResult + 'static,
+) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
+    spawn_rooted(Vec::new(), body)
+}
+
+/// Spawn with precise roots for values captured by the opaque Rust closure.
+pub fn spawn_rooted(
+    roots: Vec<Value>,
+    body: impl FnOnce() -> EvalResult + 'static,
+) -> Result<tokio::task::JoinHandle<FiberResult>, EvalError> {
+    let task = Fiber::with_roots(roots, body)?.into_task();
+    Ok(tokio::task::spawn_local(drive_to_result(task)))
+}
+
+/// Spawn `task` on the current `LocalSet` and pass its result to `deliver` in
+/// the poll that completes it, while the task (and the roots it registered)
+/// is still alive. One executor task and no intermediate `Future` cell or
+/// root state, unlike awaiting the task inside [`crate::task::spawn_future`].
+/// The fiber installs its own conveyed bindings, meters and interrupt flags,
+/// so the poll needs no outer scopes. Must be called within a `LocalSet`.
+pub(crate) fn spawn_delivering(task: FiberTask, deliver: impl FnOnce(EvalResult) + 'static) {
+    let mut task = task;
+    let mut deliver = Some(deliver);
+    #[cfg(feature = "no-gc")]
+    let (lease, allocation) = (task._captures.clone(), task.allocation.clone());
+    tokio::task::spawn_local(poll_fn(move |cx| {
+        #[cfg(feature = "no-gc")]
+        let _lease_scope = lease.enter();
+        #[cfg(feature = "no-gc")]
+        let _allocation_scope = allocation.enter();
+        let Poll::Ready(result) = Pin::new(&mut task).poll(cx) else {
+            return Poll::Pending;
+        };
+        if let Some(deliver) = deliver.take() {
+            deliver(result);
+        }
+        Poll::Ready(())
+    }));
+}
+
+/// Drive `task` to completion and keep its result rooted in a [`FiberResult`].
+async fn drive_to_result(task: FiberTask) -> FiberResult {
+    #[cfg(feature = "no-gc")]
+    {
+        let allocation = task.allocation.clone();
+        let mut task = task;
+        task.owned_result = true;
+        let result = std::future::poll_fn(|cx| {
+            let _context = allocation.enter();
+            Pin::new(&mut task).poll(cx)
+        })
+        .await;
+        // Capture result storage while the completed task still pins its
+        // original scopes. The JoinHandle can outlive those lexical scopes.
+        FiberResult::new(result)
+    }
+    #[cfg(not(feature = "no-gc"))]
+    FiberResult::new(task.await)
+}
+
+/// Drive a borrowed top-level computation on a 64 MiB root stack.
+/// Transfers the host's mutator state into the root and restores it afterward.
+/// `carrier` retains executor task roots between drives on the same LocalSet.
+/// Call outside the Tokio runtime and outside any fiber.
+pub fn run_root(
+    rt: &tokio::runtime::Runtime,
+    local: &tokio::task::LocalSet,
+    carrier: &mut MutatorState,
+    body: impl FnOnce() -> EvalResult,
+) -> EvalResult {
+    assert!(current().is_none(), "nested root fiber");
+    // The root and every task it spawns share this carrier's report registry.
+    carrier.swap_with_current();
+    let reports = crate::channel::FailureReports::current();
+    carrier.swap_with_current();
+    struct RestoreReports(crate::channel::FailureReports);
+    impl Drop for RestoreReports {
+        fn drop(&mut self) {
+            self.0.install();
+        }
+    }
+    let _reports = RestoreReports(reports.install());
+    // SAFETY: the task never escapes this synchronous function. Drive drops
+    // (and unwinds) it on every exit, including executor panics.
+    let mut task =
+        unsafe { Fiber::with_stack_bytes(Vec::new(), body, 64 * 1024 * 1024)? }.into_task();
+    task.state.swap_with_current();
+    task.roots_guard.take();
+    task.state.swap_with_current();
+    task.state = MutatorState::save();
+    task.root = true;
+    carrier.swap_with_current();
+    // Restore both states even if the executor panics. Pending legacy async
+    // tasks retain their carrier roots separately from the host's LIFO guards.
+    struct Drive<'a> {
+        task: FiberTask,
+        carrier: &'a mut MutatorState,
+    }
+    impl Drop for Drive<'_> {
+        fn drop(&mut self) {
+            self.task.cancel();
+            run_deferred_cancels();
+            self.carrier.swap_with_current();
+            self.task.state.swap_with_current();
+        }
+    }
+    let mut drive = Drive { task, carrier };
+    let result = local.block_on(rt, &mut drive.task);
+    #[cfg(feature = "no-gc")]
+    let ownership = drive.task.result_lease.borrow().clone();
+    drop(drive);
+    #[cfg(feature = "no-gc")]
+    ownership.publish_return();
+    result
+}
+
+/// Drive the tasks on `local` until `deadline`, with `carrier` installed, and
+/// return. For a host that owns the thread's loop (a UI frame, say) and gives
+/// the isolate a slice of each turn: fibers and `go` loops spawned on `local`
+/// (including nREPL jobs from `cljrs_nrepl::Poller::spawn_pending`) run
+/// during the slice and stay parked or queued between slices.
+///
+/// Returns at `deadline` even when tasks are still ready, and at once when
+/// `deadline` has passed (after one poll of the ready tasks). Use the same
+/// `carrier` for every drive of `local`, as with [`run_root`]: it holds the
+/// executor's task roots between drives. `rt` must have its time driver
+/// enabled. Call outside the Tokio runtime and outside any fiber.
+pub fn drive_until(
+    rt: &tokio::runtime::Runtime,
+    local: &tokio::task::LocalSet,
+    carrier: &mut MutatorState,
+    deadline: std::time::Instant,
+) {
+    assert!(current().is_none(), "drive_until called inside a fiber");
+    // The carrier's state (task roots, failure-report registry) is current
+    // while tasks run; the host's is restored afterwards, even on a panic.
+    struct Restore<'a>(&'a mut MutatorState);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            run_deferred_cancels();
+            self.0.swap_with_current();
+        }
+    }
+    carrier.swap_with_current();
+    let _restore = Restore(carrier);
+    // The timer is built inside the runtime: it needs the time driver.
+    let deadline = tokio::time::Instant::from_std(deadline);
+    local.block_on(rt, async move { tokio::time::sleep_until(deadline).await });
+}
+
+/// Destroy local tasks with their carrier state installed, restoring the caller
+/// even if task destruction unwinds.
+pub fn drop_local_with_carrier(local: tokio::task::LocalSet, carrier: &mut MutatorState) {
+    carrier.swap_with_current();
+    struct Restore<'a>(&'a mut MutatorState);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            self.0.swap_with_current();
+        }
+    }
+    let _restore = Restore(carrier);
+    drop(local);
+    // Tasks dropped with the executor may have been queued for cancellation.
+    run_deferred_cancels();
+    crate::channel::report_unobserved_thread_failures();
+}
+
+/// Drive one root and destroy its executor with the matching carrier state.
+pub fn run_root_owned(
+    rt: &tokio::runtime::Runtime,
+    local: tokio::task::LocalSet,
+    body: impl FnOnce() -> EvalResult,
+) -> EvalResult {
+    struct Driver {
+        local: Option<tokio::task::LocalSet>,
+        carrier: MutatorState,
+    }
+    impl Drop for Driver {
+        fn drop(&mut self) {
+            drop_local_with_carrier(self.local.take().unwrap(), &mut self.carrier);
+        }
+    }
+    let mut driver = Driver {
+        local: Some(local),
+        carrier: MutatorState::fresh(),
+    };
+    run_root(
+        rt,
+        driver.local.as_ref().unwrap(),
+        &mut driver.carrier,
+        body,
+    )
+}
+
+/// Evaluate one top-level form on a new fiber from async code that already
+/// runs on the isolate's LocalSet, returning its result rooted in a
+/// [`FiberResult`].
+///
+/// This is the fiber replacement for the retired native `eval_async` entry
+/// point. The form runs on the ordinary evaluator, so `await`, `deref`, and
+/// channel ops park the fiber. Like `future`, the fiber receives a snapshot of
+/// the caller's dynamic bindings, its active gas meters, and its interrupt
+/// flags, so a meter or interrupt around the caller also governs the form.
+/// The fiber evaluates in a fresh environment for `env`'s globals and
+/// namespace; a namespace change made by the form (`ns`, `in-ns`) is copied
+/// back into `env`. Lexical frames in `env` are not visible.
+///
+/// The result stays rooted across later yields and collections until the
+/// `FiberResult` is consumed or dropped: borrow it with [`FiberResult::get`],
+/// or take it with [`FiberResult::into_result`]. Use [`run_root`] instead when
+/// the caller is not already inside the runtime.
+pub async fn eval_form(
+    form: &cljrs_reader::Form,
+    env: &mut cljrs_runtime::env::env::Env,
+) -> FiberResult {
+    match eval_form_task(form, env) {
+        Ok((task, final_ns)) => {
+            let result = drive_to_result(task).await;
+            env.current_ns = final_ns.borrow().clone();
+            result
+        }
+        Err(error) => FiberResult::new(Err(error)),
+    }
+}
+
+/// [`eval_form`], returning the value directly and unrooted, as
+/// [`crate::await_value`] does. Use it before the next yield; a value kept
+/// across later yields must be rooted by the caller (or use [`eval_form`]).
+/// In `no-gc` builds the fiber publishes its result to the caller's scope on
+/// completion, as a root evaluation does.
+pub async fn eval_form_unrooted(
+    form: &cljrs_reader::Form,
+    env: &mut cljrs_runtime::env::env::Env,
+) -> EvalResult {
+    let (task, final_ns) = eval_form_task(form, env)?;
+    let result = task.await;
+    env.current_ns = final_ns.borrow().clone();
+    result
+}
+
+/// The form's namespace once its fiber completes, for the caller to copy back.
+type FinalNs = std::rc::Rc<RefCell<std::sync::Arc<str>>>;
+
+/// Build the conveyed fiber for one form, and the cell its final namespace is
+/// written to, which the caller copies into its `env` once the fiber completes.
+#[allow(clippy::result_large_err)]
+fn eval_form_task(
+    form: &cljrs_reader::Form,
+    env: &cljrs_runtime::env::env::Env,
+) -> Result<(FiberTask, FinalNs), EvalError> {
+    let form = form.clone();
+    let globals = env.globals.clone();
+    let start_ns = env.current_ns.clone();
+    let final_ns = std::rc::Rc::new(RefCell::new(start_ns.clone()));
+    let report_ns = final_ns.clone();
+    let fiber = crate::runtime::conveyed_fiber(Vec::new(), move || {
+        let mut fiber_env = cljrs_runtime::env::env::Env::new(globals, &start_ns);
+        let result = cljrs_runtime::interp::eval::eval(&form, &mut fiber_env);
+        *report_ns.borrow_mut() = fiber_env.current_ns.clone();
+        result
+    })?;
+    Ok((fiber.into_task(), final_ns))
+}

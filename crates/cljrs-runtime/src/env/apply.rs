@@ -132,7 +132,26 @@ pub(crate) fn prefers_in_hierarchy(
     y: &Value,
     hierarchy: &HierarchySnapshot,
 ) -> bool {
-    let prefers = mf.prefers.lock().unwrap();
+    if cljrs_value::realization::is_inert(x)
+        && cljrs_value::realization::is_inert(y)
+        && hierarchy_is_inert(hierarchy)
+    {
+        return prefers_with_table(
+            &mf.prefers.lock().unwrap(),
+            hierarchy.parents.as_ref(),
+            x,
+            y,
+        );
+    }
+    let roots: Vec<Value> = hierarchy
+        .parents
+        .iter()
+        .chain(hierarchy.ancestors.iter())
+        .cloned()
+        .map(Value::Map)
+        .collect();
+    let _roots = crate::env::gc_roots::root_values(&roots);
+    let prefers = mf.prefers.lock().unwrap().clone();
     prefers_with_table(&prefers, hierarchy.parents.as_ref(), x, y)
 }
 
@@ -167,6 +186,54 @@ fn hierarchy_method_key(
     hierarchy: &HierarchySnapshot,
 ) -> EvalResult<Option<String>> {
     let dispatch_vals = mf.dispatch_vals.lock().unwrap();
+    if cljrs_value::realization::is_inert(dispatch_val)
+        && dispatch_vals
+            .values()
+            .all(cljrs_value::realization::is_inert)
+        && hierarchy_is_inert(hierarchy)
+    {
+        let prefers = mf.prefers.lock().unwrap();
+        return hierarchy_method_key_with_tables(
+            mf,
+            dispatch_val,
+            hierarchy,
+            &dispatch_vals,
+            &prefers,
+        );
+    }
+    let snapshot = dispatch_vals.clone();
+    drop(dispatch_vals);
+    let dispatch_vals = snapshot;
+    let mut roots: Vec<Value> = dispatch_vals.values().cloned().collect();
+    roots.extend(
+        hierarchy
+            .parents
+            .iter()
+            .chain(hierarchy.ancestors.iter())
+            .cloned()
+            .map(Value::Map),
+    );
+    let _roots = crate::env::gc_roots::root_values(&roots);
+    let prefers = mf.prefers.lock().unwrap().clone();
+    hierarchy_method_key_with_tables(mf, dispatch_val, hierarchy, &dispatch_vals, &prefers)
+}
+
+fn hierarchy_is_inert(hierarchy: &HierarchySnapshot) -> bool {
+    hierarchy.parents.iter().chain(hierarchy.ancestors.iter()).all(|map| {
+        map.iter().all(|(key, value)| {
+            cljrs_value::realization::is_inert(key)
+                && matches!(value, Value::Set(set) if set.iter().all(cljrs_value::realization::is_inert))
+        })
+    })
+}
+
+fn hierarchy_method_key_with_tables(
+    mf: &cljrs_value::MultiFn,
+    dispatch_val: &Value,
+    hierarchy: &HierarchySnapshot,
+    dispatch_vals: &HashMap<String, Value>,
+    prefers: &HashMap<String, Vec<String>>,
+) -> EvalResult<Option<String>> {
     let mut matches: Vec<(String, Value)> = dispatch_vals
         .iter()
         .filter(|(k, v)| {
@@ -175,15 +242,13 @@ fn hierarchy_method_key(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    drop(dispatch_vals);
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     if matches.len() <= 1 {
         return Ok(matches.into_iter().next().map(|(k, _)| k));
     }
 
-    let prefers = mf.prefers.lock().unwrap();
     let dominates = |a: &(String, Value), b: &(String, Value)| {
-        prefers_with_table(&prefers, hierarchy.parents.as_ref(), &a.1, &b.1)
+        prefers_with_table(prefers, hierarchy.parents.as_ref(), &a.1, &b.1)
             || isa_with_ancestors(&a.1, &b.1, hierarchy.ancestors.as_ref())
     };
     let best: Vec<&(String, Value)> = matches
@@ -337,8 +402,40 @@ pub fn dispatch_if_async(callee: &Value, args: &[Value], env: &Env) -> Option<Va
     Some(rt.spawn_async_call(callee.clone(), args.to_vec(), call_env))
 }
 
+/// Run the body of `callee` on the current stack, without `^:async` dispatch.
+///
+/// Native async runtimes call this from the fiber that an `^:async` call spawns,
+/// so the body runs on the ordinary synchronous evaluator instead of spawning
+/// another fiber. Non-function callees behave like [`apply_value`].
+pub fn apply_fn_body(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    let Value::Fn(f) = callee else {
+        return apply_value(callee, args, env);
+    };
+    cljrs_value::realization::catch(|| {
+        let _callee_root = crate::env::gc_roots::root_value(callee);
+        let _args_root = crate::env::gc_roots::root_values(&args);
+        crate::env::gc_roots::gc_safepoint(env)?;
+        env.call_cljrs_fn(f.get(), &args)
+    })
+    .unwrap_or_else(|message| {
+        Err(crate::env::error::value_error_to_eval_error(
+            cljrs_value::ValueError::Other(message),
+        ))
+    })
+}
+
 /// Apply `callee` to the already-evaluated `args`.
 pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    cljrs_value::realization::catch(|| apply_value_inner(callee, args, env)).unwrap_or_else(
+        |message| {
+            Err(crate::env::error::value_error_to_eval_error(
+                cljrs_value::ValueError::Other(message),
+            ))
+        },
+    )
+}
+
+fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
     // Root the callee and args so they survive any GC triggered at the safepoint.
     // These values are on the Rust stack but not yet in any Env frame.
     let _callee_root = crate::env::gc_roots::root_value(callee);
@@ -346,7 +443,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
 
     // GC safepoint at function application boundary — blocks if collection is in progress,
     // and initiates collection if one was requested (memory pressure).
-    crate::env::gc_roots::gc_safepoint(env);
+    crate::env::gc_roots::gc_safepoint(env)?;
 
     match callee {
         Value::NativeFunction(nf) => {
@@ -368,11 +465,10 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             // call back into Clojure (via invoke()), which creates a fresh Env
             // and may trigger GC.
             let _caller_root = crate::env::gc_roots::push_env_root(env);
-            crate::env::callback::push_eval_context(env);
-            let result =
-                (nf.get().func)(&args).map_err(crate::env::error::value_error_to_eval_error);
-            crate::env::callback::pop_eval_context();
-            result
+            let _context = crate::env::callback::scoped_eval_context(env);
+            let _native_frame =
+                cljrs_gc::fiber::native_frame(&nf.get().name, &nf.get().diagnostic_id);
+            (nf.get().func)(&args).map_err(crate::env::error::value_error_to_eval_error)
         }
         Value::Fn(f) => {
             if let Some(fut) = dispatch_if_async(callee, &args, env) {
@@ -435,6 +531,11 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
                     ))
                 })?;
             drop(impls);
+            #[cfg(feature = "no-gc")]
+            pf_ref
+                .protocol
+                .get()
+                .protect_implementation(&tag, &pf_ref.method_name);
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);
             apply_value(&impl_fn, args, env)
         }
@@ -444,7 +545,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
             let _dispatch_root = crate::env::gc_roots::root_value(&dispatch_val);
             cljrs_gc::safepoint();
             let key = format!("{}", dispatch_val);
-            let exact = mf_ref.methods.lock().unwrap().get(&key).cloned();
+            let exact = mf_ref.method(&key);
             let impl_fn = match exact {
                 Some(f) => f,
                 None => {
@@ -483,18 +584,12 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
                             resolved
                         }
                     };
-                    mf_ref
-                        .methods
-                        .lock()
-                        .unwrap()
-                        .get(&method_key)
-                        .cloned()
-                        .ok_or_else(|| {
-                            EvalError::Runtime(format!(
-                                "No method in multimethod '{}' for dispatch value {}",
-                                mf_ref.name, key
-                            ))
-                        })?
+                    mf_ref.method(&method_key).ok_or_else(|| {
+                        EvalError::Runtime(format!(
+                            "No method in multimethod '{}' for dispatch value {}",
+                            mf_ref.name, key
+                        ))
+                    })?
                 }
             };
             let _impl_root = crate::env::gc_roots::root_value(&impl_fn);

@@ -168,6 +168,10 @@ pub enum TxError {
     Evaluation(String),
     #[error("transaction gas exhausted")]
     GasExhausted,
+
+    /// Execution was cancelled; the gas budget was not exhausted.
+    #[error("execution cancelled")]
+    Cancelled,
     #[error("transaction call depth exceeded")]
     DepthExceeded,
     #[error("transaction attempted a forbidden effect: {0}")]
@@ -270,7 +274,20 @@ fn execute_inner(
     let function = env.eval(program.form()).map_err(map_eval_error)?;
     let result = cljrs_runtime::env::apply::apply_value(&function, args, &mut env)
         .map_err(map_eval_error)?;
-    let result = serialize(&result)?;
+    let result = serialize(&result).map_err(|error| {
+        // Resource limits keep their own TxError kinds, as on the host-call
+        // argument path, instead of reading as a data (clone) error.
+        match cljrs_value::clone::resource_value_error(&error) {
+            Some(ValueError::Cancelled) => TxError::Cancelled,
+            Some(ValueError::GasExhausted) => TxError::GasExhausted,
+            Some(ValueError::MemoryLimitExceeded(fault)) => TxError::MemoryExhausted {
+                limit: fault.hard_limit,
+                used: fault.committed,
+                requested: fault.requested,
+            },
+            _ => TxError::Clone(error),
+        }
+    })?;
     validate_pure_data(&result).map_err(TxError::InvalidResult)?;
 
     // Make the lifetime ordering explicit: all GcPtrs disappear before the
@@ -291,11 +308,15 @@ fn host_native(entry: &HostEntry) -> Value {
         Arc::clone(&entry.name),
         Arity::Variadic { min: 0 },
         move |args| {
-            let args: Vec<SerializedValue> =
-                args.iter()
-                    .map(serialize)
-                    .collect::<Result<_, _>>()
-                    .map_err(|error| ValueError::Other(format!("host call argument: {error}")))?;
+            let args: Vec<SerializedValue> = args
+                .iter()
+                .map(serialize)
+                .collect::<Result<_, _>>()
+                .map_err(|error| {
+                // Cancellation and resource limits stay uncatchable.
+                cljrs_value::clone::resource_value_error(&error)
+                    .unwrap_or_else(|| ValueError::Other(format!("host call argument: {error}")))
+            })?;
             for arg in &args {
                 validate_pure_data(arg).map_err(|what| {
                     ValueError::Other(format!("host call argument is not pure data: {what}"))
@@ -314,6 +335,7 @@ fn host_native(entry: &HostEntry) -> Value {
 fn map_eval_error(error: EvalError) -> TxError {
     match error {
         EvalError::GasExhausted => TxError::GasExhausted,
+        EvalError::Cancelled => TxError::Cancelled,
         EvalError::ForbiddenEffect(operation) => TxError::ForbiddenEffect(operation),
         other => {
             let text = other.to_string();

@@ -22,7 +22,7 @@ pub struct Args {
     /// GC soft memory limit in MB (each isolate heap collects when it exceeds this).
     #[arg(long)]
     pub gc_soft_limit_mb: Option<usize>,
-    /// Process managed-memory hard limit in MB (reported by --gc-stats; not yet enforced).
+    /// Process managed-memory hard limit in MB (enforced only with CLJRS_MEMORY_STRICT=1).
     #[arg(long)]
     pub gc_hard_limit_mb: Option<usize>,
 }
@@ -59,10 +59,10 @@ pub fn run(args: Args, versioning: VersioningFlags) -> miette::Result<i32> {
     let mut env = Env::new(globals, "user");
 
     // Ensure clojure.test is loaded.
-    session::eval_in(&mut env, "(require 'clojure.test)", "<test>")?;
+    session::eval_in_discard(&mut env, "(require 'clojure.test)", "<test>")?;
 
     if args.verbose {
-        session::eval_in(
+        session::eval_in_discard(
             &mut env,
             "(alter-var-root (var clojure.test/*verbose*) (constantly true))",
             "<test>",
@@ -103,6 +103,8 @@ pub fn run(args: Args, versioning: VersioningFlags) -> miette::Result<i32> {
 }
 
 fn run_single_ns_tests(env: &mut Env, ns: &str) -> NsTestResult {
+    #[cfg(feature = "no-gc")]
+    let _reads = cljrs_gc::region::ReadScope::nested();
     // Try to load the namespace.
     if let Err(e) = session::eval_in(env, &format!("(require '{ns})"), "<test>") {
         return NsTestResult {

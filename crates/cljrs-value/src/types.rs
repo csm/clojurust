@@ -2,106 +2,27 @@
 
 #![allow(unused)]
 
+use crate::parking::Event;
 use std::collections::HashMap;
 use std::mem;
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use cljrs_gc::GcPtr;
+use cljrs_gc::mutator::TrackedMutex;
 use cljrs_reader::Form;
 
 use crate::TypeHint;
 use crate::Value;
 
-// ── No-GC debug provenance helper ────────────────────────────────────────────
-
-/// In `no-gc` debug builds: return `true` if the top-level `GcPtr` inside
-/// `value` (if any) was allocated by the global `StaticArena`.
-///
-/// Primitives (`Nil`, `Bool`, `Long`, `Double`, `Char`) contain no `GcPtr`
-/// and always return `true`.  `Resource` is Arc-managed and also returns
-/// `true`.  All other variants have a `GcPtr` that is checked against the
-/// static arena's chunk range.
-///
-/// This check is intentionally **shallow** (top-level pointer only).  If the
-/// value was produced inside a `StaticCtxGuard`, ALL allocations during its
-/// evaluation go to the static arena — so a static top-level pointer implies
-/// static contents.
-#[cfg(all(feature = "no-gc", debug_assertions))]
-pub(crate) fn value_gcptr_is_static(value: &Value) -> bool {
-    use crate::value::MapValue;
-    use crate::value::SetValue;
-    match value {
-        // Inline scalars — no GcPtr.
-        Value::Nil
-        | Value::Bool(_)
-        | Value::Long(_)
-        | Value::Double(_)
-        | Value::Char(_)
-        | Value::Uuid(_) => true,
-        // Arc-managed — not GcPtr; always considered static.
-        Value::Resource(_) | Value::SharedAtom(_) | Value::ByteBlob(_) => true,
-        // GcPtr variants.
-        Value::BigInt(p) => p.is_static_alloc(),
-        Value::BigDecimal(p) => p.is_static_alloc(),
-        Value::Ratio(p) => p.is_static_alloc(),
-        Value::Str(p) => p.is_static_alloc(),
-        Value::Pattern(p) => p.is_static_alloc(),
-        Value::Matcher(p) => p.is_static_alloc(),
-        Value::Symbol(p) => p.is_static_alloc(),
-        Value::Keyword(p) => p.is_static_alloc(),
-        Value::List(p) => p.is_static_alloc(),
-        Value::Vector(p) => p.is_static_alloc(),
-        Value::Queue(p) => p.is_static_alloc(),
-        Value::Map(m) => match m {
-            MapValue::Array(p) => p.is_static_alloc(),
-            MapValue::Hash(p) => p.is_static_alloc(),
-            MapValue::Sorted(p) => p.is_static_alloc(),
-        },
-        Value::Set(s) => match s {
-            SetValue::Hash(p) => p.is_static_alloc(),
-            SetValue::Sorted(p) => p.is_static_alloc(),
-        },
-        Value::NativeFunction(p) => p.is_static_alloc(),
-        Value::Fn(p) | Value::Macro(p) => p.is_static_alloc(),
-        Value::BoundFn(p) => p.is_static_alloc(),
-        Value::Var(p) => p.is_static_alloc(),
-        Value::Atom(p) => p.is_static_alloc(),
-        Value::Namespace(p) => p.is_static_alloc(),
-        Value::LazySeq(p) => p.is_static_alloc(),
-        Value::Cons(p) => p.is_static_alloc(),
-        Value::Protocol(p) => p.is_static_alloc(),
-        Value::ProtocolFn(p) => p.is_static_alloc(),
-        Value::MultiFn(p) => p.is_static_alloc(),
-        Value::Volatile(p) => p.is_static_alloc(),
-        Value::Delay(p) => p.is_static_alloc(),
-        Value::Promise(p) => p.is_static_alloc(),
-        Value::Future(p) => p.is_static_alloc(),
-        Value::Agent(p) => p.is_static_alloc(),
-        Value::TypeInstance(p) => p.is_static_alloc(),
-        Value::ObjectArray(p) => p.is_static_alloc(),
-        Value::NativeObject(p) => p.is_static_alloc(),
-        Value::Error(p) => p.is_static_alloc(),
-        Value::TransientMap(p) => p.is_static_alloc(),
-        Value::TransientVector(p) => p.is_static_alloc(),
-        Value::TransientSet(p) => p.is_static_alloc(),
-        // Primitive arrays — no meaningful pointer check needed.
-        Value::BooleanArray(_)
-        | Value::ByteArray(_)
-        | Value::ShortArray(_)
-        | Value::IntArray(_)
-        | Value::LongArray(_)
-        | Value::FloatArray(_)
-        | Value::DoubleArray(_)
-        | Value::CharArray(_) => true,
-        // Wrapper variants.
-        Value::Reduced(inner) | Value::WithMeta(inner, _) => value_gcptr_is_static(inner),
-    }
-}
-
 // ── Protocol ──────────────────────────────────────────────────────────────────
 
 /// Inner map type for protocol implementations: method_name → impl fn.
 pub type MethodMap = HashMap<Arc<str>, Value>;
+
+#[cfg(feature = "no-gc")]
+type ImplementationOwnership = HashMap<Arc<str>, HashMap<Arc<str>, crate::publish::ValueLease>>;
 
 /// A Clojure protocol — an interface-like construct with named methods.
 #[derive(Debug)]
@@ -110,7 +31,9 @@ pub struct Protocol {
     pub ns: Arc<str>,
     pub methods: Vec<ProtocolMethod>,
     /// type_tag → { method_name → impl fn }
-    pub impls: Mutex<HashMap<Arc<str>, MethodMap>>,
+    pub impls: TrackedMutex<HashMap<Arc<str>, MethodMap>>,
+    #[cfg(feature = "no-gc")]
+    impl_ownership: std::cell::RefCell<ImplementationOwnership>,
     /// `(defprotocol Name :extend-via-metadata true ...)` — when set, protocol
     /// dispatch consults the dispatch value's metadata (keyed by this
     /// protocol's `ProtocolFn`s) before falling back to type-tag impls.
@@ -128,9 +51,54 @@ impl Protocol {
             name,
             ns,
             methods,
-            impls: Mutex::new(HashMap::new()),
+            impls: TrackedMutex::new(HashMap::new()),
+            #[cfg(feature = "no-gc")]
+            impl_ownership: Default::default(),
             extend_via_metadata,
         }
+    }
+}
+
+impl Protocol {
+    /// Install an implementation and its replaceable ownership cache.
+    pub fn set_implementation(&self, tag: Arc<str>, method: Arc<str>, value: Value) {
+        #[cfg(feature = "no-gc")]
+        let (value, lease) = crate::publish::prepare_for_owner(
+            value,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(not(feature = "no-gc"))]
+        let value = crate::publish::publish_value(value);
+        self.impls
+            .lock()
+            .unwrap()
+            .entry(tag.clone())
+            .or_default()
+            .insert(method.clone(), value);
+        #[cfg(feature = "no-gc")]
+        {
+            let previous = self
+                .impl_ownership
+                .borrow_mut()
+                .entry(tag)
+                .or_default()
+                .insert(method, lease);
+            drop(previous);
+        }
+    }
+    /// Borrow a cached implementation without allocating a composite key.
+    pub fn protect_implementation(&self, tag: &str, method: &str) {
+        #[cfg(feature = "no-gc")]
+        if let Some(lease) = self
+            .impl_ownership
+            .borrow()
+            .get(tag)
+            .and_then(|methods| methods.get(method))
+        {
+            lease.protect_read();
+        }
+        #[cfg(not(feature = "no-gc"))]
+        let _ = (tag, method);
     }
 }
 
@@ -155,7 +123,18 @@ pub fn bump_protocol_generation() {
     PROTOCOL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
+impl Drop for Protocol {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
+    }
+}
+
 impl cljrs_gc::Trace for Protocol {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {
+        // Mutable contents own their destination leases independently.
+    }
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let impls = self.impls.lock().unwrap();
@@ -192,6 +171,10 @@ pub struct ProtocolFn {
 }
 
 impl cljrs_gc::Trace for ProtocolFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         visitor.visit(&self.protocol);
@@ -206,18 +189,20 @@ pub struct MultiFn {
     pub name: Arc<str>,
     pub dispatch_fn: Value,
     /// pr_str(dispatch-val) → implementation fn
-    pub methods: Mutex<HashMap<String, Value>>,
+    pub methods: TrackedMutex<HashMap<String, Value>>,
     /// pr_str(dispatch-val) → the dispatch value itself, for `isa?` lookups
-    pub dispatch_vals: Mutex<HashMap<String, Value>>,
+    pub dispatch_vals: TrackedMutex<HashMap<String, Value>>,
     /// recorded preferences: pr_str(preferred) → pr_str(over)
-    pub prefers: Mutex<HashMap<String, Vec<String>>>,
+    pub prefers: TrackedMutex<HashMap<String, Vec<String>>>,
     /// pr_str(preference dispatch value) → original value, including values
     /// which do not currently have a method.
-    pub preference_vals: Mutex<HashMap<String, Value>>,
+    pub preference_vals: TrackedMutex<HashMap<String, Value>>,
     /// normally ":default"
     pub default_dispatch: String,
     method_generation: std::sync::atomic::AtomicU64,
-    method_cache: Mutex<MultiFnMethodCache>,
+    method_cache: TrackedMutex<MultiFnMethodCache>,
+    #[cfg(feature = "no-gc")]
+    method_ownership: std::cell::RefCell<HashMap<String, crate::publish::ValueLease>>,
 }
 
 #[derive(Debug, Default)]
@@ -232,14 +217,53 @@ impl MultiFn {
         Self {
             name,
             dispatch_fn,
-            methods: Mutex::new(HashMap::new()),
-            dispatch_vals: Mutex::new(HashMap::new()),
-            prefers: Mutex::new(HashMap::new()),
-            preference_vals: Mutex::new(HashMap::new()),
+            methods: TrackedMutex::new(HashMap::new()),
+            dispatch_vals: TrackedMutex::new(HashMap::new()),
+            prefers: TrackedMutex::new(HashMap::new()),
+            preference_vals: TrackedMutex::new(HashMap::new()),
             default_dispatch,
             method_generation: std::sync::atomic::AtomicU64::new(0),
-            method_cache: Mutex::new(MultiFnMethodCache::default()),
+            method_cache: TrackedMutex::new(MultiFnMethodCache::default()),
+            #[cfg(feature = "no-gc")]
+            method_ownership: Default::default(),
         }
+    }
+
+    /// Read a method while borrowing its independently owned backing scopes.
+    pub fn method(&self, key: &str) -> Option<Value> {
+        let value = self.methods.lock().unwrap().get(key).cloned();
+        #[cfg(feature = "no-gc")]
+        if let Some(lease) = self.method_ownership.borrow().get(key) {
+            lease.protect_read();
+        }
+        value
+    }
+
+    /// Replace one method and its cached backing scopes.
+    pub fn set_method(&self, key: String, value: Value) {
+        #[cfg(feature = "no-gc")]
+        let (value, lease) = crate::publish::prepare_for_owner(
+            value,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(not(feature = "no-gc"))]
+        let value = crate::publish::publish_value(value);
+        self.methods.lock().unwrap().insert(key.clone(), value);
+        #[cfg(feature = "no-gc")]
+        {
+            let previous = self.method_ownership.borrow_mut().insert(key, lease);
+            drop(previous);
+        }
+    }
+    /// Remove a method, releasing its cache after existing readers finish.
+    pub fn remove_method(&self, key: &str) -> bool {
+        let removed = self.methods.lock().unwrap().remove(key).is_some();
+        #[cfg(feature = "no-gc")]
+        {
+            let previous = self.method_ownership.borrow_mut().remove(key);
+            drop(previous);
+        }
+        removed
     }
 
     /// Current generation of this multimethod's method and preference tables.
@@ -300,7 +324,38 @@ impl MultiFn {
     }
 }
 
+impl Drop for MultiFn {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
+    }
+}
+
 impl cljrs_gc::Trace for MultiFn {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let methods = self.methods.lock().unwrap().clone();
+        for (key, value) in methods {
+            self.set_method(key, value);
+        }
+        for (prefix, table) in [
+            ("dispatch", &self.dispatch_vals),
+            ("prefer", &self.preference_vals),
+        ] {
+            for (key, value) in table.lock().unwrap().iter() {
+                let lease = cljrs_gc::region::RegionLease::for_value(value);
+                cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                    self as *const _ as usize,
+                    format!("{prefix}:{key}"),
+                    &lease,
+                );
+            }
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        self.dispatch_fn.trace(visitor);
+    }
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.dispatch_fn.trace(visitor);
         {
@@ -322,6 +377,59 @@ impl cljrs_gc::Trace for MultiFn {
             }
         }
     }
+}
+
+#[cfg(feature = "no-gc")]
+fn prepare_optional(
+    value: Option<Value>,
+    address: usize,
+) -> (Option<Value>, crate::publish::ValueLease) {
+    match value {
+        Some(value) => {
+            let (value, lease) = crate::publish::prepare_for_owner(
+                value,
+                &cljrs_gc::region::AllocationOwner::for_address(address),
+            );
+            (Some(value), lease)
+        }
+        None => (None, Default::default()),
+    }
+}
+fn edit_watches(
+    watches: &TrackedMutex<Vec<(Value, Value)>>,
+    added: Option<(Value, Value)>,
+    removed: Option<&Value>,
+) {
+    let mut watches = watches.lock().unwrap();
+    if let Some((key, callback)) = added {
+        if let Some(entry) = watches.iter_mut().find(|(k, _)| k == &key) {
+            entry.1 = callback;
+        } else {
+            watches.push((key, callback));
+        }
+    }
+    if let Some(key) = removed {
+        watches.retain(|(k, _)| k != key);
+    }
+}
+
+#[cfg(feature = "no-gc")]
+fn refresh_watch_lease(
+    watches: &TrackedMutex<Vec<(Value, Value)>>,
+    cached: &std::cell::RefCell<crate::publish::ValueLease>,
+    address: usize,
+) {
+    let values: Vec<Value> = watches
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(key, callback)| [key.clone(), callback.clone()])
+        .collect();
+    let lease = crate::publish::ValueLease::for_values(
+        &values,
+        &cljrs_gc::region::AllocationOwner::for_address(address),
+    );
+    *cached.borrow_mut() = lease;
 }
 
 // ── Var ───────────────────────────────────────────────────────────────────────
@@ -352,16 +460,24 @@ impl cljrs_gc::Trace for MultiFn {
 /// and lives on the binding stack, not in the var root.
 #[derive(Debug)]
 pub struct Var {
+    #[cfg(feature = "no-gc")]
+    read_epoch: std::cell::Cell<u64>,
     pub namespace: Arc<str>,
     pub name: Arc<str>,
-    pub value: Mutex<Option<Value>>,
+    pub value: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    value_lease: std::cell::RefCell<crate::publish::ValueLease>,
     /// Cross-isolate mirror of the root binding (Phase B3).  `None` when the
     /// var is unbound or its current root is not promotable.
     pub shared_root: Arc<arc_swap::ArcSwap<Option<crate::shared::SharedValue>>>,
     pub is_macro: bool,
     /// Metadata map (e.g. `{:dynamic true}`).
-    pub meta: Mutex<Option<Value>>,
-    pub watches: Mutex<Vec<(Value, Value)>>,
+    pub meta: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    meta_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    #[cfg(feature = "no-gc")]
+    watch_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    pub watches: TrackedMutex<Vec<(Value, Value)>>,
     binding_generation: std::sync::atomic::AtomicU64,
 }
 
@@ -370,11 +486,19 @@ impl Var {
         Self {
             namespace: namespace.into(),
             name: name.into(),
-            value: Mutex::new(None),
+            value: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            read_epoch: Default::default(),
+            #[cfg(feature = "no-gc")]
+            value_lease: Default::default(),
             shared_root: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
             is_macro: false,
-            meta: Mutex::new(None),
-            watches: Mutex::new(Vec::new()),
+            meta: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            meta_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            watch_lease: Default::default(),
+            watches: TrackedMutex::new(Vec::new()),
             binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -396,14 +520,33 @@ impl Var {
             .as_ref()
             .as_ref()
             .map(crate::shared::demote);
+        #[cfg(feature = "no-gc")]
+        let (local, lease) = match local {
+            Some(value) => {
+                let (value, lease) = crate::publish::prepare_definition(
+                    value,
+                    &cljrs_gc::region::AllocationOwner::current(),
+                );
+                (Some(value), lease)
+            }
+            None => (None, Default::default()),
+        };
         Self {
             namespace: namespace.into(),
             name: name.into(),
-            value: Mutex::new(local),
+            value: TrackedMutex::new(local),
+            #[cfg(feature = "no-gc")]
+            read_epoch: Default::default(),
+            #[cfg(feature = "no-gc")]
+            value_lease: std::cell::RefCell::new(lease),
             shared_root,
             is_macro,
-            meta: Mutex::new(None),
-            watches: Mutex::new(Vec::new()),
+            meta: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            meta_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            watch_lease: Default::default(),
+            watches: TrackedMutex::new(Vec::new()),
             binding_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -412,8 +555,27 @@ impl Var {
         self.value.lock().unwrap().is_some()
     }
 
+    pub fn snapshot(&self) -> Option<crate::publish::ValueSnapshot> {
+        self.value
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|value| crate::publish::ValueSnapshot {
+                value,
+                #[cfg(feature = "no-gc")]
+                lease: self.value_lease.borrow().snapshot(),
+            })
+    }
     pub fn deref(&self) -> Option<Value> {
-        self.value.lock().unwrap().clone()
+        let value = self.value.lock().unwrap().clone();
+        #[cfg(feature = "no-gc")]
+        {
+            let epoch = cljrs_gc::region::ReadScope::epoch();
+            if epoch == 0 || self.read_epoch.replace(epoch) != epoch {
+                self.value_lease.borrow().protect_read();
+            }
+        }
+        value
     }
 
     /// Generation of the isolate-local root binding, incremented after each
@@ -436,22 +598,17 @@ impl Var {
     }
 
     pub fn bind(&self, v: Value) {
-        // In no-gc debug builds: assert the value being stored in this
-        // program-lifetime Var came from the StaticArena, not a scratch region.
-        // A region-local pointer would dangle after the function returns.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            value_gcptr_is_static(&v),
-            "no-gc: Var::bind({}/{}) received a region-local value — store violations \
-             indicate a missing StaticCtxGuard around the value expression",
-            self.namespace,
-            self.name
-        );
-        // GC builds: heap-promotion fallback — a region-allocated value bound
-        // to a program-lifetime var is deep-copied to the heap (or the active
-        // regions are retired when it cannot be).  One depth check when no
-        // region is open.
+        #[cfg(feature = "no-gc")]
+        self.read_epoch.set(0);
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
+        #[cfg(feature = "no-gc")]
+        let previous_lease = self.value_lease.borrow().snapshot();
+        #[cfg(feature = "no-gc")]
+        let (v, lease) = crate::publish::prepare_definition(
+            v,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
         // Replace the binding, holding the lock only across the swap.  The
         // previous value (if any) is handed to the JIT rebind hook so it can
         // reclaim native code compiled for a now-superseded definition
@@ -461,6 +618,10 @@ impl Var {
             let mut slot = self.value.lock().unwrap();
             slot.replace(v.clone())
         };
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
         // Promote-on-`def` (Phase B3): mirror the new root into the
         // cross-isolate cell when it is promotable, else clear the cell so it
         // never advertises a stale or non-shareable root.  `def` is rare and
@@ -473,14 +634,50 @@ impl Var {
         if let Some(prev) = prev {
             crate::jit_hooks::notify_var_rebind(&prev, &v);
         }
+        #[cfg(feature = "no-gc")]
+        {
+            drop(previous_lease);
+        }
+    }
+
+    pub fn add_watch(&self, key: Value, callback: Value) {
+        edit_watches(&self.watches, Some((key, callback)), None);
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    pub fn remove_watch(&self, key: &Value) {
+        edit_watches(&self.watches, None, Some(key));
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    #[cfg(feature = "no-gc")]
+    fn refresh_watch_lease(&self) {
+        refresh_watch_lease(&self.watches, &self.watch_lease, self as *const _ as usize);
+    }
+    pub fn protect_watches(&self) {
+        #[cfg(feature = "no-gc")]
+        self.watch_lease.borrow().protect_read();
     }
 
     pub fn get_meta(&self) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.meta_lease.borrow().protect_read();
         self.meta.lock().unwrap().clone()
     }
 
     pub fn set_meta(&self, m: Value) {
+        #[cfg(not(feature = "no-gc"))]
+        let m = crate::publish::publish_for_owner(m, self as *const _ as usize);
+        #[cfg(feature = "no-gc")]
+        let (m, lease) = crate::publish::prepare_definition(
+            m,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
         *self.meta.lock().unwrap() = Some(m);
+        #[cfg(feature = "no-gc")]
+        {
+            *self.meta_lease.borrow_mut() = lease;
+        }
     }
 
     pub fn full_name(&self) -> String {
@@ -489,7 +686,19 @@ impl Var {
 }
 
 impl cljrs_gc::Trace for Var {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        let lease = self.value_lease.borrow().reparent(&owner);
+        let old = self.value_lease.replace(lease);
+        drop(old);
+    }
+
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        #[cfg(not(feature = "no-gc"))]
         {
             let value = self.value.lock().unwrap();
             if let Some(v) = value.as_ref() {
@@ -517,64 +726,174 @@ impl cljrs_gc::Trace for Var {
 /// A Clojure atom — a thread-safe mutable reference.
 #[derive(Debug)]
 pub struct Atom {
-    pub value: Mutex<Value>,
-    pub meta: Mutex<Option<Value>>,
-    pub validator: Mutex<Option<Value>>,
-    pub watches: Mutex<Vec<(Value, Value)>>,
+    pub value: TrackedMutex<Value>,
+    #[cfg(feature = "no-gc")]
+    value_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    pub meta: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    meta_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    #[cfg(feature = "no-gc")]
+    watch_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    pub validator: TrackedMutex<Option<Value>>,
+    #[cfg(feature = "no-gc")]
+    validator_lease: std::cell::RefCell<crate::publish::ValueLease>,
+    pub watches: TrackedMutex<Vec<(Value, Value)>>,
 }
 
 impl Atom {
     pub fn new(v: Value) -> Self {
         // Heap-promotion fallback (GC builds): an atom is program-lifetime
         // shared state, so its initial value must not be region-allocated.
+        #[cfg(feature = "no-gc")]
+        let (v, lease) =
+            crate::publish::prepare_definition(v, &cljrs_gc::region::AllocationOwner::current());
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
-            value: Mutex::new(v),
-            meta: Mutex::new(None),
-            validator: Mutex::new(None),
-            watches: Mutex::new(Vec::new()),
+            value: TrackedMutex::new(v),
+            #[cfg(feature = "no-gc")]
+            value_lease: std::cell::RefCell::new(lease),
+            meta: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            meta_lease: Default::default(),
+            #[cfg(feature = "no-gc")]
+            watch_lease: Default::default(),
+            validator: TrackedMutex::new(None),
+            #[cfg(feature = "no-gc")]
+            validator_lease: Default::default(),
+            watches: TrackedMutex::new(Vec::new()),
+        }
+    }
+
+    pub fn snapshot(&self) -> crate::publish::ValueSnapshot {
+        crate::publish::ValueSnapshot {
+            value: self.value.lock().unwrap().clone(),
+            #[cfg(feature = "no-gc")]
+            lease: self.value_lease.borrow().snapshot(),
         }
     }
 
     pub fn deref(&self) -> Value {
-        self.value.lock().unwrap().clone()
+        let snapshot = self.snapshot();
+        snapshot.protect_current();
+        snapshot.value
     }
 
     pub fn reset(&self, v: Value) -> Value {
-        // In no-gc debug builds: assert the new value came from the StaticArena.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            value_gcptr_is_static(&v),
-            "no-gc: Atom::reset() received a region-local value — the new-value \
-             expression must be computed inside a StaticCtxGuard (i.e. inside \
-             the swap! / reset! call) so it is allocated in the static arena"
-        );
-        // GC builds: heap-promotion fallback (see `Var::bind`).
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
-        let mut guard = self.value.lock().unwrap();
-        *guard = v.clone();
+        #[cfg(feature = "no-gc")]
+        let (v, lease) = crate::publish::prepare_for_owner(
+            v,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(feature = "no-gc")]
+        lease.publish_return();
+        *self.value.lock().unwrap() = v.clone();
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
         v
     }
 
+    /// Replace the value only if it still equals `expected`.
+    /// Failed attempts do not publish or lease the candidate.
+    pub fn compare_and_set(&self, expected: &Value, value: Value) -> bool {
+        // The common vector update compares the exact snapshot just read.
+        // Avoid walking its shared elements for each accumulator update.
+        let matches_expected = |current: &Value| {
+            matches!((current, expected), (Value::Vector(a), Value::Vector(b)) if GcPtr::ptr_eq(a, b))
+                || current == expected
+        };
+        if !matches_expected(&self.value.lock().unwrap()) {
+            return false;
+        }
+        #[cfg(not(feature = "no-gc"))]
+        let value = crate::publish::publish_value(value);
+        #[cfg(feature = "no-gc")]
+        let (value, lease) = crate::publish::prepare_for_owner(
+            value,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        let mut guard = self.value.lock().unwrap();
+        if !matches_expected(&guard) {
+            return false;
+        }
+        *guard = value;
+        drop(guard);
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
+        true
+    }
+
+    pub fn add_watch(&self, key: Value, callback: Value) {
+        edit_watches(&self.watches, Some((key, callback)), None);
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    pub fn remove_watch(&self, key: &Value) {
+        edit_watches(&self.watches, None, Some(key));
+        #[cfg(feature = "no-gc")]
+        self.refresh_watch_lease();
+    }
+    #[cfg(feature = "no-gc")]
+    fn refresh_watch_lease(&self) {
+        refresh_watch_lease(&self.watches, &self.watch_lease, self as *const _ as usize);
+    }
+    pub fn protect_watches(&self) {
+        #[cfg(feature = "no-gc")]
+        self.watch_lease.borrow().protect_read();
+    }
+
     pub fn get_meta(&self) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.meta_lease.borrow().protect_read();
         self.meta.lock().unwrap().clone()
     }
 
     pub fn set_meta(&self, m: Option<Value>) {
+        #[cfg(feature = "no-gc")]
+        let (m, lease) = prepare_optional(m, self as *const _ as usize);
         *self.meta.lock().unwrap() = m;
+        #[cfg(feature = "no-gc")]
+        {
+            *self.meta_lease.borrow_mut() = lease;
+        }
     }
 
     pub fn get_validator(&self) -> Option<Value> {
+        #[cfg(feature = "no-gc")]
+        self.validator_lease.borrow().protect_read();
         self.validator.lock().unwrap().clone()
     }
 
     pub fn set_validator(&self, vf: Option<Value>) {
+        #[cfg(feature = "no-gc")]
+        let (vf, lease) = prepare_optional(vf, self as *const _ as usize);
         *self.validator.lock().unwrap() = vf;
+        #[cfg(feature = "no-gc")]
+        {
+            *self.validator_lease.borrow_mut() = lease;
+        }
     }
 }
 
 impl cljrs_gc::Trace for Atom {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        let lease = self.value_lease.borrow().reparent(&owner);
+        let old = self.value_lease.replace(lease);
+        drop(old);
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        #[cfg(not(feature = "no-gc"))]
         {
             let value = self.value.lock().unwrap();
             value.trace(visitor);
@@ -644,48 +963,47 @@ impl ReferClojureFilter {
 pub struct Namespace {
     pub name: Arc<str>,
     /// Vars interned directly in this namespace.
-    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
+    pub interns: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>,
     /// Vars referred from other namespaces (e.g. clojure.core).
-    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,
+    pub refers: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>,
     /// Namespace aliases: short-name → full namespace name.
-    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,
+    pub aliases: TrackedMutex<HashMap<Arc<str>, Arc<str>>>,
     /// Absolute path of the source file this namespace was loaded from,
     /// populated by the loader.  Used by the versioned resolver to locate the
     /// file for `git show`.
-    pub source_file: Mutex<Option<Arc<str>>>,
+    pub source_file: TrackedMutex<Option<Arc<str>>>,
     /// Absolute path of the git repository root that contains `source_file`.
-    pub git_repo_root: Mutex<Option<Arc<str>>>,
+    pub git_repo_root: TrackedMutex<Option<Arc<str>>>,
     /// `true` for namespaces loaded from a specific commit (`name@hash`).
     /// Versioned namespaces are immutable: `intern()` will refuse new bindings.
     pub is_versioned: bool,
     /// Metadata attached via `(ns ^{...} name ...)` or an `ns` attr-map.
-    pub meta: Mutex<Option<Value>>,
+    pub meta: TrackedMutex<Option<Value>>,
     /// Narrowing applied to the automatic `clojure.core` refer, set by an
     /// `(:refer-clojure ...)` clause.  `None` refers all of core.
-    pub refer_clojure_filter: Mutex<Option<ReferClojureFilter>>,
+    pub refer_clojure_filter: TrackedMutex<Option<ReferClojureFilter>>,
 }
 
 impl Namespace {
     pub fn new(name: impl Into<Arc<str>>) -> Self {
         Self {
             name: name.into(),
-            interns: Mutex::new(HashMap::new()),
-            refers: Mutex::new(HashMap::new()),
-            aliases: Mutex::new(HashMap::new()),
-            source_file: Mutex::new(None),
-            git_repo_root: Mutex::new(None),
+            interns: TrackedMutex::new(HashMap::new()),
+            refers: TrackedMutex::new(HashMap::new()),
+            aliases: TrackedMutex::new(HashMap::new()),
+            source_file: TrackedMutex::new(None),
+            git_repo_root: TrackedMutex::new(None),
             is_versioned: false,
-            meta: Mutex::new(None),
-            refer_clojure_filter: Mutex::new(None),
+            meta: TrackedMutex::new(None),
+            refer_clojure_filter: TrackedMutex::new(None),
         }
     }
 
     /// Create a versioned (immutable) namespace for `name@commit`.
     pub fn new_versioned(name: impl Into<Arc<str>>) -> Self {
-        Self {
-            is_versioned: true,
-            ..Self::new(name)
-        }
+        let mut namespace = Self::new(name);
+        namespace.is_versioned = true;
+        namespace
     }
 
     /// Record the source file path and its git repo root (if in a repo).
@@ -695,15 +1013,28 @@ impl Namespace {
     }
 
     pub fn get_meta(&self) -> Option<Value> {
+        crate::publish::read_slot(self as *const _ as usize, 0);
         self.meta.lock().unwrap().clone()
     }
 
     pub fn set_meta(&self, m: Value) {
+        let m = crate::publish::publish_for_owner(m, self as *const _ as usize);
         *self.meta.lock().unwrap() = Some(m);
     }
 }
 
+impl Drop for Namespace {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
+    }
+}
+
 impl cljrs_gc::Trace for Namespace {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {
+        // Mutable contents own their destination leases independently.
+    }
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         {
@@ -746,8 +1077,14 @@ pub enum Arity {
 
 pub struct NativeFn {
     pub name: Arc<str>,
+    /// Lazily assigned watchdog name id (`Default::default()` when building).
+    pub diagnostic_id: cljrs_gc::fiber::NativeDiagnosticId,
     pub arity: Arity,
     pub func: NativeFnFunc,
+    /// Managed values retained by the opaque callable closure.
+    pub captures: Arc<[Value]>,
+    /// Optional adapter that marshals owned inputs and offloads native work.
+    pub blocking_func: Option<NativeFnFunc>,
 }
 
 impl NativeFn {
@@ -756,11 +1093,20 @@ impl NativeFn {
         Self {
             name: name.into(),
             arity,
-            func: Arc::new(func),
+            blocking_func: None,
+            captures: Default::default(),
+            diagnostic_id: Default::default(),
+            func: Arc::new(move |args| {
+                crate::parking::catch_cancelled(|| {
+                    crate::realization::catch(|| func(args))
+                        .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                })?
+            }),
         }
     }
 
-    /// Create from a closure or any `Fn(&[Value]) -> ValueResult<Value>`.
+    /// Create a Rust callable with no managed captures. For closures that
+    /// retain Values, use with_captures so the collector can visit them.
     pub fn with_closure(
         name: impl Into<Arc<str>>,
         arity: Arity,
@@ -769,8 +1115,73 @@ impl NativeFn {
         Self {
             name: name.into(),
             arity,
-            func: Arc::new(func),
+            blocking_func: None,
+            captures: Default::default(),
+            diagnostic_id: Default::default(),
+            func: Arc::new(move |args| {
+                crate::parking::catch_cancelled(|| {
+                    crate::realization::catch(|| func(args))
+                        .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+                })?
+            }),
         }
+    }
+
+    /// Create a callable with explicit managed captures for precise tracing.
+    /// The callback and tracer share one immutable capture slice.
+    /// Callers must not replace the public `captures` handle after construction.
+    pub fn with_captures(
+        name: impl Into<Arc<str>>,
+        arity: Arity,
+        captures: Vec<Value>,
+        func: impl Fn(&[Value], &[Value]) -> crate::ValueResult<Value> + 'static,
+    ) -> Self {
+        let captures: Arc<[Value]> = captures.into();
+        let shared = captures.clone();
+        let mut native = Self::with_closure(name, arity, move |args| func(&shared, args));
+        native.captures = captures;
+        native
+    }
+
+    /// Create a native function with a separate owned-work blocking adapter.
+    /// The adapter must keep managed conversions on the caller's isolate.
+    pub fn with_blocking(
+        name: impl Into<Arc<str>>,
+        arity: Arity,
+        func: impl Fn(&[Value]) -> crate::ValueResult<Value> + 'static,
+        blocking_func: impl Fn(&[Value]) -> crate::ValueResult<Value> + 'static,
+    ) -> Self {
+        let mut native = Self::with_closure(name, arity, func);
+        native.blocking_func = Some(Arc::new(move |args| {
+            crate::parking::catch_cancelled(|| {
+                crate::realization::catch(|| blocking_func(args))
+                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            })?
+        }));
+        native
+    }
+
+    /// Call the blocking adapter. Reject unsupported functions before execution.
+    pub fn call_blocking(&self, args: &[Value]) -> crate::ValueResult<Value> {
+        let expected = match self.arity {
+            Arity::Fixed(n) if args.len() != n => Some(n.to_string()),
+            Arity::Variadic { min } if args.len() < min => Some(format!("{min}+")),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            return Err(crate::ValueError::ArityError {
+                name: self.name.to_string(),
+                expected,
+                got: args.len(),
+            });
+        }
+        let adapter = self.blocking_func.as_ref().ok_or_else(|| {
+            crate::ValueError::Other(format!(
+                "blocking cannot offload {}: this function has no owned-work adapter",
+                self.name
+            ))
+        })?;
+        adapter(args)
     }
 }
 
@@ -785,7 +1196,15 @@ impl std::fmt::Debug for NativeFn {
 }
 
 impl cljrs_gc::Trace for NativeFn {
-    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
+    fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        for value in self.captures.iter() {
+            value.trace(visitor);
+        }
+    }
 }
 
 // ── CljxFnArity ───────────────────────────────────────────────────────────────
@@ -798,8 +1217,10 @@ pub struct CljxFnArity {
     pub params: Vec<Arc<str>>,
     /// The name after `&`, if any.
     pub rest_param: Option<Arc<str>>,
-    /// The body forms for this arity.
-    pub body: Vec<Form>,
+    /// The body forms for this arity. Shared, so cloning a fn (e.g. when
+    /// `lazy-seq` wraps a thunk, or a closure is copied) does not deep-copy
+    /// its body.
+    pub body: Arc<[Form]>,
     /// Destructuring patterns: (param_index, original_form).
     /// After binding the gensym'd param, these patterns are applied
     /// via `bind_pattern` to destructure the value.
@@ -823,7 +1244,7 @@ impl CljxFnArity {
         // params Vec buffer (Arc<str> pointers; the str data is shared, skip it)
         self.params.capacity() * mem::size_of::<Arc<str>>()
         // body: the dominant consumer — Form AST trees stored inline
-        + self.body.capacity() * mem::size_of::<Form>()
+        + self.body.len() * mem::size_of::<Form>()
         + self.body.iter().map(|f| f.heap_size()).sum::<usize>()
         // destructure_params
         + self.destructure_params.capacity() * mem::size_of::<(usize, Form)>()
@@ -886,6 +1307,10 @@ impl CljxFn {
 }
 
 impl cljrs_gc::Trace for CljxFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         use cljrs_gc::GcVisitor as _;
         for v in &self.closed_over_vals {
@@ -922,6 +1347,10 @@ pub struct BoundFn {
 }
 
 impl cljrs_gc::Trace for BoundFn {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.wrapped.trace(visitor);
         for val in self.captured_bindings.values() {
@@ -939,61 +1368,195 @@ impl cljrs_gc::Trace for BoundFn {
 
 /// A deferred computation that produces a `Value` when forced.
 pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
-    fn force(&self) -> Result<Value, String>;
+    /// Errors other than `crate::ValueError::Cancelled` are cached as their message.
+    /// A thunk interrupted by fiber cancellation must return
+    /// `crate::ValueError::Cancelled`, so the cell stays pending for other readers.
+    fn force(&self) -> crate::ValueResult<Value>;
+}
+
+/// The cached message of a failed thunk.
+fn thunk_error_message(error: crate::ValueError) -> String {
+    match error {
+        crate::ValueError::Other(message) => message,
+        other => other.to_string(),
+    }
+}
+
+/// Identifies a computation by its isolate thread and optional fiber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Realizer {
+    thread: std::thread::ThreadId,
+    fiber: Option<u64>,
+}
+impl Realizer {
+    pub fn current() -> Self {
+        Self {
+            thread: std::thread::current().id(),
+            fiber: crate::parking::current(),
+        }
+    }
+
+    /// Reject a carrier wait that would prevent this owner's fiber resuming.
+    /// A different fiber can park; a different thread can block normally.
+    pub fn ensure_can_wait(self) -> Result<(), String> {
+        if self.thread == std::thread::current().id()
+            && self.fiber.is_some()
+            && crate::parking::current().is_none()
+        {
+            Err("cannot block the isolate thread waiting for a parked fiber. Run this code inside a fiber.".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// Cancellation/panic returns the original thunk to Pending for another reader.
+struct RealizationGuard<'a> {
+    lazy: Option<&'a LazySeq>,
+    delay: Option<&'a Delay>,
+}
+impl Drop for RealizationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(cell) = self.lazy {
+            let mut state = cell.state.lock().unwrap();
+            if let LazySeqState::Realizing { thunk, .. } = &*state {
+                *state = LazySeqState::Pending(thunk.clone());
+            }
+            drop(state);
+            cell.ready.notify_all();
+        }
+        if let Some(cell) = self.delay {
+            let mut state = cell.state.lock().unwrap();
+            if let DelayState::Realizing { thunk, .. } = &*state {
+                *state = DelayState::Pending(thunk.clone());
+            }
+            drop(state);
+            cell.ready.notify_all();
+        }
+    }
 }
 
 /// Internal state of a lazy sequence cell.
 pub enum LazySeqState {
     /// Thunk not yet evaluated.
-    Pending(Box<dyn Thunk>),
+    Pending(Rc<dyn Thunk>),
+    Realizing {
+        owner: Realizer,
+        thunk: Rc<dyn Thunk>,
+    },
     /// Result cached after first force.
     Forced(Value),
     /// Thunk evaluation failed; error message is cached.
     Error(String),
 }
 
-/// A lazy sequence that forces its thunk exactly once and caches the result.
+/// A lazy sequence that caches its result and retries interrupted realizations.
 pub struct LazySeq {
-    pub state: Mutex<LazySeqState>,
+    ready: Event,
+    pub state: TrackedMutex<LazySeqState>,
 }
 
 impl LazySeq {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
-            state: Mutex::new(LazySeqState::Pending(thunk)),
+            state: TrackedMutex::new(LazySeqState::Pending(Rc::from(thunk))),
+            ready: Event::default(),
         }
     }
 
     /// Realize the sequence: force the thunk on first call, return cached value on subsequent calls.
-    /// On error, returns `Value::Nil` and caches the error (retrievable via `error()`).
+    /// Cached thunk errors return nil and remain available through `error()`.
+    /// Panics if a carrier wait would prevent the owning fiber resuming.
+    /// Use `try_realize` when the caller can return an error.
     pub fn realize(&self) -> Value {
-        let thunk = {
-            let mut guard = self.state.lock().unwrap();
-            match &*guard {
-                LazySeqState::Forced(v) => return v.clone(),
-                LazySeqState::Error(_) => return Value::Nil,
-                LazySeqState::Pending(_) => {}
-            }
-            // Replace the pending state with a temporary Forced(Nil), extract the thunk.
-            let prev = mem::replace(&mut *guard, LazySeqState::Forced(Value::Nil));
-            let LazySeqState::Pending(thunk) = prev else {
-                unreachable!("state was not Pending")
-            };
-            thunk
-            // guard dropped here — lock released before forcing
-        };
-        // Force the thunk WITHOUT holding the lock. This ensures GC's
-        // lock().unwrap() in LazySeq::trace() will not deadlock.
-        match thunk.force() {
-            Ok(result) => {
-                *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
-                result
-            }
-            Err(msg) => {
-                *self.state.lock().unwrap() = LazySeqState::Error(msg);
+        match self.try_realize() {
+            Ok(value) => value,
+            // No error channel here: continue the cancellation as an unwind.
+            Err(crate::ValueError::Cancelled) => crate::parking::resume_cancelled(),
+            Err(error) => {
+                // Infallible trait callers cannot return a transient wait
+                // error. Fail explicitly instead of silently losing data.
+                assert!(self.error().is_some(), "{error}");
                 Value::Nil
             }
         }
+    }
+
+    /// Realize a sequence with explicit errors, including unsafe carrier waits.
+    /// A rejected wait does not change the thunk or its realization state.
+    /// Cached and ordinary errors are `crate::ValueError::Other`; a thunk cancelled
+    /// with its fiber returns `crate::ValueError::Cancelled` and stays pending.
+    pub fn try_realize(&self) -> crate::ValueResult<Value> {
+        let owner = Realizer::current();
+        let thunk = loop {
+            let listener = self.ready.listen();
+            let mut state = self.state.lock().unwrap();
+            match &*state {
+                LazySeqState::Forced(v) => {
+                    let value = v.clone();
+                    drop(state);
+                    crate::publish::read_slot(self as *const _ as usize, 0);
+                    return Ok(value);
+                }
+                LazySeqState::Error(error) => return Err(crate::ValueError::Other(error.clone())),
+                LazySeqState::Realizing { owner: active, .. } => {
+                    if *active == owner {
+                        return Ok(Value::Nil);
+                    }
+                    active.ensure_can_wait().map_err(crate::ValueError::Other)?;
+                    drop(state);
+                    listener.wait(None);
+                    continue;
+                }
+                LazySeqState::Pending(_) => {}
+            }
+            let LazySeqState::Pending(thunk) =
+                mem::replace(&mut *state, LazySeqState::Forced(Value::Nil))
+            else {
+                unreachable!()
+            };
+            *state = LazySeqState::Realizing {
+                owner,
+                thunk: thunk.clone(),
+            };
+            break thunk;
+        };
+        let mut guard = RealizationGuard {
+            lazy: Some(self),
+            delay: None,
+        };
+        let result = match thunk.force() {
+            Ok(result) => {
+                let result = crate::publish::publish_for_owner(result, self as *const _ as usize);
+                *self.state.lock().unwrap() = LazySeqState::Forced(result.clone());
+                Ok(result)
+            }
+            // Cancellation is not the thunk's result: the guard returns it to
+            // Pending for other readers, and the error propagates typed.
+            Err(crate::ValueError::Cancelled) => {
+                drop(thunk);
+                drop(guard);
+                return Err(crate::ValueError::Cancelled);
+            }
+            Err(error) => {
+                let message = thunk_error_message(error);
+                *self.state.lock().unwrap() = LazySeqState::Error(message.clone());
+                Err(crate::ValueError::Other(message))
+            }
+        };
+        drop(thunk);
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+            self as *const _ as usize,
+            usize::MAX,
+            &Default::default(),
+        );
+        guard.lazy = None;
+        if result.is_ok() {
+            crate::publish::read_slot(self as *const _ as usize, 0);
+        }
+        self.ready.notify_all();
+        result
     }
 
     /// Return the cached error message, if the thunk failed.
@@ -1013,7 +1576,33 @@ impl std::fmt::Debug for LazySeq {
     }
 }
 
+impl Drop for LazySeq {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
+    }
+}
 impl cljrs_gc::Trace for LazySeq {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let state = self.state.lock().unwrap();
+        if let LazySeqState::Pending(thunk) = &*state {
+            struct ThunkRef<'a>(&'a dyn Thunk);
+            impl cljrs_gc::Trace for ThunkRef<'_> {
+                fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+                    self.0.trace(visitor);
+                }
+            }
+            let lease = cljrs_gc::region::RegionLease::for_value(&ThunkRef(thunk.as_ref()));
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                usize::MAX,
+                &lease,
+            );
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         // Safe to lock unconditionally: realize() drops the lock before entering
         // eval (thunk.force()), so the lock is never held across a GC safepoint.
@@ -1021,6 +1610,7 @@ impl cljrs_gc::Trace for LazySeq {
             let state = self.state.lock().unwrap();
             match &*state {
                 LazySeqState::Pending(thunk) => thunk.trace(visitor),
+                LazySeqState::Realizing { thunk, .. } => thunk.trace(visitor),
                 LazySeqState::Forced(v) => v.trace(visitor),
                 LazySeqState::Error(_) => {}
             }
@@ -1041,6 +1631,10 @@ pub struct CljxCons {
 }
 
 impl cljrs_gc::Trace for CljxCons {
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        true
+    }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         self.head.trace(visitor);
         self.tail.trace(visitor);
@@ -1051,33 +1645,55 @@ impl cljrs_gc::Trace for CljxCons {
 
 /// Non-atomic mutable cell (single-thread performance, no CAS).
 pub struct Volatile {
-    pub value: Mutex<Value>,
+    pub value: TrackedMutex<Value>,
+    #[cfg(feature = "no-gc")]
+    value_lease: std::cell::RefCell<crate::publish::ValueLease>,
 }
 
 impl Volatile {
     pub fn new(v: Value) -> Self {
         // GC builds: heap-promotion fallback (see `Var::bind`).
+        #[cfg(feature = "no-gc")]
+        let (v, lease) =
+            crate::publish::prepare_for_owner(v, &cljrs_gc::region::AllocationOwner::current());
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
         Self {
-            value: Mutex::new(v),
+            value: TrackedMutex::new(v),
+            #[cfg(feature = "no-gc")]
+            value_lease: std::cell::RefCell::new(lease),
+        }
+    }
+
+    pub fn snapshot(&self) -> crate::publish::ValueSnapshot {
+        crate::publish::ValueSnapshot {
+            value: self.value.lock().unwrap().clone(),
+            #[cfg(feature = "no-gc")]
+            lease: self.value_lease.borrow().snapshot(),
         }
     }
 
     pub fn deref(&self) -> Value {
-        self.value.lock().unwrap().clone()
+        let snapshot = self.snapshot();
+        snapshot.protect_current();
+        snapshot.value
     }
 
     pub fn reset(&self, v: Value) -> Value {
-        // In no-gc debug builds: assert the new value came from the StaticArena.
-        #[cfg(all(feature = "no-gc", debug_assertions))]
-        debug_assert!(
-            value_gcptr_is_static(&v),
-            "no-gc: Volatile::reset() received a region-local value — ensure the \
-             new-value expression is inside a StaticCtxGuard (vreset! handles this)"
-        );
-        // GC builds: heap-promotion fallback (see `Var::bind`).
+        #[cfg(not(feature = "no-gc"))]
         let v = crate::publish::publish_value(v);
+        #[cfg(feature = "no-gc")]
+        let (v, lease) = crate::publish::prepare_for_owner(
+            v,
+            &cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize),
+        );
+        #[cfg(feature = "no-gc")]
+        lease.publish_return();
         *self.value.lock().unwrap() = v.clone();
+        #[cfg(feature = "no-gc")]
+        {
+            *self.value_lease.borrow_mut() = lease;
+        }
         v
     }
 }
@@ -1089,7 +1705,16 @@ impl std::fmt::Debug for Volatile {
 }
 
 impl cljrs_gc::Trace for Volatile {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let owner = cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize);
+        let lease = self.value_lease.borrow().reparent(&owner);
+        let old = self.value_lease.replace(lease);
+        drop(old);
+    }
+
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+        #[cfg(not(feature = "no-gc"))]
         {
             let value = self.value.lock().unwrap();
             value.trace(visitor);
@@ -1101,47 +1726,111 @@ impl cljrs_gc::Trace for Volatile {
 
 /// Internal state of a delay cell.
 pub enum DelayState {
-    Pending(Box<dyn Thunk>),
+    Error(String),
+    Pending(Rc<dyn Thunk>),
+    Realizing {
+        owner: Realizer,
+        thunk: Rc<dyn Thunk>,
+    },
     Forced(Value),
 }
 
-/// A lazy one-time computation (forced at most once, result cached).
+/// A lazy computation with a cached result and retry after interruption.
 pub struct Delay {
-    pub state: Mutex<DelayState>,
+    ready: Event,
+    pub state: TrackedMutex<DelayState>,
 }
 
 impl Delay {
     pub fn new(thunk: Box<dyn Thunk>) -> Self {
         Self {
-            state: Mutex::new(DelayState::Pending(thunk)),
+            state: TrackedMutex::new(DelayState::Pending(Rc::from(thunk))),
+            ready: Event::default(),
         }
     }
 
-    /// Force the delay and cache the result.
-    /// Returns the value on success, or an error message on failure.
-    pub fn force(&self) -> Result<Value, String> {
-        let thunk = {
-            let mut guard = self.state.lock().unwrap();
-            if let DelayState::Forced(v) = &*guard {
-                return Ok(v.clone());
+    /// Force the delay and cache the result. Errors are as for
+    /// [`LazySeq::try_realize`].
+    pub fn force(&self) -> crate::ValueResult<Value> {
+        let owner = Realizer::current();
+        let thunk = loop {
+            let listener = self.ready.listen();
+            let mut state = self.state.lock().unwrap();
+            match &*state {
+                DelayState::Forced(v) => {
+                    let value = v.clone();
+                    drop(state);
+                    crate::publish::read_slot(self as *const _ as usize, 0);
+                    return Ok(value);
+                }
+                DelayState::Error(e) => return Err(crate::ValueError::Other(e.clone())),
+                DelayState::Realizing { owner: active, .. } => {
+                    if *active == owner {
+                        return Err(crate::ValueError::Other(
+                            "recursive delay realization".into(),
+                        ));
+                    }
+                    active.ensure_can_wait().map_err(crate::ValueError::Other)?;
+                    drop(state);
+                    listener.wait(None);
+                    continue;
+                }
+                DelayState::Pending(_) => {}
             }
-            let prev = mem::replace(&mut *guard, DelayState::Forced(Value::Nil));
-            let DelayState::Pending(thunk) = prev else {
-                unreachable!("state was not Pending")
+            let DelayState::Pending(thunk) =
+                mem::replace(&mut *state, DelayState::Forced(Value::Nil))
+            else {
+                unreachable!()
             };
-            thunk
-            // guard dropped here — lock released before forcing
+            *state = DelayState::Realizing {
+                owner,
+                thunk: thunk.clone(),
+            };
+            break thunk;
         };
-        // Force the thunk WITHOUT holding the lock so GC's lock().unwrap() in
-        // Delay::trace() will not deadlock.
-        let result = thunk.force()?;
-        *self.state.lock().unwrap() = DelayState::Forced(result.clone());
-        Ok(result)
+        let mut guard = RealizationGuard {
+            lazy: None,
+            delay: Some(self),
+        };
+        let result = match thunk.force() {
+            Ok(value) => Ok(crate::publish::publish_for_owner(
+                value,
+                self as *const _ as usize,
+            )),
+            // As for lazy seqs: the guard leaves the thunk Pending.
+            Err(crate::ValueError::Cancelled) => {
+                drop(thunk);
+                drop(guard);
+                return Err(crate::ValueError::Cancelled);
+            }
+            Err(error) => Err(thunk_error_message(error)),
+        };
+        *self.state.lock().unwrap() = match &result {
+            Ok(value) => DelayState::Forced(value.clone()),
+            Err(error) => DelayState::Error(error.clone()),
+        };
+        let result = result.map_err(crate::ValueError::Other);
+        drop(thunk);
+        #[cfg(feature = "no-gc")]
+        cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+            self as *const _ as usize,
+            usize::MAX,
+            &Default::default(),
+        );
+        guard.delay = None;
+        if result.is_ok() {
+            crate::publish::read_slot(self as *const _ as usize, 0);
+        }
+        self.ready.notify_all();
+        result
     }
 
     /// True if the delay has already been forced.
     pub fn is_realized(&self) -> bool {
-        matches!(&*self.state.lock().unwrap(), DelayState::Forced(_))
+        matches!(
+            &*self.state.lock().unwrap(),
+            DelayState::Forced(_) | DelayState::Error(_)
+        )
     }
 }
 
@@ -1151,7 +1840,33 @@ impl std::fmt::Debug for Delay {
     }
 }
 
+impl Drop for Delay {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
+    }
+}
 impl cljrs_gc::Trace for Delay {
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {
+        let state = self.state.lock().unwrap();
+        if let DelayState::Pending(thunk) = &*state {
+            struct ThunkRef<'a>(&'a dyn Thunk);
+            impl cljrs_gc::Trace for ThunkRef<'_> {
+                fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+                    self.0.trace(visitor);
+                }
+            }
+            let lease = cljrs_gc::region::RegionLease::for_value(&ThunkRef(thunk.as_ref()));
+            cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
+                self as *const _ as usize,
+                usize::MAX,
+                &lease,
+            );
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         // Safe to lock unconditionally: force() drops the lock before entering
         // eval (thunk.force()), so the lock is never held across a GC safepoint.
@@ -1159,6 +1874,8 @@ impl cljrs_gc::Trace for Delay {
             let state = self.state.lock().unwrap();
             match &*state {
                 DelayState::Pending(thunk) => thunk.trace(visitor),
+                DelayState::Realizing { thunk, .. } => thunk.trace(visitor),
+                DelayState::Error(_) => {}
                 DelayState::Forced(v) => v.trace(visitor),
             }
         }
@@ -1169,6 +1886,7 @@ impl cljrs_gc::Trace for Delay {
 
 /// A one-shot rendezvous (promise).
 pub struct CljxPromise {
+    pub ready: Event,
     pub value: Mutex<Option<Value>>,
     pub cond: Condvar,
 }
@@ -1178,33 +1896,56 @@ impl CljxPromise {
         Self {
             value: Mutex::new(None),
             cond: Condvar::new(),
+            ready: Event::default(),
         }
     }
 
     /// Deliver a value (no-op if already delivered).
     pub fn deliver(&self, v: Value) {
+        if self.value.lock().unwrap().is_some() {
+            return;
+        }
         // GC builds: heap-promotion fallback — the promise may outlive (and be
         // read from outside) any region scope active at delivery time.
-        let v = crate::publish::publish_value(v);
+        let v = crate::publish::publish_for_owner(v, self as *const _ as usize);
         let mut guard = self.value.lock().unwrap();
         if guard.is_none() {
             *guard = Some(v);
             self.cond.notify_all();
+            drop(guard);
+            self.ready.notify_all();
         }
     }
 
     /// Block until a value is available, then return it.
     pub fn deref_blocking(&self) -> Value {
-        let mut guard = self.value.lock().unwrap();
-        while guard.is_none() {
-            guard = self.cond.wait(guard).unwrap();
+        self.wait_value(None).unwrap()
+    }
+
+    pub fn wait_value(&self, timeout: Option<Duration>) -> Option<Value> {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let listener = self.ready.listen();
+            let value = self.value.lock().unwrap().clone();
+            if let Some(value) = value {
+                crate::publish::read_slot(self as *const _ as usize, 0);
+                return Some(value);
+            }
+            if !listener.wait(deadline.map(|d| d.saturating_duration_since(Instant::now()))) {
+                return self.value.lock().unwrap().clone();
+            }
         }
-        guard.as_ref().unwrap().clone()
     }
 
     /// True if already delivered.
     pub fn is_realized(&self) -> bool {
         self.value.lock().unwrap().is_some()
+    }
+}
+
+impl Drop for CljxPromise {
+    fn drop(&mut self) {
+        crate::publish::clear_slots(self as *const _ as usize);
     }
 }
 
@@ -1221,6 +1962,9 @@ impl std::fmt::Debug for CljxPromise {
 }
 
 impl cljrs_gc::Trace for CljxPromise {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let value = self.value.lock().unwrap();
@@ -1244,6 +1988,11 @@ pub enum FutureState {
     /// The future exhausted the evaluation budget. Kept distinct from a
     /// thrown value so user-level catch clauses cannot intercept it.
     GasExhausted,
+    /// The producer was interrupted by fiber cancellation (uncatchable).
+    Interrupted,
+    /// The future's body failed with a managed-memory limit fault (strict
+    /// governor mode). Kept distinct for the same reason as `GasExhausted`.
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     Cancelled,
 }
 
@@ -1252,8 +2001,10 @@ pub const FUTURE_CANCELLED_MSG: &str = "future was cancelled";
 
 /// A future value computed asynchronously on another thread.
 pub struct CljxFuture {
+    pub ready: Event,
     pub state: Mutex<FutureState>,
     pub cond: Condvar,
+    executor_thread: Option<std::thread::ThreadId>,
     /// Set once a consumer has read the settled result (via `await`/`deref`).
     /// Used to warn about a `Failed` future that is discarded without anyone
     /// ever observing its error (the fire-and-forget footgun).
@@ -1265,8 +2016,70 @@ impl CljxFuture {
         Self {
             state: Mutex::new(FutureState::Running),
             cond: Condvar::new(),
+            ready: Event::default(),
+            executor_thread: None,
             observed: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// A future whose producer needs this thread's local executor.
+    pub fn new_local() -> Self {
+        let mut future = Self::new();
+        future.executor_thread = Some(std::thread::current().id());
+        future
+    }
+
+    /// Wait for settlement, parking only when running on a fiber.
+    pub fn wait_value(&self, timeout: Option<Duration>) -> crate::ValueResult<Option<Value>> {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let listener = self.ready.listen();
+            if let Some(result) = self.settled_value() {
+                return result.map(Some);
+            }
+            if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                return self.settled_value().transpose();
+            }
+            if crate::parking::current().is_none()
+                && self.executor_thread == Some(std::thread::current().id())
+            {
+                return Err(crate::ValueError::Other(
+                    "cannot wait for an isolate future outside a fiber; use await in async code or fiber::run_root for synchronous evaluation".into(),
+                ));
+            }
+            if !listener.wait(deadline.map(|d| d.saturating_duration_since(Instant::now()))) {
+                return self.settled_value().transpose();
+            }
+        }
+    }
+
+    pub fn settled_value(&self) -> Option<crate::ValueResult<Value>> {
+        use crate::ValueError;
+        let state = self.state.lock().unwrap();
+        let value = match &*state {
+            FutureState::Running => return None,
+            FutureState::Done(v) => Ok(v.clone()),
+            FutureState::Failed(v) => Err(crate::ValueError::Thrown(v.clone())),
+            FutureState::GasExhausted => Err(crate::ValueError::GasExhausted),
+            FutureState::MemoryLimitExceeded(f) => Err(crate::ValueError::MemoryLimitExceeded(*f)),
+            // A producer interrupted by fiber cancellation reaches awaiters as
+            // the same catchable error as `future-cancel`. A cancelled
+            // awaiter stops at its own park; healthy ones can handle it.
+            FutureState::Cancelled | FutureState::Interrupted => {
+                drop(state);
+                return Some(Err(crate::ValueError::Thrown(Self::cancelled_error())));
+            }
+        };
+        self.mark_observed();
+        drop(state);
+        #[cfg(feature = "no-gc")]
+        match &value {
+            Ok(value) | Err(crate::ValueError::Thrown(value)) => {
+                cljrs_gc::region::RegionLease::for_value(value).protect_read()
+            }
+            _ => {}
+        }
+        Some(value)
     }
 
     /// True if done, failed, or cancelled (not still running).
@@ -1288,6 +2101,8 @@ impl CljxFuture {
         if matches!(&*state, FutureState::Running) {
             *state = FutureState::Cancelled;
             self.cond.notify_all();
+            drop(state);
+            self.ready.notify_all();
             true
         } else {
             false
@@ -1332,14 +2147,41 @@ impl Drop for CljxFuture {
         // (still-valid) allocation.
         if !self.observed.load(std::sync::atomic::Ordering::Relaxed)
             && let Ok(state) = self.state.lock()
-            && matches!(&*state, FutureState::Failed(_))
         {
-            eprintln!(
-                "[clojurust warning] a failed future was discarded without its error \
-                 being observed (no await/deref); the thrown exception was lost"
-            );
+            match &*state {
+                FutureState::Failed(_)
+                | FutureState::GasExhausted
+                | FutureState::MemoryLimitExceeded(_) => eprintln!(
+                    "[clojurust warning] a failed future was discarded without its error \
+                     being observed (no await/deref); the failure was lost"
+                ),
+                // Interruption is deliberate, like `future-cancel`: silent
+                // unless CLJRS_WARN_INTERRUPTED_FUTURES opts in.
+                FutureState::Interrupted if warn_interrupted_futures() => eprintln!(
+                    "[clojurust warning] an interrupted future was discarded without \
+                     being observed (no await/deref)"
+                ),
+                _ => {}
+            }
         }
+        crate::publish::clear_slots(self as *const _ as usize);
     }
+}
+
+/// Whether discarding an unread `Interrupted` future warns, like a failed
+/// one. Off by default; `CLJRS_WARN_INTERRUPTED_FUTURES=1` (or `true`/`yes`)
+/// enables it. Read once per process: `CljxFuture::drop` can run during a GC
+/// sweep.
+fn warn_interrupted_futures() -> bool {
+    static WARN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WARN.get_or_init(|| {
+        std::env::var("CLJRS_WARN_INTERRUPTED_FUTURES").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+    })
 }
 
 impl Default for CljxFuture {
@@ -1355,6 +2197,9 @@ impl std::fmt::Debug for CljxFuture {
 }
 
 impl cljrs_gc::Trace for CljxFuture {
+    #[cfg(feature = "no-gc")]
+    fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+    #[cfg(not(feature = "no-gc"))]
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         {
             let state = self.state.lock().unwrap();
@@ -1375,7 +2220,7 @@ pub struct Agent {
     pub state: Arc<Mutex<Value>>,
     /// Last error.
     pub error: Arc<Mutex<Option<Value>>>,
-    pub watches: Mutex<Vec<(Value, Value)>>,
+    pub watches: TrackedMutex<Vec<(Value, Value)>>,
 }
 
 impl Agent {
@@ -1426,6 +2271,18 @@ impl cljrs_gc::Trace for Agent {
 mod var_tests {
     use super::*;
     use crate::shared::SharedValue;
+
+    #[test]
+    fn native_captures_share_one_immutable_allocation() {
+        let native = NativeFn::with_captures(
+            "capture",
+            Arity::Fixed(0),
+            vec![Value::Long(7)],
+            |captures, _| Ok(captures[0].clone()),
+        );
+        assert_eq!(Arc::strong_count(&native.captures), 2);
+        assert_eq!((native.func)(&[]).unwrap(), Value::Long(7));
+    }
 
     #[test]
     fn bind_promotable_mirrors_shared_root() {

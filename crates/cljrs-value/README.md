@@ -20,19 +20,21 @@ plus all persistent (immutable, structurally shared) collection types.  The
 ```
 src/
   lib.rs                         — module declarations and re-exports
-  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
-  error.rs                       — ValueError enum, ValueResult<T> alias
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
+  error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)` and `Cancelled`, uncatchable like `GasExhausted`), ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
   jit_hooks.rs                   — (Phases 10.2/10.5) var-rebind hooks fired by Var::bind; set_var_rebind_hook registers multiple consumers (the compiler JIT stales superseded native code; cljrs-runtime invalidates cross-defn-specialized lowerings)
   keyword.rs                     — Keyword { namespace, name }
-  publish.rs                     — (Phase 10.5, GC builds; identity stub under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
-  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedValue>>), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
+  parking.rs                     — optional executor hooks, notification events, borrowed future parking, and Send-only blocking work
+  publish.rs                     — (Phase 10.5, GC builds; scope ownership under no-gc) heap-promotion publish barrier: publish_value(Value) -> Value scans for region-allocated boxes, deep-copies them to the GC heap (via clone.rs), or poisons the active regions when the value is opaque to the scan. Called by Var::bind, Atom::new/reset, Volatile::new/reset, CljxPromise::deliver, and cljrs-async channel puts
+  shared.rs                      — (Phase B3) SharedValue enum, SharedAtom (Arc<ArcSwap<SharedSlot>>), ByteBlob and SharedSlot (each owns one governor MemoryCharge), promote/demote; PromoteError. Var roots reuse SharedValue via Var::shared_root (issue #171)
+  realization.rs                 — fallible boundaries for equality, hashing, and formatting through Rust traits
   regex.rs                       — Pattern (engine-agnostic compiled regex behind Value::Pattern, selected by the regex-full / small-regex features), PatternError, Captures, Matcher (stateful re-find/re-matches driver), MatchPhase, MatchResult
   symbol.rs                      — Symbol { namespace, name }
   type_hint.rs                   — TypeHint enum (^long/^double/^longs/… primitive type tags) + from_tag/is_array/element
   native_object.rs               — NativeObject trait, NativeObjectBox wrapper, gc_native_object helper (Phase 9 interop)
-  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent
+  types.rs                       — Var, Atom, Namespace, NativeFn, CljxFn, Thunk, LazySeq, CljxCons, Protocol, ProtocolFn, ProtocolMethod, MultiFn, Volatile, Delay, CljxPromise, CljxFuture, Agent. The runtime-lock fields of Protocol, MultiFn, Var, Atom, Namespace, LazySeq, Volatile, Delay and Agent watches are `cljrs_gc::mutator::TrackedMutex` (debug builds count held guards so a fiber park can assert none is held — virtual threads Phase 0)
   value.rs                       — Value enum (incl. SharedAtom, ByteBlob variants), MapValue, SetValue, TypeInstance, pr_str, PartialEq, ClojureHash, std::hash::Hash
   collections/
     mod.rs                       — re-exports all collection types
@@ -41,6 +43,7 @@ src/
     hash_set.rs                  — PersistentHashSet (same index+ordering-log technique as PersistentHashMap)
     list.rs                      — PersistentList (singly-linked cons list)
     queue.rs                     — PersistentQueue (front-list + rear-vector)
+    share_charge.rs              — (crate-private) ShareCharge: per-version gc_size_extra charge for structurally shared collections (full size, or path-copied nodes when derived from a GC-allocated version); vector/HAMT/red-black path-size estimates
     vector.rs                    — PersistentVector (32-way trie + tail buffer)
     hamt/
       mod.rs                     — re-exports Node and bitmap helpers
@@ -86,7 +89,7 @@ pub enum Value {
     Var(GcPtr<Var>),
     Atom(GcPtr<Atom>),
     SharedAtom(Arc<SharedAtom>),       // cross-isolate mutable ref (Phase B3)
-    ByteBlob(Arc<[u8]>),               // refcounted immutable byte buffer (Phase B3)
+    ByteBlob(Arc<ByteBlob>),           // refcounted immutable byte buffer (Phase B3)
     Namespace(GcPtr<Namespace>),
     NativeFn(GcPtr<NativeFn>),
     CljxFn(GcPtr<CljxFn>),
@@ -242,20 +245,56 @@ pub enum SharedValue {
     Str(Arc<str>),
     Keyword(StaticGcPtr<Keyword>),
     Symbol(StaticGcPtr<Symbol>),
-    ByteBlob(Arc<[u8]>),              // BEAM off-heap-binary trick
+    ByteBlob(Arc<ByteBlob>),          // BEAM off-heap-binary trick
 }
 
+/// Immutable shared byte buffer.  Owns one governor charge
+/// (`MemoryClass::SharedValue`) for its bytes, however many `Arc`s exist.
+pub struct ByteBlob { /* Box<[u8]>, Option<MemoryCharge> */ }
+impl ByteBlob {
+    pub fn new(bytes: impl Into<Box<[u8]>>) -> Self   // strict refusal raises a runtime fault
+    pub fn try_new(bytes: impl Into<Box<[u8]>>) -> Result<Self, MemoryLimitExceeded>
+    pub fn try_with(len: usize, fill: impl FnOnce() -> Box<[u8]>)
+        -> Result<Self, MemoryLimitExceeded>          // reserves before building the buffer
+    pub fn as_bytes(&self) -> &[u8]
+    pub fn charged_bytes(&self) -> usize
+}
+impl Deref<Target = [u8]> + AsRef<[u8]> + From<Vec<u8>> + From<&[u8]> for ByteBlob
+
+/// One value stored in a `SharedAtom`; owns the governor charge for its
+/// `Arc` allocation and string payload.
+pub struct SharedSlot { /* SharedValue, Option<MemoryCharge> */ }
+impl SharedSlot {
+    pub fn new(value: SharedValue) -> Self              // strict refusal raises a runtime fault
+    pub fn try_new(value: SharedValue) -> Result<Self, MemoryLimitExceeded>
+    pub fn value(&self) -> &SharedValue
+    pub fn charged_bytes(&self) -> usize
+}
+impl Deref<Target = SharedValue> + AsRef<SharedValue> for SharedSlot
+
 pub struct SharedAtom {
-    pub cell: Arc<ArcSwap<SharedValue>>,
+    pub cell: Arc<ArcSwap<SharedSlot>>,
     pub meta: Mutex<Option<SharedValue>>,
 }
 
 impl SharedAtom {
     pub fn new(val: SharedValue) -> Self
-    pub fn deref_val(&self) -> Arc<SharedValue>     // atomic load
-    pub fn reset(&self, val: SharedValue) -> Arc<SharedValue>
-    pub fn swap<F>(&self, f: F) -> Arc<SharedValue> // CAS-retry (closure form)
-    pub fn compare_and_set(&self, current: &Arc<SharedValue>, new: SharedValue) -> bool
+    pub fn try_new(val: SharedValue) -> Result<Self, MemoryLimitExceeded>
+    pub fn deref_val(&self) -> Arc<SharedSlot>      // atomic load
+    pub fn reset(&self, val: SharedValue) -> Arc<SharedSlot>
+    pub fn try_reset(&self, val: SharedValue) -> Result<Arc<SharedSlot>, MemoryLimitExceeded>
+    pub fn swap<F>(&self, f: F) -> Arc<SharedSlot>  // CAS-retry (closure form)
+    pub fn compare_and_set(&self, current: &Arc<SharedSlot>, new: SharedValue) -> bool
+    pub fn try_compare_and_set(&self, current: &Arc<SharedSlot>, new: SharedValue)
+        -> Result<bool, MemoryLimitExceeded>
+}
+
+/// `memory` is set when the governor refused the shared allocation.
+pub struct PromoteError { pub type_name: &'static str, pub memory: Option<MemoryLimitExceeded> }
+impl PromoteError {
+    pub fn not_promotable(type_name: &'static str) -> Self
+    pub fn memory_limit(type_name: &'static str, error: MemoryLimitExceeded) -> Self
+    pub fn into_value_error(self) -> ValueError   // MemoryLimitExceeded or Other(message)
 }
 
 pub fn promote(value: &Value)   -> Result<SharedValue, PromoteError>;
@@ -267,7 +306,10 @@ closures, resources, atoms, …).  `demote` converts back into a fresh
 isolate-local `Value`.  `compare_and_set` is the single lock-free CAS that
 backs the Clojure-level `compare-and-set!` and the `swap!` retry loop (callers
 that must run interpreter code between load and store use it instead of the
-closure-based `swap`).
+closure-based `swap`).  The `try_*` forms reserve the new slot before they
+publish it, so a strict-mode refusal leaves the atom's value unchanged; the
+runtime's `shared-atom`, `reset!`, `swap!`, and `compare-and-set!` use them.
+Promoting a byte array reserves its blob before copying the bytes.
 
 #### Var roots — two-tier, promote-on-`def` (issue #171)
 
@@ -276,7 +318,7 @@ A var's *root* binding uses the **same** cross-isolate mechanism as
 
 ```rust
 pub struct Var {
-    pub value: Mutex<Option<Value>>,                          // isolate-local fast path
+    pub value: TrackedMutex<Option<Value>>,                   // isolate-local fast path
     pub shared_root: Arc<ArcSwap<Option<SharedValue>>>,       // cross-isolate mirror (B3)
     binding_generation: AtomicU64,                            // local root revision
     // …namespace, name, is_macro, meta, watches
@@ -412,7 +454,27 @@ impl TransientSet {
 All three implement `Default`, `Clone`, `ClojureHash`, and `Trace`.
 
 All collection Trace impls also override `gc_size_extra` to report the heap
-bytes owned by each collection beyond the GcBox struct.  Approximations used:
+bytes owned by each collection beyond the GcBox struct.  The table gives the
+**full** charge.  `PersistentVector`, `PersistentHashMap`, `PersistentHashSet`,
+`SortedMap`, and `SortedSet` instead charge only their path-copied nodes —
+O(log n), see `vector_path_bytes`, `hamt_path_bytes`, and `rb_path_bytes` in
+`share_charge.rs` — when the version was derived by one update (`conj`,
+`assoc`, `assoc_nth`, `dissoc`, `disj`, `pop`, or a no-op of these) from a
+version already allocated behind a `GcPtr`, because that parent's box already
+accounts for the shared nodes.  They charge the full amount when:
+
+- built wholesale (`empty`, `from_iter`, `from_pairs`, `from_vector`,
+  `map_entry`, an in-place `conj_mut`) or cloned;
+- derived from a version that was never GC-allocated (a Rust-side builder
+  loop), since the result then owns every node;
+- the count reaches twice that of the nearest fully charged ancestor, so a
+  chain of `n` updates charges O(n) element bytes in total plus O(log n) per
+  step, and a collection cannot grow past twice the size last admitted in
+  full.
+
+When a fully charged ancestor is collected, a surviving derived version is
+under-counted by less than twice that ancestor's full charge.  Each box still
+returns exactly its own stored header size when swept.  Approximations used:
 
 | Type | Formula |
 |------|---------|
@@ -421,7 +483,8 @@ bytes owned by each collection beyond the GcBox struct.  Approximations used:
 | `PersistentHashSet` | `n × (88 + size_of::<Value>())` |
 | `PersistentVector` | `n × (24 + size_of::<Value>())` |
 | `SortedMap` | `n × (40 + 2×size_of::<Value>())` |
-| `TransientMap/Set` | same as HashMap/Set (locked at alloc) |
+| `SortedSet` | `n × (40 + size_of::<Value>())` |
+| `TransientMap/Set` | full HashMap/Set charge of the inner map (locked at alloc) |
 | `TransientVector` | same as Vector (locked at alloc) |
 | `ObjectArray` | `capacity × size_of::<Value>()` |
 | Primitive arrays | `capacity × size_of::<T>()` |
@@ -436,11 +499,11 @@ thin pointer in the leaf-node Vec.
 ### `CljxFn` / `CljxFnArity` (Phase 4)
 
 ```rust
-// Requires cljrs-reader (for Vec<Form> body).
+// Requires cljrs-reader (for the Form body).
 pub struct CljxFnArity {
     pub params: Vec<Arc<str>>,        // positional param names
     pub rest_param: Option<Arc<str>>, // name after & (if any)
-    pub body: Vec<Form>,              // forms in this arity's body
+    pub body: Arc<[Form]>,            // forms in this arity's body (shared by clones)
     pub param_hints: Vec<Option<TypeHint>>, // primitive type hint per param (^long, …)
     pub rest_hint: Option<TypeHint>,         // hint on the rest param (rarely used)
     // (also: destructure_params, destructure_rest, ir_arity_id)
@@ -498,22 +561,23 @@ pub fn publish_value(v: Value) -> Value;
 The runtime safety net for bump regions coexisting with the tracing GC:
 correctness never depends on escape analysis being perfect.  Invoked by
 `Var::bind`, `Atom::new`/`Atom::reset`, `Volatile::new`/`Volatile::reset`,
-`CljxPromise::deliver`, and `cljrs-async`'s channel puts.  Under `no-gc` the
-module is an identity stub (that build keeps its `StaticCtxGuard` discipline).
+`CljxPromise::deliver`, and `cljrs-async`'s channel puts.
+Under `no-gc`, regional destinations transfer backing scopes.
+Replaceable cells, Var roots, and channel entries use cached leases. Publication preserves object identity.
 
 ### `Namespace` (Phase 4)
 
 ```rust
 pub struct Namespace {
     pub name: Arc<str>,
-    pub interns: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,        // own vars
-    pub refers: Mutex<HashMap<Arc<str>, GcPtr<Var>>>,         // imported names
-    pub aliases: Mutex<HashMap<Arc<str>, Arc<str>>>,          // ns alias → ns name
-    pub source_file: Mutex<Option<Arc<str>>>,                 // path the ns was loaded from
-    pub git_repo_root: Mutex<Option<Arc<str>>>,               // repo root of source_file, if any
+    pub interns: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>, // own vars
+    pub refers: TrackedMutex<HashMap<Arc<str>, GcPtr<Var>>>,  // imported names
+    pub aliases: TrackedMutex<HashMap<Arc<str>, Arc<str>>>,   // ns alias → ns name
+    pub source_file: TrackedMutex<Option<Arc<str>>>,          // path the ns was loaded from
+    pub git_repo_root: TrackedMutex<Option<Arc<str>>>,        // repo root of source_file, if any
     pub is_versioned: bool,                                   // true for `name@commit` namespaces
-    pub meta: Mutex<Option<Value>>,                           // from `(ns ^{...} name ...)` / attr-map
-    pub refer_clojure_filter: Mutex<Option<ReferClojureFilter>>, // from `(:refer-clojure ...)`
+    pub meta: TrackedMutex<Option<Value>>,                    // from `(ns ^{...} name ...)` / attr-map
+    pub refer_clojure_filter: TrackedMutex<Option<ReferClojureFilter>>, // from `(:refer-clojure ...)`
 }
 
 impl Namespace {
@@ -555,27 +619,95 @@ one local name, happens once in `GlobalEnv::set_refer_clojure_filter`.
 ### `Thunk` / `LazySeq` / `CljxCons` (Phase 5)
 
 ```rust
-pub trait Thunk: Send + Sync + std::fmt::Debug {
-    fn force(&self) -> Value;
+pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
+    fn force(&self) -> ValueResult<Value>;
 }
 
-pub struct LazySeq {
-    pub state: Mutex<LazySeqState>,  // Pending(Box<dyn Thunk>) | Forced(Value)
+pub struct Realizer { /* isolate thread and optional fiber id */ }
+impl Realizer {
+    pub fn current() -> Self;
+    pub fn ensure_can_wait(self) -> Result<(), String>;
 }
+
+pub enum LazySeqState {
+    Pending(Rc<dyn Thunk>),
+    Realizing { owner: Realizer, thunk: Rc<dyn Thunk> },
+    Forced(Value),
+    Error(String),
+}
+pub struct LazySeq { pub state: TrackedMutex<LazySeqState> }
 impl LazySeq {
-    pub fn new(thunk: Box<dyn Thunk>) -> Self
-    pub fn realize(&self) -> Value   // forces once, caches result
+    pub fn new(thunk: Box<dyn Thunk>) -> Self;
+    pub fn try_realize(&self) -> ValueResult<Value>;
+    pub fn realize(&self) -> Value;
+    pub fn error(&self) -> Option<String>;
 }
+pub struct CljxCons { pub head: Value, pub tail: Value }
+```
 
-pub struct CljxCons {
-    pub head: Value,
-    pub tail: Value,   // may be LazySeq, Cons, List, or Nil
+`Thunk` implementations live in `cljrs-runtime`, so this crate needs no evaluator dependency.
+The realization state retains the traced thunk while user code runs without the cell lock.
+Other fibers wait for the result. Cancellation or a panic restores `Pending` and wakes waiters so another reader can retry.
+A thunk reports cancellation as `ValueError::Cancelled`, which is returned typed and never
+cached; returning an error (rather than unwinding) keeps a caller's locks unpoisoned.
+Any other thunk error is cached as its message and returned as `ValueError::Other`, so a
+real exception raised during cancellation cleanup is still an ordinary, catchable error.
+
+`Realizer` identifies both monitor owners and realization owners.
+`ensure_can_wait` rejects a carrier wait on a fiber that needs the same thread to resume.
+`try_realize` returns this error without changing the cell. Runtime sequence operations use this fallible entry point.
+The legacy `realize` helper returns nil for cached thunk errors, panics on an unsafe carrier
+wait, and continues a cancellation as the private parking unwind.
+Its infallible trait callers cannot return a transient wait error.
+
+### `parking` (virtual threads Phase 2)
+
+```rust
+pub type BlockingResult = Box<dyn Any + Send>;
+pub type BlockingJob = Box<dyn FnOnce() -> BlockingResult + Send>;
+pub struct Hooks {
+    pub current: fn() -> Option<u64>,
+    pub cancelled: fn() -> bool,
+    pub park: fn(Pin<&mut dyn Future<Output = ()>>, Option<Duration>) -> bool,
+    pub sleep: fn(Duration),
+    pub blocking: fn(BlockingJob) -> BlockingResult,
+}
+pub fn install(hooks: Hooks);
+pub fn current() -> Option<u64>;
+pub fn cancelled() -> bool; // the running fiber is being cancelled
+pub fn park<F: Future>(future: F) -> F::Output;
+pub fn block_on<F: Future>(future: F) -> F::Output;
+pub fn sleep(duration: Duration);
+pub fn blocking<F, T>(job: F) -> T
+where F: FnOnce() -> T + Send + 'static, T: Send + 'static;
+pub fn resume_cancelled() -> !; // unwind a cancelled fiber with a private payload
+pub fn catch_cancelled<T>(operation: impl FnOnce() -> T) -> ValueResult<T>;
+
+pub struct Event { /* Default + Debug */ }
+impl Event {
+    pub fn listen(&self) -> Listener<'_>;
+    pub fn notify_all(&self);
+}
+pub struct Listener<'a> { /* Future<Output = ()> + Drop */ }
+impl Listener<'_> {
+    pub fn wait(self, timeout: Option<Duration>) -> bool;
 }
 ```
 
-`Thunk` implementations live in `cljrs-runtime` (e.g. `ClosureThunk`) so that
-`cljrs-value` stays free of evaluator dependencies while `LazySeq` can still
-call back through the trait object.
+`Event` keeps registered wakers in a map keyed by listener id, so registering, updating and dropping a listener are O(1) however many fibers wait on it; `notify_all` wakes every current listener.
+Native fibers install the executor hooks once. This crate does not depend on Tokio.
+`park` accepts borrowed futures inside a fiber. `block_on` also supports notification futures outside a fiber with an OS-thread wait.
+`sleep` and `blocking` keep their direct behavior outside fibers.
+Managed values require precise roots across a park and cannot cross worker threads.
+A park in a cancelled fiber unwinds with `resume_cancelled`. `catch_cancelled` turns
+only that payload into `ValueError::Cancelled` and rethrows every other panic.
+`NativeFn` wrappers and C-ABI bridges use it so cancellation never unwinds through
+foreign frames.
+
+A listener registers before its caller checks the protected condition.
+`notify_all` wakes every listener, and listener destruction removes its waker.
+`wait` returns false on timeout. It parks a fiber or waits on a Condvar outside fibers.
+Owner-aware callers use `Realizer::ensure_can_wait` before a potentially unsafe carrier wait.
 
 ### `TypeInstance` (Phase 6-ext — defrecord/deftype/reify)
 
@@ -605,21 +737,52 @@ itself is runtime state that does not cross a clone boundary.
 ### `Volatile` / `Delay` / `CljxPromise` / `CljxFuture` / `Agent` (Phase 7)
 
 ```rust
-pub struct Volatile { pub value: Mutex<Value> }
+pub struct Volatile { pub value: TrackedMutex<Value>, /* private ownership state */ }
+impl Volatile {
+    pub fn new(value: Value) -> Self;
+    pub fn deref(&self) -> Value;
+    pub fn reset(&self, value: Value) -> Value;
+}
 
-pub struct Delay { pub state: Mutex<DelayState> }  // Pending(Box<dyn Thunk>) | Forced(Value)
+pub enum DelayState {
+    Pending(Rc<dyn Thunk>),
+    Realizing { owner: Realizer, thunk: Rc<dyn Thunk> },
+    Forced(Value),
+    Error(String),
+}
+pub struct Delay { pub state: TrackedMutex<DelayState> }
+impl Delay {
+    pub fn new(thunk: Box<dyn Thunk>) -> Self;
+    pub fn force(&self) -> ValueResult<Value>;
+    pub fn is_realized(&self) -> bool;
+}
 
 pub struct CljxPromise {
+    pub ready: parking::Event,
     pub value: Mutex<Option<Value>>,
     pub cond: Condvar,
 }
 
 pub struct CljxFuture {
-    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Cancelled
+    pub ready: parking::Event,
+    pub state: Mutex<FutureState>,  // Running | Done(Value) | Failed(Value) | GasExhausted | Interrupted | ...
+    // Drop warns about an unobserved Failed/GasExhausted/MemoryLimitExceeded state, and
+    // about Interrupted only when CLJRS_WARN_INTERRUPTED_FUTURES=1 (or true/yes).
+                                    // | MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded) | Cancelled
     pub cond: Condvar,
 }
 
+impl CljxPromise {
+    pub fn new() -> Self;
+    pub fn deliver(&self, value: Value);
+    pub fn deref_blocking(&self) -> Value;
+    pub fn wait_value(&self, timeout: Option<Duration>) -> Option<Value>;
+    pub fn is_realized(&self) -> bool;
+}
 impl CljxFuture {
+    pub fn new() -> Self;
+    pub fn wait_value(&self, timeout: Option<Duration>) -> ValueResult<Option<Value>>;
+    pub fn settled_value(&self) -> Option<ValueResult<Value>>;
     pub fn is_done(&self) -> bool;
     pub fn is_cancelled(&self) -> bool;
     /// Running -> Cancelled, waking waiters; false if it had already settled.
@@ -639,6 +802,11 @@ pub struct Agent {
 }
 pub type AgentFn = Box<dyn FnOnce(Value) -> Result<Value, String> + Send>;
 ```
+
+Delay realization uses the same owner checks and cancellation retry behavior as lazy sequences.
+Promise and future waits use `ready` notifications inside fibers and Condvar waits outside fibers.
+A timeout returns `None`. Settled future errors remain distinct from a timeout.
+`settled_value` reads a result without waiting. Settlement and cancellation wake both notification and Condvar consumers.
 
 ### `Protocol` / `ProtocolFn` / `MultiFn` (Phase 6)
 
@@ -736,13 +904,29 @@ impl SerializedValue {
     /// receiver. Telemetry approximation for the metered boundary seam
     /// (`docs/isolate-boundary-plan.md`); Arc-shared payloads count as zero.
     pub fn byte_size(&self) -> usize;
+    /// Bytes the serialized message owns while queued (root node plus owned
+    /// buffers); the isolate channel's governor charge.  Arc-shared payloads
+    /// (SharedAtom, ByteBlob, a var's root cell) count as zero.
+    pub fn wire_size(&self) -> usize;
 }
 
 /// Reason a value cannot cross an isolate boundary.
 pub enum CloneError {
     NotShareable { type_name: &'static str },
     Disconnected,
+    /// Realizing a lazy seq was interrupted by fiber cancellation, or ran out
+    /// of gas; callers surface these as the uncatchable `ValueError` kinds.
+    Cancelled,
+    GasExhausted,
+    /// A byte-bounded isolate channel has no room for the message.
+    Full { bytes: usize, queued: usize, limit: usize },
+    /// The strict process governor refused the message's queue charge.
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
+
+/// The uncatchable `ValueError` for a resource-limit CloneError (cancellation,
+/// gas, memory); `None` for ordinary boundary errors.
+pub fn resource_value_error(error: &CloneError) -> Option<ValueError>;
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
 /// closures, native resources, and other non-shareable types.
@@ -826,3 +1010,178 @@ re-exports `deps` for that reason.
 The one crate where the swap cannot pay is the CLI: `cljrs` depends on
 `cljrs-project` with `vcs`/`vcs-net`/`ssh` unconditionally, so `pgp` — and with it
 `regex` — is always in that binary.
+
+## Realization errors in Rust traits
+
+`realization::catch<T>(operation: impl FnOnce() -> T) -> Result<T, String>`
+reports lazy realization errors from equality, hashing, and formatting.
+These traits stop immediately on an error through a private unwind payload.
+The boundary catches only that payload. Ordinary panics and fiber cancellation continue unwinding.
+`NativeFn::new` and `NativeFn::with_closure` convert these errors to `ValueError::Other`.
+The evaluator and compiler ABI also install realization boundaries.
+Rust embedders can use `realization::catch(|| format!("{value}"))` for fallible printing.
+
+`realization::check_stack()` fails through the same payload when the running fiber is within
+`cljrs_gc::fiber::NATIVE_STACK_MARGIN` of its guard page. `Value`'s `PartialEq`, `ClojureHash`,
+`Ord`, and `pr_str` call it on entry, so printing, comparing, or hashing deeply nested data on a
+fiber throws a catchable "stack overflow in native code" error instead of hitting the guard page.
+It is a no-op off a fiber.
+
+`realization::is_inert(&Value) -> bool` identifies scalar values whose equality, hash, and display cannot run user code.
+Transient maps and sets use in-place updates and direct lookups while all keys meet this condition.
+Other operations compute from traced snapshots outside their locks.
+An update retries if another computation changes the collection during realization.
+A failed realization does not change or poison a transient collection.
+
+Snapshots use stable host storage and the per-mutator `SNAPSHOT_ROOTS` shadow stack.
+They create no managed boxes. `collections::trace_snapshots(&mut MarkVisitor)` traces the active snapshots for runtime collectors.
+Detached mutator states trace snapshots in suspended fibers.
+Object-array hashing copies its vector once. Transient-vector hashing shares the existing persistent vector storage.
+
+## Native blocking adapters
+
+`NativeFn` has an optional `blocking_func: Option<NativeFnFunc>` field.
+`NativeFn::new` and `NativeFn::with_closure` leave this field empty.
+Compiled Clojure closures also leave it empty.
+
+`NativeFn::with_blocking(name, arity, func, blocking_func) -> NativeFn`
+registers separate ordinary and blocking adapters.
+Both adapters take `&[Value]` and return `ValueResult<Value>` on the isolate.
+The blocking adapter must convert inputs before it offloads owned Rust work.
+It must convert results after the worker returns.
+
+`NativeFn::call_blocking(&self, args: &[Value]) -> ValueResult<Value>`
+checks arity and rejects a missing adapter before execution.
+Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
+Ordinary `func` calls retain their original behavior.
+
+In `no-gc` builds, `publish::publish_value` retains backing scopes at explicit program-lifetime boundaries.
+All values preserve identity and laziness; publication does not serialize them.
+`publish::publish_return(value)` transfers results into the caller or its active `ReadScope`.
+The evaluator publishes only its final escaping result after that read scope ends.
+Recur values use a replaceable trampoline lease.
+
+`publish::prepare_for_owner(value, &AllocationOwner) -> (Value, ValueLease)` prepares replaceable payloads for cells and channels.
+Ordinary replaceable stores keep their collection wrappers and structural sharing.
+Definition relocation preserves logical identity and shared aliases.
+Small strings, UUIDs, BigInts, and ratios can move into compact arenas while keeping their logical identity.
+Other live payloads retain their source arenas, including other allocations in those arenas.
+Replacing or consuming the payload releases that ownership after its last reader finishes.
+Permanent destinations own their current payload lease. Regional destinations use counted, replaceable ownership edges and cache weak snapshots.
+Ownership tracing records mutable container scopes without snapshotting their current contents.
+Namespace bindings, protocol implementations, and channel entries retain their contents through their own destination ownership.
+`ValueLease` implements `Default` and `Debug`.
+Its `snapshot() -> RegionLease` method acquires temporary ownership without another value traversal.
+Its `protect_current()` method transfers that cached ownership into the caller.
+
+Atoms, volatiles, and Var roots use this shared preparation path, including initial values and replacements.
+Atom metadata, validators, and watch callbacks have independent replaceable leases. Var metadata and watches do too.
+Use `add_watch` and `remove_watch` to maintain ownership; direct mutation of the public watch vector bypasses these barriers.
+Reads reuse cached leases. Their cost depends on the number of backing scopes, without traversal of collection elements.
+Returned updates acquire caller ownership before the cell can replace its payload.
+`Atom::snapshot()` and `Volatile::snapshot()` return `publish::ValueSnapshot` for callbacks and watches.
+This snapshot exposes `value: Value` and keeps its no-GC backing scopes alive until drop.
+Its `protect_current()` method transfers ownership to the caller. Native GC callers still require normal value roots across collections.
+
+`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` rejects an unequal initial snapshot before publication.
+The public `value` field remains available for compatibility. Direct writes bypass ownership preparation.
+Use `reset`, `compare_and_set`, or `Var::bind` for writes.
+Scalar vectors maintain a summary so ownership tracing skips their elements.
+Unobserved future failures warn on drop, including resource failures. Internal thread delivery futures count as observed.
+Bounded invocations retain their original allocation rules.
+
+`NativeFn::captures: Arc<[Value]>` records managed values retained by a Rust callable.
+`NativeFn::diagnostic_id: cljrs_gc::fiber::NativeDiagnosticId` caches the function's
+watchdog name id; struct literals set it to `Default::default()`.
+The callable and tracer share one immutable allocation. Compiled and IR adapters use the same capture slice.
+For struct literals, convert an existing capture vector with `.into()`.
+
+`NativeFn::with_captures(name, arity, captures, func) -> NativeFn` declares managed
+captures at construction. The callback receives `(&[Value], &[Value])` for captures
+and call arguments. The callback shares the declared capture slice.
+Keep the public capture handle unchanged after construction. `with_closure` is for Rust callables without managed captures.
+The interop registration helpers require `Send + Sync` host closures, which cannot
+capture isolate-local Values. Transaction host wrappers capture serialized host APIs.
+
+`CljxFuture::new_local()` records the executor thread. A pending local future
+rejects synchronous carrier dereference with a catchable error. `CljxFuture::new()`
+retains blocking behavior for manual futures and producers on another thread.
+
+
+### Borrowed values and field ownership
+
+`Value::identical(&self, other: &Value) -> bool` implements Clojure identity for every execution tier.
+Immutable relocation preserves logical identity, including collection aliases. Mutable objects retain their original allocation.
+`UuidValue` also implements `Clone`.
+
+`Var::snapshot() -> Option<publish::ValueSnapshot>` owns a root snapshot under no-GC.
+Atom and volatile snapshots have the same ownership contract.
+Use snapshots for Rust code that needs values across replacement without a read scope.
+For borrowed `deref`, metadata, validator, and watch reads, keep a `region::ReadScope` alive while using the values.
+Unscoped no-GC host reads receive program-lifetime ownership. Use scopes or snapshots for bounded retention.
+Native GC callers must continue to register GC roots.
+
+`Atom::add_watch(key: Value, callback: Value)` and `Var::add_watch` retain callback ownership.
+Their `remove_watch(key: &Value)` methods release removed ownership.
+`Atom::protect_watches()` and `Var::protect_watches()` borrow the cached watch values for callback delivery.
+`ValueLease::for_values(values: &[Value], owner: &AllocationOwner) -> ValueLease` prepares a shared field policy.
+`ValueLease::protect_read()` borrows cached backing scopes into the caller's scope or allocation destination.
+
+`publish::publish_for_slot(value: Value, address: usize, slot: usize) -> Value` replaces one indexed field's lease.
+`publish_for_named_slot(value: Value, address: usize, slot: String) -> Value` supports named fields such as protocol methods.
+`publish_for_owner` uses indexed slot zero for a single-field container.
+`publish::read_slot(address: usize, slot: usize)` protects a cached field value for its reader.
+`publish::clear_slots(address: usize)` releases fields at object destruction.
+Native GC builds use the ordinary promotion barrier for these stores.
+
+Arrays, transients, lazy cells, delays, promises, and futures maintain independent no-GC field ownership.
+Initial managed allocation invokes `Trace::init_ownership`; ordinary ownership tracing skips these mutable contents.
+Collection snapshots own their backing leases during operations that can park or mutate the original collection.
+Native containers that store managed values must use the same publication and read barriers.
+
+
+`publish::read_named_slot(address: usize, slot: String)` borrows a named cached field.
+`MultiFn::method(key: &str) -> Option<Value>` borrows a registered implementation before returning it.
+Multimethod implementations cache ownership beside their method entries. Dispatch and preference values use independent named slots.
+Replacing or removing a method releases its lease after existing readers finish.
+
+### Definition and transient ownership
+
+No-GC definition stores compact small immutable data and metadata.
+Compaction stops at 128 values or 32 levels. Large strings and numeric leaves keep their existing storage.
+Already compact or static objects are reused. The compact arena is created only when a copy is needed.
+Larger collections retain structural sharing and acquire leases without a rebuild.
+The packer preserves logical identities and shared aliases. It does not force lazy values or clone mutable cells.
+Interpreted function, atom, lazy-cell, delay, and multimethod roots use separate small regions.
+Atoms establish their payload ownership after managed allocation.
+Opaque captures retain their actual backing regions.
+
+`Value::Reduced(Arc<Value>)` and `Value::WithMeta(Arc<Value>, Arc<Value>)` share wrapper identity across clones.
+`Value::identical` handles every boxed variant, including arrays, wrappers, transients, and errors.
+
+`TransientVector::from_persistent(vector: &PersistentVector) -> Self` shares the trie and its scalar summary.
+Managed transient conversion shares initial data and captures its ownership once, without initial per-element slots.
+Later publication and returns reuse that cached ownership without tracing the initial collection.
+Writes acquire slots lazily. Maps and sets reuse their insertion sequence IDs for those slots.
+Key hashing stays in the existing realization-safe mutation path.
+Managed `persistent!` borrows the containing region. Rust stack containers protect the returned graph instead.
+This fallback permits those results to outlive the temporary container.
+
+`Protocol::set_implementation(tag: Arc<str>, method: Arc<str>, value: Value)` installs an implementation and its ownership cache.
+`Protocol::protect_implementation(tag: &str, method: &str)` borrows the cache without formatting a key.
+`MultiFn::set_method(key: String, value: Value)` and `remove_method(key: &str) -> bool` maintain method ownership.
+Use these methods when modifying managed implementation tables.
+`MultiFn::method` reads its cache beside the method table.
+`ValueLease::publish_return()` transfers an update result explicitly.
+Repeated cached reads reuse the caller's lease set without allocating another snapshot.
+
+Definition packing has a fixed work and depth bound. Other replaceable stores preserve collection sharing.
+After an implementation-table update batch, use the existing protocol or multimethod generation invalidation API.
+
+Exception tracing includes data maps, causes, and managed thrown payloads.
+These fields can retain independent backing regions.
+
+Immutable collections and closures cache their backing ownership after the first publication walk.
+Repeated captures of a shared graph stop at its cached root.
+Var root reads acquire leases once per scope epoch and binding generation.
+Rebinding and scope changes invalidate the read cache.

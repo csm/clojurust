@@ -103,7 +103,7 @@ See [`TODO.md`](TODO.md) for the full itemised roadmap.
 | [`cljrs-value`](crates/cljrs-value) | `Value` enum; persistent collections (rpds-backed); Clojure-compatible hashing | complete |
 | [`cljrs-gc`](crates/cljrs-gc) | Non-moving mark-and-sweep GC; `GcPtr<T>` smart pointer; `Trace` trait; scratch regions | complete |
 | [`cljrs-runtime`](crates/cljrs-runtime) | The runtime: `env` (`GlobalEnv`, `Env`, dynamic bindings, namespace loader, GC roots), `builtins` (~300 native core functions, transients, regex, bitops), `interp` (tree-walking interpreter: eval, special forms, macros, destructuring), `tiered` (IR interpreter, IR cache, tiering/JIT state, background lower worker, `load_prebuilt_ir` bundle replay) | complete |
-| [`cljrs-tx`](crates/cljrs-tx) | Pure tree-walked transaction functions in a bounded, invocation-lifetime no-GC arena | initial |
+| [`cljrs-tx`](crates/cljrs-tx) | Pure tree-walked transaction functions in a bounded, invocation-lifetime no-GC arena. `no-gc` is currently experimental and may panic. | initial |
 | [`cljrs-ir`](crates/cljrs-ir) | IR types (ANF/SSA) with serialization (postcard); ANF lowering, escape analysis, OSR | complete |
 | [`cljrs-stdlib`](crates/cljrs-stdlib) | Embedded stdlib: clojure.string, clojure.set, clojure.test, clojure.walk, clojure.edn, clojure.zip, clojure.data | complete |
 

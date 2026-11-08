@@ -53,7 +53,7 @@ use num_bigint::BigInt;
 
 use crate::collections::{PersistentHashSet, PersistentVector, SortedMap, SortedSet};
 use crate::error::ValueError;
-use crate::shared::{SharedAtom, SharedValue};
+use crate::shared::{ByteBlob, SharedAtom, SharedValue};
 use crate::types::DelayState;
 use crate::{Keyword, MapValue, PersistentList, PersistentQueue, SetValue, Symbol, Value};
 use cljrs_gc::GcPtr;
@@ -70,6 +70,24 @@ pub enum CloneError {
     },
     /// The channel's receiver side has been dropped.
     Disconnected,
+    /// Realizing a lazy value was interrupted by fiber cancellation; callers
+    /// must surface it as `ValueError::Cancelled`, which stays uncatchable.
+    Cancelled,
+    /// Realizing a lazy value exhausted the gas budget; callers surface it
+    /// as the uncatchable `ValueError::GasExhausted`.
+    GasExhausted,
+    /// The process memory governor refused the message's queue charge
+    /// (strict mode).
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+    /// A byte-bounded channel has no room for the message.
+    Full {
+        /// Wire size of the refused message.
+        bytes: usize,
+        /// Bytes queued on the channel when the message was refused.
+        queued: usize,
+        /// The channel's byte limit.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for CloneError {
@@ -82,6 +100,18 @@ impl std::fmt::Display for CloneError {
                 )
             }
             CloneError::Disconnected => write!(f, "isolate channel is disconnected"),
+            CloneError::Cancelled => write!(f, "execution cancelled"),
+            CloneError::GasExhausted => write!(f, "gas exhausted"),
+            CloneError::MemoryLimitExceeded(e) => e.fmt(f),
+            CloneError::Full {
+                bytes,
+                queued,
+                limit,
+            } => write!(
+                f,
+                "isolate channel is full: a {bytes}-byte message does not fit \
+                 ({queued} of {limit} bytes queued)"
+            ),
         }
     }
 }
@@ -170,7 +200,7 @@ pub enum SerializedValue {
     /// both isolates share the same underlying `ArcSwap` cell.
     SharedAtom(Arc<SharedAtom>),
     /// `ByteBlob` is an immutable refcounted buffer; clone the `Arc`.
-    ByteBlob(Arc<[u8]>),
+    ByteBlob(Arc<ByteBlob>),
     /// A var crosses by sharing its cross-isolate root cell (the `Arc` is
     /// cloned, so both isolates point at the same `ArcSwap`).  The receiving
     /// isolate rebuilds a `Var` whose local fast-path slot is the demoted
@@ -277,7 +307,114 @@ impl SerializedValue {
     }
 }
 
+impl SerializedValue {
+    /// Bytes this serialized message owns while it is queued: the root node
+    /// plus every owned buffer (child vectors, strings, array contents).
+    ///
+    /// This is the message-queue charge.  It differs from [`Self::byte_size`],
+    /// which estimates the receiver's materialized heap.  `Arc`-shared payloads
+    /// (`SharedAtom`, `ByteBlob`, a var's root cell) count as zero: their
+    /// owner objects already hold the applicable governor charge.
+    pub fn wire_size(&self) -> usize {
+        std::mem::size_of::<SerializedValue>() + self.owned_bytes()
+    }
+
+    /// Heap bytes owned below this node (excluding the node itself).
+    fn owned_bytes(&self) -> usize {
+        const NODE: usize = std::mem::size_of::<SerializedValue>();
+        fn items(items: &[SerializedValue]) -> usize {
+            items.iter().map(|v| NODE + v.owned_bytes()).sum()
+        }
+        fn pairs(pairs: &[(SerializedValue, SerializedValue)]) -> usize {
+            pairs
+                .iter()
+                .map(|(k, v)| 2 * NODE + k.owned_bytes() + v.owned_bytes())
+                .sum()
+        }
+        fn ident(namespace: &Option<Arc<str>>, name: &Arc<str>) -> usize {
+            namespace.as_ref().map_or(0, |n| n.len()) + name.len()
+        }
+        match self {
+            SerializedValue::Nil
+            | SerializedValue::Bool(_)
+            | SerializedValue::Long(_)
+            | SerializedValue::Double(_)
+            | SerializedValue::Char(_)
+            | SerializedValue::Uuid(_) => 0,
+
+            SerializedValue::BigInt(b) => b.bits().div_ceil(8) as usize,
+            SerializedValue::Ratio(r) => {
+                (r.numer().bits().div_ceil(8) + r.denom().bits().div_ceil(8)) as usize
+            }
+            // log2(10) / 8 ≈ 27 / 64 bytes per decimal digit.
+            SerializedValue::BigDecimal(d) => (d.digits() as usize * 27).div_ceil(64),
+
+            SerializedValue::Str(s) | SerializedValue::Pattern(s) => s.capacity(),
+
+            SerializedValue::Symbol {
+                namespace,
+                name,
+                version,
+            } => ident(namespace, name) + version.as_ref().map_or(0, |v| v.len()),
+            SerializedValue::Keyword { namespace, name } => ident(namespace, name),
+
+            SerializedValue::List(v)
+            | SerializedValue::Vector(v)
+            | SerializedValue::HashSet(v)
+            | SerializedValue::SortedSet(v)
+            | SerializedValue::Queue(v)
+            | SerializedValue::ObjectArray(v) => items(v),
+
+            SerializedValue::ArrayMap(p)
+            | SerializedValue::HashMap(p)
+            | SerializedValue::SortedMap(p) => pairs(p),
+
+            SerializedValue::TypeInstance { type_tag, fields } => type_tag.len() + pairs(fields),
+
+            SerializedValue::Cons { head, tail } => {
+                2 * NODE + head.owned_bytes() + tail.owned_bytes()
+            }
+
+            SerializedValue::Error(e) => e.wire_size(),
+
+            SerializedValue::BooleanArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::ByteArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::ShortArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::IntArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::LongArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::FloatArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::DoubleArray(v) => std::mem::size_of_val(v.as_slice()),
+            SerializedValue::CharArray(v) => std::mem::size_of_val(v.as_slice()),
+
+            SerializedValue::WithMeta { value, meta } => {
+                2 * NODE + value.owned_bytes() + meta.owned_bytes()
+            }
+            SerializedValue::Reduced(inner) => NODE + inner.owned_bytes(),
+
+            SerializedValue::SharedAtom(_) | SerializedValue::ByteBlob(_) => 0,
+            SerializedValue::Var {
+                namespace, name, ..
+            } => namespace.len() + name.len(),
+        }
+    }
+}
+
 impl SerializedError {
+    /// Boxed size of this error plus everything it owns.
+    fn wire_size(&self) -> usize {
+        const NODE: usize = std::mem::size_of::<SerializedValue>();
+        std::mem::size_of::<SerializedError>()
+            + self.message.capacity()
+            + self.data.as_ref().map_or(0, |pairs| {
+                pairs
+                    .iter()
+                    .map(|(k, v)| 2 * NODE + k.owned_bytes() + v.owned_bytes())
+                    .sum()
+            })
+            + self.cause.as_ref().map_or(0, |c| c.wire_size())
+            + self.kind.owned_bytes()
+    }
+
     fn byte_size(&self) -> usize {
         std::mem::size_of::<SerializedError>()
             + self.message.len()
@@ -325,13 +462,51 @@ pub enum SerializedErrorKind {
     Unsupported,
     Other(String),
     GasExhausted,
+    Cancelled,
+    MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     OutOfRange,
     TransientAlreadyPersisted,
     Parse,
     Thrown(Box<SerializedValue>),
 }
 
+impl SerializedErrorKind {
+    /// Heap bytes this kind owns (strings and a thrown value).
+    fn owned_bytes(&self) -> usize {
+        match self {
+            SerializedErrorKind::WrongType { got, .. } => got.capacity(),
+            SerializedErrorKind::ArityError { name, expected, .. } => {
+                name.capacity() + expected.capacity()
+            }
+            SerializedErrorKind::NotCallable { value } => value.capacity(),
+            SerializedErrorKind::Other(msg) => msg.capacity(),
+            SerializedErrorKind::Thrown(v) => v.wire_size(),
+            SerializedErrorKind::IndexOutOfBounds { .. }
+            | SerializedErrorKind::OddMap { .. }
+            | SerializedErrorKind::Unsupported
+            | SerializedErrorKind::Cancelled
+            | SerializedErrorKind::GasExhausted
+            | SerializedErrorKind::MemoryLimitExceeded(_)
+            | SerializedErrorKind::OutOfRange
+            | SerializedErrorKind::TransientAlreadyPersisted
+            | SerializedErrorKind::Parse => 0,
+        }
+    }
+}
+
 // ── serialize ─────────────────────────────────────────────────────────────────
+
+/// The `ValueError` a caller surfaces for a resource-limit `CloneError`
+/// (cancellation, gas, memory), so it stays uncatchable; `None` for ordinary
+/// boundary errors.
+pub fn resource_value_error(error: &CloneError) -> Option<ValueError> {
+    match error {
+        CloneError::Cancelled => Some(ValueError::Cancelled),
+        CloneError::GasExhausted => Some(ValueError::GasExhausted),
+        CloneError::MemoryLimitExceeded(fault) => Some(ValueError::MemoryLimitExceeded(*fault)),
+        _ => None,
+    }
+}
 
 /// Serialize a `Value` into a `Send + Sync` wire form suitable for crossing an
 /// isolate boundary. Returns [`CloneError`] for non-shareable values.
@@ -443,7 +618,14 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         }
 
         // ── Lazy sequences: realize first ──
-        Value::LazySeq(p) => serialize(&p.get().realize()),
+        Value::LazySeq(p) => serialize(&p.get().try_realize().map_err(|error| match error {
+            // Resource errors and cancellation keep their identity, so they
+            // are not turned into a catchable "not shareable" error.
+            ValueError::Cancelled => CloneError::Cancelled,
+            ValueError::GasExhausted => CloneError::GasExhausted,
+            ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
+            _ => not_shareable("lazy seq whose realization failed"),
+        })?),
 
         // ── Delay: force if already realized, else error ──
         Value::Delay(p) => {
@@ -565,6 +747,8 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
         ValueError::Unsupported => SerializedErrorKind::Unsupported,
         ValueError::Other(s) => SerializedErrorKind::Other(s.clone()),
         ValueError::GasExhausted => SerializedErrorKind::GasExhausted,
+        ValueError::Cancelled => SerializedErrorKind::Cancelled,
+        ValueError::MemoryLimitExceeded(e) => SerializedErrorKind::MemoryLimitExceeded(*e),
         ValueError::OutOfRange => SerializedErrorKind::OutOfRange,
         ValueError::TransientAlreadyPersisted => SerializedErrorKind::TransientAlreadyPersisted,
         ValueError::Parse => SerializedErrorKind::Parse,
@@ -594,10 +778,11 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
 /// `serialize` time, so nothing in `SerializedValue` requires runtime checks.
 pub fn deserialize(sv: SerializedValue) -> Value {
     match sv {
-        SerializedValue::WithMeta { value, meta } => {
-            Value::WithMeta(Box::new(deserialize(*value)), Box::new(deserialize(*meta)))
-        }
-        SerializedValue::Reduced(inner) => Value::Reduced(Box::new(deserialize(*inner))),
+        SerializedValue::WithMeta { value, meta } => Value::WithMeta(
+            std::sync::Arc::new(deserialize(*value)),
+            std::sync::Arc::new(deserialize(*meta)),
+        ),
+        SerializedValue::Reduced(inner) => Value::Reduced(std::sync::Arc::new(deserialize(*inner))),
 
         SerializedValue::Nil => Value::Nil,
         SerializedValue::Bool(b) => Value::Bool(b),
@@ -752,6 +937,8 @@ fn deserialize_error(se: SerializedError) -> crate::error::ExceptionInfo {
         SerializedErrorKind::Unsupported => ValueError::Unsupported,
         SerializedErrorKind::Other(s) => ValueError::Other(s),
         SerializedErrorKind::GasExhausted => ValueError::GasExhausted,
+        SerializedErrorKind::Cancelled => ValueError::Cancelled,
+        SerializedErrorKind::MemoryLimitExceeded(e) => ValueError::MemoryLimitExceeded(e),
         SerializedErrorKind::OutOfRange => ValueError::OutOfRange,
         SerializedErrorKind::TransientAlreadyPersisted => ValueError::TransientAlreadyPersisted,
         SerializedErrorKind::Parse => ValueError::Parse,
@@ -904,7 +1091,7 @@ mod tests {
             fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
         }
         impl Thunk for DoneThunk {
-            fn force(&self) -> Result<Value, String> {
+            fn force(&self) -> crate::ValueResult<Value> {
                 Ok(Value::Long(99))
             }
         }
@@ -924,8 +1111,11 @@ mod tests {
 
     #[test]
     fn reduced_roundtrip() {
-        let v = Value::Reduced(Box::new(Value::Long(55)));
-        assert_eq!(roundtrip(&v), Value::Reduced(Box::new(Value::Long(55))));
+        let v = Value::Reduced(std::sync::Arc::new(Value::Long(55)));
+        assert_eq!(
+            roundtrip(&v),
+            Value::Reduced(std::sync::Arc::new(Value::Long(55)))
+        );
     }
 
     #[test]
@@ -1031,6 +1221,46 @@ mod tests {
             panic!("expected Var")
         };
         assert!(!p.get().is_bound());
+    }
+
+    #[test]
+    fn wire_size_counts_owned_buffers() {
+        const NODE: usize = std::mem::size_of::<SerializedValue>();
+        assert_eq!(serialize(&Value::Long(1)).unwrap().wire_size(), NODE);
+        let s = serialize(&Value::string("x".repeat(100))).unwrap();
+        assert!(s.wire_size() >= NODE + 100);
+        let v = serialize(&Value::Vector(GcPtr::new(PersistentVector::from_iter([
+            Value::Long(1),
+            Value::Long(2),
+        ]))))
+        .unwrap();
+        assert_eq!(v.wire_size(), 3 * NODE, "root plus two child slots");
+    }
+
+    #[test]
+    fn wire_size_counts_error_kind_payloads() {
+        let big = "x".repeat(1 << 20);
+        let thrown = SerializedValue::Error(Box::new(SerializedError {
+            kind: SerializedErrorKind::Thrown(Box::new(SerializedValue::Str(big.clone()))),
+            message: String::new(),
+            data: None,
+            cause: None,
+        }));
+        assert!(thrown.wire_size() >= 1 << 20);
+        let other = SerializedValue::Error(Box::new(SerializedError {
+            kind: SerializedErrorKind::Other(big),
+            message: String::new(),
+            data: None,
+            cause: None,
+        }));
+        assert!(other.wire_size() >= 1 << 20);
+    }
+
+    #[test]
+    fn wire_size_excludes_shared_payloads() {
+        const NODE: usize = std::mem::size_of::<SerializedValue>();
+        let blob = Value::ByteBlob(Arc::new(ByteBlob::new(vec![0u8; 1 << 16])));
+        assert_eq!(serialize(&blob).unwrap().wire_size(), NODE);
     }
 
     #[test]

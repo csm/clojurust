@@ -11,14 +11,14 @@ use crate::env::env::{Env, RequireRefer, RequireSpec};
 use crate::env::error::{EvalError, EvalResult};
 use crate::env::loader::load_ns;
 use crate::interp::destructure::bind_pattern;
-use crate::interp::eval::{eval, eval_body, is_special_form};
+use crate::interp::eval::{eval_body, eval_unscoped as eval, is_special_form};
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::error::ExceptionInfo;
 use cljrs_value::{
-    CljxFn, CljxFnArity, CljxFuture, FutureState, Keyword, MapValue, Protocol, ProtocolMethod,
-    ReferClojureFilter, TypeHint, Value, ValueError,
+    CljxFn, CljxFnArity, Keyword, MapValue, Protocol, ProtocolMethod, ReferClojureFilter, TypeHint,
+    Value, ValueError,
 };
 
 /// Dispatch to the right special-form handler.
@@ -63,17 +63,13 @@ pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
 
 fn eval_def(args: &[Form], env: &mut Env) -> EvalResult {
     let target = parse_def(args, env)?;
-    let val = match target.value_form {
-        Some(form) => {
-            // Under no-gc: def value expressions go to the StaticArena since the
-            // Var must outlive all scratch regions.
-            #[cfg(feature = "no-gc")]
-            let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-            eval(form, env)?
-        }
-        None => Value::Nil,
-    };
-    intern_def(target, val, env)
+    crate::interp::eval::with_scratch(|| {
+        let val = match target.value_form {
+            Some(form) => eval(form, env)?,
+            None => Value::Nil,
+        };
+        intern_def(target, val, env)
+    })
 }
 
 /// A parsed `(def name "doc"? value?)`: everything but the value itself.
@@ -283,7 +279,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     // Eagerly lower each arity to IR if the compiler is ready.
     //eager_lower_fn(&cljrs_fn, env);
 
-    let mut ptr = GcPtr::new(cljrs_fn);
+    let mut ptr = GcPtr::new_isolated(cljrs_fn);
     // For named anonymous functions (fn g ...), store a back-pointer so that
     // the self-reference returned from the body is pointer-equal to the outer
     // binding — required for `(= f (f))` to be `true`.
@@ -360,7 +356,7 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
     Ok(CljxFnArity {
         params,
         rest_param,
-        body,
+        body: body.into(),
         destructure_params,
         destructure_rest,
         ir_arity_id: crate::interp::arity::fresh_arity_id(),
@@ -563,44 +559,32 @@ fn eval_let(args: &[Form], env: &mut Env) -> EvalResult {
     let chains = crate::interp::virtualize::detect_let_chains(&bindings);
     let virtualizable_chains = find_virtualizable_chains(&chains, &bindings, body);
 
-    env.push_frame();
-
-    let pairs: Vec<_> = bindings.chunks(2).collect();
-    let mut i = 0;
-    while i < pairs.len() {
-        // Check if this binding starts a virtualizable chain.
-        if let Some(chain) = virtualizable_chains.iter().find(|c| c.start == i) {
-            match eval_virtualized_chain(chain, &pairs, env) {
-                Ok(()) => {
-                    i += chain.len;
-                    continue;
-                }
-                Err(e) => {
-                    env.pop_frame();
-                    return Err(e);
+    env.with_frame(|env| {
+        let pairs: Vec<_> = bindings.chunks(2).collect();
+        let mut i = 0;
+        while i < pairs.len() {
+            // Check if this binding starts a virtualizable chain.
+            if let Some(chain) = virtualizable_chains.iter().find(|c| c.start == i) {
+                match eval_virtualized_chain(chain, &pairs, env) {
+                    Ok(()) => {
+                        i += chain.len;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
                 }
             }
+
+            // Normal evaluation.
+            let pair = pairs[i];
+            let val = eval(&pair[1], env)?;
+            bind_pattern(&pair[0], val, env)?;
+            i += 1;
         }
 
-        // Normal evaluation.
-        let pair = pairs[i];
-        let val = match eval(&pair[1], env) {
-            Ok(v) => v,
-            Err(e) => {
-                env.pop_frame();
-                return Err(e);
-            }
-        };
-        if let Err(e) = bind_pattern(&pair[0], val, env) {
-            env.pop_frame();
-            return Err(e);
-        }
-        i += 1;
-    }
-
-    let result = eval_body(body, env);
-    env.pop_frame();
-    result
+        eval_body(body, env)
+    })
 }
 
 /// Filter chains to only those that are safe to virtualize.
@@ -755,18 +739,33 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
     let patterns: Vec<Form> = bindings.iter().step_by(2).cloned().collect();
     let mut current_vals: Vec<Value> = Vec::new();
 
-    // Evaluate initial values.
+    #[cfg(feature = "no-gc")]
+    let mut initial_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
     for i in (1..bindings.len()).step_by(2) {
-        current_vals.push(eval(&bindings[i], env)?);
+        match eval(&bindings[i], env) {
+            Ok(value) => current_vals.push(value),
+            Err(error) => {
+                #[cfg(feature = "no-gc")]
+                {
+                    initial_scope.pop_for_return();
+                    return crate::interp::eval::publish_result(Err(error), None);
+                }
+                #[cfg(not(feature = "no-gc"))]
+                return Err(error);
+            }
+        }
     }
-
+    #[cfg(feature = "no-gc")]
+    let mut recur_lease = cljrs_gc::region::RegionLease::for_values(&current_vals);
+    #[cfg(feature = "no-gc")]
+    drop(initial_scope);
     loop {
         // Root current_vals so they survive GC — they're not yet bound in env.
         let _vals_root = crate::env::gc_roots::root_values(&current_vals);
 
         // GC safepoint on every loop iteration so tight recur loops
         // don't starve the collector.
-        crate::env::gc_roots::gc_safepoint(env);
+        crate::env::gc_roots::gc_safepoint(env)?;
 
         // Under no-gc: push a fresh scratch region for this iteration.
         // Intermediates allocated in the body land here and are freed
@@ -787,22 +786,25 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
         #[cfg(not(feature = "no-gc"))]
         let _iter_frame = cljrs_gc::push_alloc_frame();
 
-        env.push_frame();
-        for (pat, val) in patterns.iter().zip(current_vals.iter()) {
-            if let Err(e) = bind_pattern(pat, val.clone(), env) {
-                env.pop_frame();
-                return Err(e);
+        let result = env.with_frame(|env| {
+            for (pat, val) in patterns.iter().zip(current_vals.iter()) {
+                bind_pattern(pat, val.clone(), env)?;
             }
-        }
 
-        // Under no-gc: pop scratch before tail expression so the return value
-        // or recur args are allocated in the enclosing scope's context.
-        #[cfg(not(feature = "no-gc"))]
-        let result = eval_body_recur(body, env);
-        #[cfg(feature = "no-gc")]
-        let result = eval_body_with_scratch_loop(body, &mut scratch, env);
+            // Under no-gc: transfer return/recur backing scopes into the
+            // enclosing destination before this iteration releases scratch.
+            #[cfg(not(feature = "no-gc"))]
+            let result = eval_body_recur(body, env);
+            #[cfg(feature = "no-gc")]
+            let result = crate::interp::apply::eval_body_with_scratch(
+                body,
+                &mut scratch,
+                &mut recur_lease,
+                env,
+            );
 
-        env.pop_frame();
+            result
+        });
         // scratch / _iter_frame drop at the end of the iteration (after the
         // match below), freeing this iteration's intermediates.
 
@@ -816,8 +818,8 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
                         got: new_vals.len(),
                     });
                 }
-                // new_vals were evaluated in the caller's context (scratch was
-                // popped before the tail form), so they survive the reset.
+                // Ownership of new_vals was transferred to the enclosing
+                // destination, so they survive this iteration's scratch guard.
                 current_vals = new_vals;
             }
             Err(e) => return Err(e),
@@ -840,28 +842,6 @@ pub fn eval_body_recur(body: &[Form], env: &mut Env) -> EvalResult {
         result = eval(form, env)?;
     }
     Ok(result)
-}
-
-/// Under `no-gc`: eval loop body with scratch-region semantics.
-///
-/// Evaluates all non-tail forms inside the scratch region, then pops the
-/// scratch before the tail (return/recur) expression so it lands in the
-/// caller's context.
-#[cfg(feature = "no-gc")]
-fn eval_body_with_scratch_loop(
-    body: &[Form],
-    scratch: &mut cljrs_gc::alloc_ctx::ScratchGuard,
-    env: &mut Env,
-) -> EvalResult {
-    if body.is_empty() {
-        scratch.pop_for_return();
-        return Ok(Value::Nil);
-    }
-    for form in &body[..body.len() - 1] {
-        eval(form, env)?;
-    }
-    scratch.pop_for_return();
-    eval(&body[body.len() - 1], env)
 }
 
 // ── quote ─────────────────────────────────────────────────────────────────────
@@ -1090,8 +1070,12 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
             result = Err(EvalError::Recur(args));
             None
         }
-        Err(EvalError::GasExhausted) => {
-            result = Err(EvalError::GasExhausted);
+        Err(
+            error @ (EvalError::GasExhausted
+            | EvalError::Cancelled
+            | EvalError::MemoryLimitExceeded(_)),
+        ) => {
+            result = Err(error);
             None
         }
         Err(other) => Some(other),
@@ -1105,10 +1089,10 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
         let mut handled = false;
         for c in &catches {
             if catch_type_matches(c.type_sym, &thrown_val) {
-                env.push_frame();
-                env.bind(Arc::from(c.binding), thrown_val.clone());
-                result = eval_body(c.body, env);
-                env.pop_frame();
+                result = env.with_frame(|env| {
+                    env.bind(Arc::from(c.binding), thrown_val.clone());
+                    eval_body(c.body, env)
+                });
                 handled = true;
                 break;
             }
@@ -1122,11 +1106,23 @@ fn eval_try(args: &[Form], env: &mut Env) -> EvalResult {
     // Always run finally.  Its normal (Ok) value is discarded — `try` returns
     // the body/catch result — but an exception thrown from `finally` supersedes
     // the pending result or exception (matching JVM/Clojure semantics).
-    if !fin_body.is_empty() {
-        eval_body(fin_body, env)?;
+    // An uncatchable resource error is never superseded, so a throwing
+    // `finally` cannot make it catchable (the compiled `rt_try` agrees).
+    if !fin_body.is_empty()
+        && let Err(error) = eval_body(fin_body, env)
+        && !matches!(&result, Err(pending) if is_resource_error(pending))
+    {
+        return Err(error);
     }
 
     result
+}
+
+fn is_resource_error(error: &EvalError) -> bool {
+    matches!(
+        error,
+        EvalError::GasExhausted | EvalError::Cancelled | EvalError::MemoryLimitExceeded(_)
+    )
 }
 
 /// The class name or `:default` keyword naming what a `catch` clause catches.
@@ -1197,6 +1193,10 @@ pub fn parse_try_args(args: &[Form]) -> (&[Form], Vec<CatchClause<'_>>, &[Form])
 // ── defn ──────────────────────────────────────────────────────────────────────
 
 pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
+    crate::interp::eval::with_scratch(|| eval_defn_inner(args, env, private))
+}
+
+fn eval_defn_inner(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
     // The name may carry reader metadata, e.g. `(defn ^:async fetch ...)`.
     let name_form = args
         .first()
@@ -1230,10 +1230,6 @@ pub fn eval_defn(args: &[Form], env: &mut Env, private: bool) -> EvalResult {
         args[0].span.clone(),
     )];
     fn_args.extend_from_slice(&args[rest_start..]);
-    // Under no-gc: the Fn object must live in the StaticArena since the Var
-    // intern outlives all scratch regions.
-    #[cfg(feature = "no-gc")]
-    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
     let mut fn_val = eval_fn(&fn_args, env)?;
     if is_async && let Value::Fn(ref mut f) = fn_val {
         f.get_mut().is_async = true;
@@ -1342,7 +1338,7 @@ fn eval_defmacro(args: &[Form], env: &mut Env) -> EvalResult {
         Value::Fn(f) => {
             let mut mfn = f.get().clone();
             mfn.is_macro = true;
-            Value::Macro(GcPtr::new(mfn))
+            Value::Macro(GcPtr::new_isolated(mfn))
         }
         other => other,
     };
@@ -1953,7 +1949,8 @@ pub fn push_letfn_frame(args: &[Form], env: &mut Env) -> EvalResult<()> {
     for (_, fn_val) in &built {
         if let Value::Fn(ptr) = fn_val {
             let mut ptr = ptr.clone();
-            let f = ptr.get_mut();
+            #[allow(unused_mut)]
+            let mut f = ptr.get_mut();
             for i in 0..f.closed_over_names.len() {
                 let captured = f.closed_over_names[i].clone();
                 if let Some((_, real)) = built.iter().find(|(n, _)| *n == captured) {
@@ -2072,7 +2069,7 @@ fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
     }
     // Name metadata belongs on the var `defprotocol` binds, not here.
     let (name, _) = require_sym_meta(args, 0, "protocol*", env)?;
-    let specs = crate::interp::eval::eval(&args[1], env)?;
+    let specs = crate::interp::eval::eval_unscoped(&args[1], env)?;
     let specs: Vec<Value> = match specs.unwrap_meta() {
         Value::Vector(v) => v.get().iter().cloned().collect(),
         Value::Nil => Vec::new(),
@@ -2089,7 +2086,7 @@ fn eval_protocol_star(args: &[Form], env: &mut Env) -> EvalResult {
         .collect::<EvalResult<Vec<_>>>()?;
     let extend_via_metadata = match args.get(2) {
         Some(f) => !matches!(
-            crate::interp::eval::eval(f, env)?,
+            crate::interp::eval::eval_unscoped(f, env)?,
             Value::Nil | Value::Bool(false)
         ),
         None => false,
@@ -2224,7 +2221,7 @@ fn build_impl_fn(
         false,
         Arc::clone(&env.current_ns),
     );
-    Ok(Value::Fn(GcPtr::new(cljrs_fn)))
+    Ok(Value::Fn(GcPtr::new_isolated(cljrs_fn)))
 }
 
 // ── binding ───────────────────────────────────────────────────────────────────
@@ -2425,12 +2422,9 @@ fn register_impls_for_tag(
                     None => continue,
                 };
                 let fn_val = build_impl_fn(parts, fields, mutable_fields, env)?;
-                let mut impls = proto.get().impls.lock().unwrap();
-                impls
-                    .entry(type_tag.clone())
-                    .or_default()
-                    .insert(method_name, fn_val);
-                drop(impls);
+                proto
+                    .get()
+                    .set_implementation(type_tag.clone(), method_name, fn_val);
                 cljrs_value::bump_protocol_generation();
             }
             _ => {}
@@ -2507,40 +2501,13 @@ fn eval_with_out_str(body: &[Form], env: &mut Env) -> EvalResult {
 ///
 /// When `cljrs-async` is loaded, `eval_async` intercepts `await` forms before
 /// the sync evaluator reaches this handler, so this path is only taken in
-/// non-async (sync) code. It blocks the OS thread until the future/promise
-/// resolves — equivalent to `(deref val)`.
+/// non-async code. Inside a fiber, this path parks until settlement.
+/// Outside a fiber, it blocks the OS thread, like `(deref val)`. A channel is
+/// taken from, so `(await (go ...))` yields the block's value.
 fn eval_await(args: &[Form], env: &mut Env) -> EvalResult {
     if args.is_empty() {
         return Err(EvalError::Runtime("await requires one argument".into()));
     }
     let val = eval(&args[0], env)?;
-    match val {
-        Value::Future(f) => {
-            let mut guard = f.get().state.lock().unwrap();
-            loop {
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        return Ok(v.clone());
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        return Err(EvalError::Thrown(v.clone()));
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        return Err(EvalError::GasExhausted);
-                    }
-                    FutureState::Cancelled => {
-                        return Err(EvalError::Thrown(CljxFuture::cancelled_error()));
-                    }
-                    FutureState::Running => {
-                        guard = f.get().cond.wait(guard).unwrap();
-                    }
-                }
-            }
-        }
-        Value::Promise(p) => Ok(p.get().deref_blocking()),
-        other => Ok(other),
-    }
+    crate::interp::eval::await_value_sync(val, &env.globals)
 }

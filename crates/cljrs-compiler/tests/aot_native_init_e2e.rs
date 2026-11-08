@@ -123,6 +123,9 @@ cljrs-interop = {{ path = "{}" }}
     let lib_rs = format!(
         r#"use cljrs_interop::{{Registry, wrap_fn0}};
 
+#[cljrs_interop::export(ns = "fixture")]
+fn native_answer(value: i64) -> i64 {{ value + 1 }}
+
 pub fn register(registry: &mut Registry) {{
     registry.define(
         "fixture/answer",
@@ -216,4 +219,17 @@ fn a_safe_extern_c_entry_point_works_too() {
         "(println (fixture/answer))\n",
     );
     assert_eq!(out.trim(), "42");
+}
+
+#[test]
+fn compiled_blocking_form_uses_typed_native_adapters() {
+    let out = compile_with_native_init(
+        "native_blocking_form",
+        Spelling::UnsafeExternC,
+        r#"(require '[cljrs.fiber :as f])
+           (println (blocking (fixture/native-answer 41)))
+           (println (f/blocking (fixture/native-answer 0) (fixture/native-answer 41)))
+           (println (try (blocking ((fn [] 1))) (catch Exception _ :rejected)))"#,
+    );
+    assert_eq!(out.trim(), "42\n42\n:rejected");
 }

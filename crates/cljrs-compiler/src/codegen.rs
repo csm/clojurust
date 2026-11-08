@@ -40,6 +40,10 @@ pub type CodegenResult<T> = Result<T, CodegenError>;
 /// Cached `FuncId`s for runtime bridge functions.
 struct RuntimeFuncs {
     rt_safepoint: FuncId,
+    rt_error_flag_ptr: FuncId,
+    rt_native_frame_depth: FuncId,
+    rt_native_frame_cleanup: FuncId,
+    rt_async_fail: FuncId,
     rt_const_nil: FuncId,
     rt_const_true: FuncId,
     rt_const_false: FuncId,
@@ -261,6 +265,7 @@ impl<M: Module> Compiler<M> {
     /// state machine's slots, and the result/thrown value is returned in-band via
     /// `CljxStateMachine::pending`, so the compiled signature is a single pointer
     /// plus an `i32` poll code, independent of the function's arity.
+    #[cfg(test)]
     pub fn declare_poll_function(&mut self, name: &str) -> CodegenResult<FuncId> {
         let mut sig = self.module.make_signature();
         sig.call_conv = CallConv::SystemV;
@@ -364,6 +369,8 @@ impl<M: Module> Compiler<M> {
                     specs,
                     is_poll_fn: ir_func.is_async_poll_fn,
                     sm_param: None,
+                    frame_depth: None,
+                    error_flag: None,
                 };
                 translator.translate(ir_func)?;
             }
@@ -481,6 +488,8 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     is_poll_fn: bool,
     /// The poll function's `*mut CljxStateMachine` parameter (state-machine ABI).
     sm_param: Option<cranelift_codegen::ir::Value>,
+    frame_depth: Option<cranelift_codegen::ir::Value>,
+    error_flag: Option<cranelift_codegen::ir::Value>,
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
@@ -531,8 +540,9 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     Some(self.builder.block_params(entry_block)[ir_func.params.len()]);
             }
 
+            self.enter_native_frame();
             // GC safepoint at function entry.
-            self.emit_safepoint();
+            self.emit_safepoint()?;
         }
 
         // Translate each block.
@@ -593,8 +603,8 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         self.builder.switch_to_block(dispatch);
         let params = self.builder.block_params(dispatch).to_vec();
         self.sm_param = Some(params[0]);
-
-        self.emit_safepoint();
+        self.enter_native_frame();
+        self.emit_safepoint()?;
 
         // switch(state): brif chain over the resume-block table.  Entry (state
         // 0) is the default.  All targets are phi-free, so jumps carry no args.
@@ -666,6 +676,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             self.builder.block_params(prologue).to_vec();
 
         let deopt_block = self.builder.create_block();
+        self.enter_native_frame();
 
         for (i, (_name, var_id)) in ir_func.params.iter().enumerate() {
             let raw = params[i];
@@ -706,7 +717,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             self.region_param = Some(params[ir_func.params.len()]);
         }
 
-        self.emit_safepoint();
+        self.emit_safepoint()?;
         let entry = self.block_map[&ir_func.blocks[0].id];
         self.builder.ins().jump(entry, &[]);
 
@@ -826,12 +837,14 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 let val_v = self.use_var_boxed(*val)?;
                 let func_ref = self.import_func(self.rt.rt_set_bang);
                 self.builder.ins().call(func_ref, &[var_v, val_v]);
+                self.emit_error_check()?;
             }
 
             Inst::Throw(val) => {
                 let v = self.use_var_boxed(*val)?;
                 let func_ref = self.import_func(self.rt.rt_throw);
                 self.builder.ins().call(func_ref, &[v]);
+                self.emit_error_check()?;
                 // rt_throw stores the exception in a thread-local and returns.
                 // The block ends with Unreachable which returns nil, allowing
                 // the caller (rt_try) to check the thread-local.
@@ -921,6 +934,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                                 ncaptures_val,
                             ],
                         );
+                        self.emit_error_check()?;
                         let result = self.builder.inst_results(call)[0];
                         let var = self.ensure_var(*dst);
                         self.builder.def_var(var, result);
@@ -948,6 +962,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                                 ncaptures_val,
                             ],
                         );
+                        self.emit_error_check()?;
                         let result = self.builder.inst_results(call)[0];
                         let var = self.ensure_var(*dst);
                         self.builder.def_var(var, result);
@@ -1026,6 +1041,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                                 ncaptures_val,
                             ],
                         );
+                        self.emit_error_check()?;
                         let result = self.builder.inst_results(call)[0];
                         let var = self.ensure_var(*dst);
                         self.builder.def_var(var, result);
@@ -1069,6 +1085,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                             let t = self.use_var_boxed(operands[1])?;
                             let func_ref = self.import_func(self.rt.rt_region_alloc_cons);
                             let call = self.builder.ins().call(func_ref, &[region_handle, h, t]);
+                            self.emit_error_check()?;
                             self.builder.inst_results(call)[0]
                         } else {
                             self.call_rt_0(self.rt.rt_const_nil)?
@@ -1224,7 +1241,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     .builder
                     .ins()
                     .iconst(types::I32, cljrs_async::state_machine::POLL_THREW as i64);
-                self.builder.ins().return_(&[threw]);
+                self.emit_poll_failure_return(threw);
 
                 // Gas exhaustion is not a catchable thrown value.
                 self.builder.switch_to_block(cont2);
@@ -1243,7 +1260,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                     types::I32,
                     cljrs_async::state_machine::POLL_GAS_EXHAUSTED as i64,
                 );
-                self.builder.ins().return_(&[exhausted]);
+                self.emit_poll_failure_return(exhausted);
 
                 // Ready → bind the resolved value; the continuation emits here.
                 self.builder.switch_to_block(ready_block);
@@ -1324,7 +1341,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             Terminator::RecurJump { target, args } => {
                 // GC safepoint before looping back, so tight recur
                 // loops cooperate with the collector.
-                self.emit_safepoint();
+                self.emit_safepoint()?;
                 let clif_block = self.block_map[target];
                 // Recur args feed the target's phis positionally; coerce each
                 // to its phi's representation (boxing into boxed phis).
@@ -1400,35 +1417,115 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
 
     // ── Helpers ─────────────────────────────────────────────────────────────
 
-    /// Emit a call to `rt_safepoint()`.
-    fn emit_safepoint(&mut self) {
-        let func_ref = self.import_func(self.rt.rt_safepoint);
-        self.builder.ins().call(func_ref, &[]);
+    fn enter_native_frame(&mut self) {
+        let function = self.import_func(self.rt.rt_native_frame_depth);
+        let call = self.builder.ins().call(function, &[]);
+        self.frame_depth = Some(self.builder.inst_results(call)[0]);
+        let function = self.import_func(self.rt.rt_error_flag_ptr);
+        let call = self.builder.ins().call(function, &[]);
+        self.error_flag = Some(self.builder.inst_results(call)[0]);
     }
 
-    /// Charge a weighted basic block and return a type-correct exhaustion
-    /// sentinel immediately when the active gas meter is exhausted.
+    /// Return an in-band poll failure code, first closing the regions this
+    /// invocation opened, as every other error exit does.
+    fn emit_poll_failure_return(&mut self, code: cranelift_codegen::ir::Value) {
+        let depth = self
+            .frame_depth
+            .expect("compiled function without region checkpoint");
+        let function = self.import_func(self.rt.rt_native_frame_cleanup);
+        self.builder.ins().call(function, &[depth]);
+        self.builder.ins().return_(&[code]);
+    }
+
+    fn emit_error_return(&mut self) -> CodegenResult<()> {
+        let code = if self.is_poll_fn {
+            let sm = self.sm_param.expect("poll function without machine");
+            let function = self.import_func(self.rt.rt_async_fail);
+            let call = self.builder.ins().call(function, &[sm]);
+            Some(self.builder.inst_results(call)[0])
+        } else {
+            None
+        };
+        let depth = self
+            .frame_depth
+            .expect("compiled function without region checkpoint");
+        let function = self.import_func(self.rt.rt_native_frame_cleanup);
+        self.builder.ins().call(function, &[depth]);
+        let result = match code {
+            Some(code) => code,
+            None => self.call_rt_0(self.rt.rt_const_nil)?,
+        };
+        self.builder.ins().return_(&[result]);
+        Ok(())
+    }
+
+    fn branch_on_error(&mut self, error: cranelift_codegen::ir::Value) -> CodegenResult<()> {
+        let failed = self.builder.create_block();
+        let next = self.builder.create_block();
+        self.builder.ins().brif(error, failed, &[], next, &[]);
+        self.builder.switch_to_block(failed);
+        self.emit_error_return()?;
+        self.builder.switch_to_block(next);
+        Ok(())
+    }
+
+    fn emit_error_check(&mut self) -> CodegenResult<()> {
+        let address = self
+            .error_flag
+            .expect("compiled function without error flag");
+        let error = self.builder.ins().load(
+            types::I8,
+            cranelift_codegen::ir::MemFlags::trusted(),
+            address,
+            0,
+        );
+        self.branch_on_error(error)
+    }
+
+    fn emit_safepoint(&mut self) -> CodegenResult<()> {
+        let function = self.import_func(self.rt.rt_safepoint);
+        let call = self.builder.ins().call(function, &[]);
+        let ok = self.builder.inst_results(call)[0];
+        let error =
+            self.builder
+                .ins()
+                .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, ok, 0);
+        self.branch_on_error(error)
+    }
+
     fn emit_gas_checkpoint(&mut self, cost: u64) -> CodegenResult<()> {
         let cost = self.builder.ins().iconst(types::I64, cost as i64);
         let charged = self.call_rt_1(self.rt.rt_gas_charge, cost)?;
-        let continue_block = self.builder.create_block();
-        let exhausted_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(charged, continue_block, &[], exhausted_block, &[]);
-        self.builder.switch_to_block(exhausted_block);
-        if self.is_poll_fn {
-            let exhausted = self.builder.ins().iconst(
-                types::I32,
-                cljrs_async::state_machine::POLL_GAS_EXHAUSTED as i64,
-            );
-            self.builder.ins().return_(&[exhausted]);
-        } else {
-            let nil = self.call_rt_0(self.rt.rt_const_nil)?;
-            self.builder.ins().return_(&[nil]);
+        let error =
+            self.builder
+                .ins()
+                .icmp_imm(cranelift_codegen::ir::condcodes::IntCC::Equal, charged, 0);
+        self.branch_on_error(error)
+    }
+
+    fn after_runtime_call(&mut self, function: FuncId) -> CodegenResult<()> {
+        // Scalar boxing, tags, and the checkpoint itself cannot set an ordinary
+        // pending exception. Avoid another ABI crossing on typed arithmetic.
+        if [
+            self.rt.rt_const_nil,
+            self.rt.rt_const_true,
+            self.rt.rt_const_false,
+            self.rt.rt_const_long,
+            self.rt.rt_const_double,
+            self.rt.rt_const_char,
+            self.rt.rt_box_bool,
+            self.rt.rt_unbox_long,
+            self.rt.rt_unbox_double,
+            self.rt.rt_value_tag,
+            self.rt.rt_truthiness,
+            self.rt.rt_gas_charge,
+            self.rt.rt_deopt,
+        ]
+        .contains(&function)
+        {
+            return Ok(());
         }
-        self.builder.switch_to_block(continue_block);
-        Ok(())
+        self.emit_error_check()
     }
 
     /// Inferred machine representation of `var_id` (Boxed if unknown).
@@ -1519,22 +1616,16 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             Const::Bool(true) => self.call_rt_0(self.rt.rt_const_true),
             Const::Bool(false) => self.call_rt_0(self.rt.rt_const_false),
             Const::Long(n) => {
-                let func_ref = self.import_func(self.rt.rt_const_long);
                 let arg = self.builder.ins().iconst(types::I64, *n);
-                let call = self.builder.ins().call(func_ref, &[arg]);
-                Ok(self.builder.inst_results(call)[0])
+                self.call_rt_1(self.rt.rt_const_long, arg)
             }
             Const::Double(f) => {
-                let func_ref = self.import_func(self.rt.rt_const_double);
                 let arg = self.builder.ins().f64const(*f);
-                let call = self.builder.ins().call(func_ref, &[arg]);
-                Ok(self.builder.inst_results(call)[0])
+                self.call_rt_1(self.rt.rt_const_double, arg)
             }
             Const::Char(ch) => {
-                let func_ref = self.import_func(self.rt.rt_const_char);
                 let arg = self.builder.ins().iconst(types::I32, *ch as i64);
-                let call = self.builder.ins().call(func_ref, &[arg]);
-                Ok(self.builder.inst_results(call)[0])
+                self.call_rt_1(self.rt.rt_const_char, arg)
             }
             Const::Str(s) => self.emit_string_const(self.rt.rt_const_string, s),
             Const::Regex(s) => self.emit_string_const(self.rt.rt_const_regex, s),
@@ -1595,6 +1686,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(fill_ref, &[name_ptr, name_len, slot_addr]);
+        self.emit_error_check()?;
         let filled = self.builder.inst_results(call)[0];
         self.builder
             .ins()
@@ -1628,6 +1720,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
 
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[ptr, len]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1670,6 +1763,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[ns_ptr, ns_len, name_ptr, name_len]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1737,6 +1831,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(fill_ref, &[ns_ptr, ns_len, name_ptr, name_len, slot_addr]);
+        self.emit_error_check()?;
         let filled = self.builder.inst_results(call)[0];
         self.builder
             .ins()
@@ -1777,6 +1872,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[ns_ptr, ns_len, name_ptr, name_len]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1814,6 +1910,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[ns_ptr, ns_len, name_ptr, name_len, val]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1831,6 +1928,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             let null = self.builder.ins().iconst(self.ptr_type, 0);
             let zero = self.builder.ins().iconst(types::I64, 0);
             let call = self.builder.ins().call(func_ref, &[null, zero]);
+            self.emit_error_check()?;
             return Ok(self.builder.inst_results(call)[0]);
         }
 
@@ -1864,6 +1962,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[slot_addr, actual_count]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -1886,6 +1985,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
                 .builder
                 .ins()
                 .call(func_ref, &[region_handle, null, zero]);
+            self.emit_error_check()?;
             return Ok(self.builder.inst_results(call)[0]);
         }
 
@@ -1913,6 +2013,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[region_handle, slot_addr, actual_count]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2060,8 +2161,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         let exc = self.call_rt_0(self.rt.rt_overflow_error)?;
         let throw_ref = self.import_func(self.rt.rt_throw);
         self.builder.ins().call(throw_ref, &[exc]);
-        let nil = self.call_rt_0(self.rt.rt_const_nil)?;
-        self.builder.ins().return_(&[nil]);
+        self.emit_error_return()?;
 
         self.builder.switch_to_block(cont_block);
         Ok(())
@@ -2287,6 +2387,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         }
         let func_ref = self.import_func(rt_func);
         let call = self.builder.ins().call(func_ref, &arg_vals);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2324,6 +2425,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[atom_val, f_val, extra_ptr, extra_count]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2368,6 +2470,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[bindings_ptr, npairs_val, body_val]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2401,6 +2504,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             arg_vals.push(self.use_var_boxed(*a)?);
         }
         let call = self.builder.ins().call(func_ref, &arg_vals);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2423,6 +2527,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         }
         arg_vals.push(extra);
         let call = self.builder.ins().call(func_ref, &arg_vals);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2444,6 +2549,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             let zero = self.builder.ins().iconst(types::I64, 0);
             let func_ref = self.import_func(self.rt.rt_call);
             let call = self.builder.ins().call(func_ref, &[callee_val, null, zero]);
+            self.emit_error_check()?;
             return Ok(self.builder.inst_results(call)[0]);
         }
 
@@ -2475,6 +2581,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
             .builder
             .ins()
             .call(func_ref, &[callee_val, slot_addr, count, ic_addr]);
+        self.emit_error_check()?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2497,6 +2604,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     fn call_rt_0(&mut self, func_id: FuncId) -> CodegenResult<cranelift_codegen::ir::Value> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[]);
+        self.after_runtime_call(func_id)?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2507,6 +2615,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[arg]);
+        self.after_runtime_call(func_id)?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2518,6 +2627,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[arg]);
+        self.after_runtime_call(func_id)?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2529,6 +2639,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[a, b]);
+        self.after_runtime_call(func_id)?;
         Ok(self.builder.inst_results(call)[0])
     }
 
@@ -2541,6 +2652,7 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
         let func_ref = self.import_func(func_id);
         let call = self.builder.ins().call(func_ref, &[a, b, c]);
+        self.after_runtime_call(func_id)?;
         Ok(self.builder.inst_results(call)[0])
     }
 }
@@ -2586,16 +2698,20 @@ fn declare_runtime_funcs<M: Module>(
     module: &mut M,
     ptr: types::Type,
 ) -> CodegenResult<RuntimeFuncs> {
-    // Declare rt_safepoint: void -> void.  We declare it as returning ptr
-    // (ignored) to keep the signature uniform with declare_rt.
+    // A failed stack-margin check sets the pending exception and returns zero.
     let rt_safepoint = {
         let mut sig = module.make_signature();
         sig.call_conv = CallConv::SystemV;
+        sig.returns.push(AbiParam::new(types::I8));
         module.declare_function("rt_safepoint", Linkage::Import, &sig)?
     };
 
     Ok(RuntimeFuncs {
         rt_safepoint,
+        rt_error_flag_ptr: declare_rt(module, "rt_error_flag_ptr", &[], ptr)?,
+        rt_native_frame_depth: declare_rt(module, "rt_native_frame_depth", &[], ptr)?,
+        rt_native_frame_cleanup: declare_rt_void(module, "rt_native_frame_cleanup", &[ptr])?,
+        rt_async_fail: declare_rt(module, "rt_async_fail", &[ptr], types::I32)?,
         rt_const_nil: declare_rt(module, "rt_const_nil", &[], ptr)?,
         rt_const_true: declare_rt(module, "rt_const_true", &[], ptr)?,
         rt_const_false: declare_rt(module, "rt_const_false", &[], ptr)?,

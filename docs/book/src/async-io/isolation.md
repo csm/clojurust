@@ -37,7 +37,7 @@ reproduce them bit-for-bit.
 
 | Clojure (JVM) | clojurust |
 |---|---|
-| `future` runs the body on **another OS thread**, sharing the heap | `future` is **loop-async** on the same isolate — concurrent, not parallel. Cross-core parallelism is a separate, explicit step. |
+| `future` runs the body on **another OS thread**, sharing the heap | `future` runs in a **fiber** on the same isolate — concurrent, not parallel. Cross-core parallelism is a separate, explicit step. |
 | `atom`, `ref`, and var roots are **globally shared** mutable cells any thread can see | `atom` is **isolate-local** and fast. Genuinely shared mutable state is a distinct primitive, [`shared-atom`](#shared-atom-cross-isolate-mutable-state). |
 | Passing a value to another thread shares a **pointer** — zero copy, but also zero isolation | Passing a value to another isolate **deep-copies** it. The two sides are fully independent afterward. |
 | Any value (closures, refs, mutable objects) can be handed to another thread | Only **plain, immutable, acyclic data** can cross an isolate boundary; everything else is rejected at the send site. |
@@ -109,8 +109,8 @@ in source.
 
 | Operation | Meaning |
 |---|---|
-| `(isolate-chan)` | create a channel, returning `[tx rx]`. `tx` is multi-producer (cloneable); `rx` is single-consumer. |
-| `(isolate-put! tx v)` | deep-copy `v` across the boundary and enqueue it. `true` on success, `false` if the receiver is gone, **throws** if `v` can't cross. |
+| `(isolate-chan)` / `(isolate-chan limit-bytes)` | create a channel, returning `[tx rx]`. `tx` is multi-producer (cloneable); `rx` is single-consumer. The channel holds at most `limit-bytes` of queued messages (default: `CLJRS_ISOLATE_QUEUE_LIMIT_MB`, 64 MiB at most). |
+| `(isolate-put! tx v)` | deep-copy `v` across the boundary and enqueue it. `true` on success, `false` if the receiver is gone, **throws** if `v` can't cross or the channel is full. |
 | `(isolate-poll! rx)` | non-blocking take: the next value (copied into *this* isolate's heap), or `nil` if empty/closed. |
 | `(isolate-take! rx)` | a `Future` resolving to the next value, or `nil` once closed and drained. Use with `await` in a `go`/`^:async` body. |
 

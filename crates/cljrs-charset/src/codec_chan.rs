@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use cljrs_async::{
     channel::{chan_put as put, chan_ref, chan_take, make_chan},
-    spawn_future,
+    spawn_future_with_roots,
 };
 use cljrs_gc::GcPtr;
 use cljrs_runtime::env::env::GlobalEnv;
@@ -110,7 +110,8 @@ fn builtin_decode_chan(args: &[Value]) -> ValueResult<Value> {
     let out_ch = make_chan(cap);
     let out_val = Value::NativeObject(out_ch.clone());
 
-    spawn_future(async move {
+    let captures = vec![Value::NativeObject(in_ch.clone()), out_val.clone()];
+    spawn_future_with_roots(captures, async move {
         let mut dec = encoding.new_decoder();
 
         'pump: loop {
@@ -176,7 +177,8 @@ fn builtin_encode_chan(args: &[Value]) -> ValueResult<Value> {
     let out_ch = make_chan(cap);
     let out_val = Value::NativeObject(out_ch.clone());
 
-    spawn_future(async move {
+    let captures = vec![Value::NativeObject(in_ch.clone()), out_val.clone()];
+    spawn_future_with_roots(captures, async move {
         let mut enc = encoding.new_encoder();
 
         'pump: loop {

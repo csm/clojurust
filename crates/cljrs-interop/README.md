@@ -14,6 +14,7 @@ registration helpers, Registry, `#[export]` proc-macro).
 ```
 src/
   lib.rs       — re-exports, crate entry point
+  blocking.rs  — typed native worker adapters used by the Clojure blocking form
   error.rs     — wrap_result: Rust Result → ValueResult<Value>
   exports.rs   — ExportEntry / ProvenanceEntry, inventory::collect!, register_exports,
                  register_provenance! macro
@@ -256,3 +257,62 @@ edge to a package, so one edge left at its defaults re-enables `regex-full` for
 the whole graph. `deps` has to be off as well for the size win to land, since
 `cljrs-project/vcs` pulls `regex` in through `pgp`. See
 [cljrs-value's README](../cljrs-value/README.md#features).
+
+## Blocking native exports
+
+The `blocking` attribute runs an exported Rust function on the blocking worker pool when a fiber calls it.
+Outside a fiber, the function runs directly.
+
+```rust
+#[cljrs_interop::export(ns = "files", blocking)]
+fn read_text(path: String) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
+}
+```
+
+The wrapper converts arguments before the worker starts. It converts the result back to a Clojure value on the isolate.
+Arguments and results must be owned, `Send`, and `'static`. This includes the error type of a `Result`.
+The compiler rejects `Value` parameters and results because managed values cannot cross threads.
+Variadic exports with `&[Value]` cannot use `blocking`.
+
+Rust callers can use `cljrs_interop::blocking(move || ...)` with the same ownership constraints.
+A worker panic becomes a fiber error at the fiber boundary.
+
+## Clojure blocking form
+
+Fixed-arity exports also provide an adapter for `(blocking & calls)` and `cljrs.fiber/blocking`.
+The `blocking` export attribute is optional for these calls.
+
+```rust
+#[cljrs_interop::export(ns = "host")]
+fn read_text(path: String) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
+}
+```
+
+```clojure
+(require '[cljrs.fiber :as fiber])
+(let [path "data.edn"]
+  (fiber/blocking (host/read-text path)))
+```
+
+Each body form must call a typed native function.
+Arguments can use ordinary Clojure expressions. Argument evaluation and `FromValue` conversion stay on the isolate.
+Only converted Rust inputs and outputs that implement `Send + 'static` enter the worker path.
+This requirement also applies to the error type in a `Result`.
+`IntoValue` conversion runs on the isolate after the wait.
+Worker panics become catchable Clojure errors.
+The calls run in order and return the last result. An empty form returns nil.
+
+Unsupported types remain valid for ordinary exports.
+A blocking call rejects them before the Rust body runs.
+This includes `Value` inputs or outputs, even for scalar values.
+Variadic `&[Value]` exports, Clojure closures, and registration helpers without an adapter are rejected.
+Rust embedders can provide explicit adapters with `NativeFn::with_blocking`.
+Outside a fiber, the call runs synchronously.
+Cancellation stops the wait without interrupting an active host operation.
+
+The hidden `blocking::BlockingCall<A, F, C>` and `BlockingDispatch` types support generated code.
+`BlockingCall::new(name, args, job, convert)` keeps the conversion callback on the isolate.
+The worker implementation requires `A`, the native job, and its output to implement `Send + 'static`.
+A fallback implementation reports an unsupported call without running the job.

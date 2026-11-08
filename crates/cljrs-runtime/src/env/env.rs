@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::env::async_hook::AsyncRuntime;
 
@@ -84,12 +84,15 @@ pub struct GlobalEnv {
     pub source_paths: RwLock<Vec<std::path::PathBuf>>,
     /// Namespaces that have been fully loaded from a file (idempotent guard).
     pub loaded: Mutex<std::collections::HashSet<Arc<str>>>,
-    /// Namespaces currently being loaded, mapped to the thread loading them.
-    /// Used to detect true circular requires (same thread) vs concurrent loads
-    /// (different thread — those wait on `loading_done` instead of erroring).
-    pub loading: Mutex<HashMap<Arc<str>, std::thread::ThreadId>>,
-    /// Signalled whenever a namespace finishes loading (or fails).
-    pub loading_done: Condvar,
+    /// Namespaces currently being loaded, mapped to the computation (thread +
+    /// fiber, see [`cljrs_value::types::Realizer`]) loading them.  Used to
+    /// detect true circular requires (same computation) vs concurrent loads
+    /// (another thread or another fiber — those wait on `loading_done`
+    /// instead of erroring).
+    pub loading: Mutex<HashMap<Arc<str>, cljrs_value::types::Realizer>>,
+    /// Signalled whenever a namespace finishes loading (or fails).  A
+    /// parking event: a waiting fiber parks, a plain thread blocks.
+    pub loading_done: cljrs_value::parking::Event,
     /// Built-in namespace sources embedded in the binary.
     /// Checked by `load_ns` before falling back to source-path search.
     pub builtin_sources: RwLock<HashMap<Arc<str>, &'static str>>,
@@ -230,7 +233,7 @@ impl GlobalEnv {
             source_paths: RwLock::new(Vec::new()),
             loaded: Mutex::new(std::collections::HashSet::new()),
             loading: Mutex::new(HashMap::new()),
-            loading_done: Condvar::new(),
+            loading_done: cljrs_value::parking::Event::default(),
             builtin_sources: RwLock::new(HashMap::new()),
             gc_config: RwLock::new(None),
             execution_mode,
@@ -360,7 +363,11 @@ impl GlobalEnv {
         if let Some(ns) = map.get(name) {
             return ns.clone();
         }
-        let ns = GcPtr::new(Namespace::new(name));
+        let ns = {
+            #[cfg(feature = "no-gc")]
+            let _static = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            GcPtr::new(Namespace::new(name))
+        };
         map.insert(Arc::from(name), ns.clone());
         ns
     }
@@ -374,7 +381,11 @@ impl GlobalEnv {
             var.get().bind(val);
             return var.clone();
         }
-        let var = GcPtr::new(Var::new(ns_name, name.as_ref()));
+        let var = {
+            #[cfg(feature = "no-gc")]
+            let _static = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            GcPtr::new(Var::new(ns_name, name.as_ref()))
+        };
         var.get().bind(val);
         interns.insert(name, var.clone());
         var
@@ -1094,6 +1105,23 @@ impl Env {
 
     pub fn pop_frame(&mut self) {
         self.frames.pop();
+    }
+
+    // Keep lexical frames balanced across errors and realization unwinds.
+    pub(crate) fn with_frame<T>(&mut self, body: impl FnOnce(&mut Env) -> T) -> T {
+        struct Scope<'a> {
+            env: &'a mut Env,
+            depth: usize,
+        }
+        impl Drop for Scope<'_> {
+            fn drop(&mut self) {
+                self.env.frames.truncate(self.depth);
+            }
+        }
+        let depth = self.frames.len();
+        self.push_frame();
+        let scope = Scope { env: self, depth };
+        body(scope.env)
     }
 
     /// Bind `name` to `val` in the top frame.

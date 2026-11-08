@@ -5,7 +5,9 @@
 
 use std::ptr::NonNull;
 
+pub mod fiber;
 pub mod governor;
+pub mod mutator;
 pub mod region;
 pub mod stats;
 
@@ -20,9 +22,10 @@ pub mod alloc_ctx;
 pub mod static_arena;
 
 pub use governor::{
-    IsolateAccount, IsolateControl, MemoryCharge, MemoryClass, MemoryConfig, MemoryConfigError,
-    MemoryLimitExceeded, MemorySnapshot, PressureLevel, ProcessMemoryGovernor, governor,
-    register_current_isolate,
+    Admission, CriticalSection, IsolateAccount, IsolateControl, MemoryCharge, MemoryClass,
+    MemoryConfig, MemoryConfigError, MemoryLimitExceeded, MemorySnapshot, PressureLevel,
+    ProcessMemoryGovernor, ShedHookId, enter_critical, governor, register_current_isolate,
+    resolve_runtime_fault, with_critical,
 };
 pub use stats::{
     CLJRS_GC_STATS_ENV, GC_STATS, GcStats, GcStatsSnapshot, dump_stats_from_env,
@@ -75,6 +78,17 @@ pub fn is_static_addr(addr: usize) -> bool {
 /// - Do NOT cross `GcPtr` boundaries — each pointed-to box is counted
 ///   separately when it is allocated.
 pub trait Trace {
+    /// Initialize independent no-GC ownership slots after allocation.
+    #[cfg(feature = "no-gc")]
+    fn init_ownership(&self) {}
+
+    /// Whether this object's managed child references never change after allocation.
+    /// No-GC publication can cache their ownership after its first graph walk.
+    #[cfg(feature = "no-gc")]
+    fn immutable_children(&self) -> bool {
+        false
+    }
+
     fn trace(&self, visitor: &mut MarkVisitor);
 
     fn gc_size_extra(&self) -> usize {
@@ -228,8 +242,29 @@ pub use self::nogc_box::GcBox;
 mod nogc_box {
     use crate::Trace;
 
+    pub(crate) const RELOCATED: u64 = 1 << 63;
+    pub(crate) const OWNED: u64 = 1 << 62;
+    pub(crate) const ID_MASK: u64 = OWNED - 1;
+    static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     pub struct GcBox<T: Trace + 'static> {
         pub value: T,
+        pub(crate) identity: std::sync::atomic::AtomicU64,
+    }
+    impl<T: Trace + 'static> GcBox<T> {
+        pub(crate) fn new(value: T) -> Self {
+            Self {
+                value,
+                identity: std::sync::atomic::AtomicU64::new(
+                    NEXT_IDENTITY
+                        .fetch_update(
+                            std::sync::atomic::Ordering::Relaxed,
+                            std::sync::atomic::Ordering::Relaxed,
+                            |id| (id < ID_MASK).then_some(id + 1),
+                        )
+                        .expect("managed identity space exhausted"),
+                ),
+            }
+        }
     }
 }
 
@@ -244,7 +279,37 @@ pub struct MarkVisitor {
 }
 
 #[cfg(feature = "no-gc")]
-pub struct MarkVisitor;
+#[derive(Default)]
+pub struct MarkVisitor {
+    retaining: Option<std::collections::HashSet<usize>>,
+    collecting: Option<region::RegionLease>,
+    pending: Vec<PendingTrace>,
+    destination: Option<region::AllocationOwner>,
+    completed: Vec<*const std::sync::atomic::AtomicU64>,
+}
+
+/// Retain only regions reached by a published value in no-gc mode.
+#[cfg(feature = "no-gc")]
+pub fn retain_regions_for(value: &impl Trace) {
+    let mut visitor = MarkVisitor {
+        retaining: Some(Default::default()),
+        ..Default::default()
+    };
+    value.trace(&mut visitor);
+    visitor.drain_owned();
+}
+
+#[cfg(feature = "no-gc")]
+fn leases_for(value: &impl Trace) -> region::RegionLease {
+    let mut visitor = MarkVisitor {
+        retaining: Some(Default::default()),
+        collecting: Some(Default::default()),
+        ..Default::default()
+    };
+    value.trace(&mut visitor);
+    visitor.drain_owned();
+    visitor.collecting.take().unwrap()
+}
 
 #[cfg(not(feature = "no-gc"))]
 impl MarkVisitor {
@@ -308,8 +373,71 @@ impl MarkVisitor {
 }
 
 #[cfg(feature = "no-gc")]
+struct PendingTrace {
+    pointer: *const u8,
+    trace: unsafe fn(*const u8, &mut MarkVisitor),
+    destination: Option<region::AllocationOwner>,
+}
+#[cfg(feature = "no-gc")]
+impl MarkVisitor {
+    fn drain_owned(&mut self) {
+        while let Some(pending) = self.pending.pop() {
+            self.destination = pending.destination;
+            // SAFETY: the collected lease and the producer's scope keep queued objects live.
+            unsafe { (pending.trace)(pending.pointer, self) };
+        }
+        for identity in self.completed.drain(..) {
+            // Commit only after the complete graph walk succeeds.
+            unsafe { &*identity }.fetch_or(nogc_box::OWNED, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+#[cfg(feature = "no-gc")]
 impl GcVisitor for MarkVisitor {
-    fn visit<T: Trace + 'static>(&mut self, _: &GcPtr<T>) {}
+    fn visit<T: Trace + 'static>(&mut self, ptr: &GcPtr<T>) {
+        if self.retaining.is_none() {
+            return;
+        }
+        let address = ptr.0.as_ptr() as usize;
+        let source = region::RegionLease::for_address(address);
+        if let Some(destination) = &self.destination {
+            destination.adopt(&source);
+        }
+        if let Some(lease) = &mut self.collecting {
+            lease.extend(&source);
+        } else {
+            region::retain_containing(address);
+        }
+        if !self.retaining.as_mut().unwrap().insert(address) {
+            return;
+        }
+        let immutable = ptr.get().immutable_children();
+        if immutable
+            && unsafe {
+                (*ptr.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    & nogc_box::OWNED
+                    != 0
+            }
+        {
+            return;
+        }
+        unsafe fn trace<T: Trace + 'static>(raw: *const u8, visitor: &mut MarkVisitor) {
+            unsafe { &*(raw as *const T) }.trace(visitor);
+        }
+        let destination = if immutable {
+            self.completed.push(unsafe { &(*ptr.raw()).identity });
+            Some(region::AllocationOwner::for_address(address))
+        } else {
+            self.destination.clone()
+        };
+        self.pending.push(PendingTrace {
+            pointer: ptr.get() as *const T as *const u8,
+            trace: trace::<T>,
+            destination,
+        });
+    }
 }
 
 // =============================================================================
@@ -329,7 +457,57 @@ pub struct GcPtr<T: Trace + 'static>(NonNull<GcBox<T>>);
 #[cfg(not(feature = "no-gc"))]
 pub(crate) const REGION_PTR_TAG: usize = 1;
 
+/// A governed allocation the process governor refused.  Returns ownership of
+/// the value, so dropping the error releases whatever memory it owns.
+pub struct AllocError<T> {
+    value: T,
+    error: MemoryLimitExceeded,
+}
+
+impl<T> AllocError<T> {
+    /// The refusal.
+    pub fn error(&self) -> MemoryLimitExceeded {
+        self.error
+    }
+
+    /// Take back the value that was not allocated.
+    pub fn into_inner(self) -> T {
+        self.value
+    }
+
+    /// Split into the value and the refusal.
+    pub fn into_parts(self) -> (T, MemoryLimitExceeded) {
+        (self.value, self.error)
+    }
+}
+
+impl<T> std::fmt::Debug for AllocError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AllocError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> std::fmt::Display for AllocError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl<T> std::error::Error for AllocError<T> {}
+
+impl<T> From<AllocError<T>> for MemoryLimitExceeded {
+    fn from(e: AllocError<T>) -> Self {
+        e.error
+    }
+}
+
 impl<T: Trace + 'static> GcPtr<T> {
+    /// Allocate `value`.  Infallible: in strict mode a refused allocation
+    /// uses the critical reserve and raises the thread's runtime fault,
+    /// which the next evaluation safepoint resolves (see
+    /// [`governor`](crate::governor) and [`Self::try_new`]).
     #[cfg(not(feature = "no-gc"))]
     pub fn new(value: T) -> Self {
         gc_full::HEAP.alloc(value)
@@ -338,6 +516,37 @@ impl<T: Trace + 'static> GcPtr<T> {
     #[cfg(feature = "no-gc")]
     pub fn new(value: T) -> Self {
         alloc_ctx::alloc_in_ctx(value)
+    }
+
+    /// Allocate `value`, or return it with the refusal if the process
+    /// governor cannot admit its bytes.  The governor is consulted before
+    /// the object exists; a refusal changes no counter.  Observe-only mode
+    /// never refuses.
+    ///
+    /// In `no-gc` builds the governor is asked only when the active region
+    /// or the static arena must add a chunk; an object that fits in memory
+    /// already charged is never refused.
+    pub fn try_new(value: T) -> Result<Self, AllocError<T>> {
+        #[cfg(not(feature = "no-gc"))]
+        {
+            let bytes = std::mem::size_of::<GcBox<T>>() + value.gc_size_extra();
+            match governor::try_reserve_current(bytes) {
+                Ok(()) => Ok(Self::new(value)),
+                Err(error) => Err(AllocError { value, error }),
+            }
+        }
+        #[cfg(feature = "no-gc")]
+        {
+            alloc_ctx::try_alloc_in_ctx(value)
+        }
+    }
+
+    /// Allocate `value` for runtime control work (error reporting, shutdown):
+    /// the allocation may use the critical reserve and never raises a
+    /// runtime fault.
+    pub fn new_critical(value: T) -> Self {
+        let _section = governor::enter_critical();
+        Self::new(value)
     }
 
     /// The untagged `GcBox<T>` address.  In GC builds this masks off the
@@ -389,6 +598,7 @@ impl<T: Trace + 'static> GcPtr<T> {
         unsafe { &(*self.raw()).value }
     }
 
+    #[cfg(not(feature = "no-gc"))]
     pub fn get_mut(&mut self) -> &mut T {
         #[cfg(all(debug_assertions, not(feature = "no-gc")))]
         {
@@ -404,18 +614,151 @@ impl<T: Trace + 'static> GcPtr<T> {
         unsafe { &mut (*self.raw()).value }
     }
 
+    /// Mutate an object and refresh its backing ownership when the guard drops.
+    #[cfg(feature = "no-gc")]
+    pub fn get_mut(&mut self) -> GcMut<'_, T> {
+        unsafe { &(*self.raw()).identity }
+            .fetch_and(!nogc_box::OWNED, std::sync::atomic::Ordering::Relaxed);
+        GcMut { pointer: self }
+    }
+
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0
     }
 
-    /// Return `true` if this pointer was allocated by the global `StaticArena`.
+    /// Compare logical object identity, including relocated immutable scalar boxes.
+    pub fn identity_eq(a: &Self, b: &Self) -> bool {
+        #[cfg(feature = "no-gc")]
+        {
+            unsafe {
+                (*a.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    & nogc_box::ID_MASK
+                    == (*b.raw())
+                        .identity
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        & nogc_box::ID_MASK
+            }
+        }
+        #[cfg(not(feature = "no-gc"))]
+        {
+            Self::ptr_eq(a, b)
+        }
+    }
+
+    /// Allocate a root in a separate region sized to its box.
+    /// The caller's scope owns the result; invocation and static destinations retain their rules.
+    pub fn new_isolated(value: T) -> Self {
+        #[cfg(feature = "no-gc")]
+        if !alloc_ctx::is_static_context() && !alloc_ctx::invocation_is_active() {
+            let mut scratch =
+                alloc_ctx::ScratchGuard::with_capacity(std::mem::size_of::<GcBox<T>>() + 32);
+            let pointer = Self::new(value);
+            let lease = region::RegionLease::for_address(pointer.raw() as usize);
+            region::AllocationOwner::for_address(pointer.raw() as usize)
+                .adopt(&region::RegionLease::for_value(pointer.get()));
+            scratch.pop_for_return();
+            lease.protect_current();
+            return pointer;
+        }
+        Self::new(value)
+    }
+
+    /// Relocate an immutable value while preserving its logical identity.
     ///
-    /// Only meaningful (and only compiled) in `no-gc` debug builds.  Used by
+    /// # Safety
+    /// `value` must represent the same immutable object, including the identities of its children.
+    #[cfg(feature = "no-gc")]
+    pub unsafe fn relocate_immutable(&self, value: T) -> Self {
+        let copy = Self::new(value);
+        unsafe {
+            (*copy.raw()).identity.store(
+                ((*self.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    & nogc_box::ID_MASK)
+                    | nogc_box::RELOCATED,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        copy
+    }
+
+    /// True if this immutable box was relocated for compact storage.
+    #[cfg(feature = "no-gc")]
+    pub fn is_relocated_immutable(&self) -> bool {
+        unsafe {
+            (*self.raw())
+                .identity
+                .load(std::sync::atomic::Ordering::Relaxed)
+                & nogc_box::RELOCATED
+                != 0
+        }
+    }
+
+    /// Copy an immutable scalar into the current allocation destination.
+    ///
+    /// # Safety
+    /// The pointee must be immutable, and its clone must represent the same
+    /// value without mutable state. Both allocations retain one logical identity.
+    #[cfg(feature = "no-gc")]
+    pub unsafe fn clone_immutable(&self) -> Self
+    where
+        T: Clone,
+    {
+        let copy = Self::new(self.get().clone());
+        unsafe {
+            (*copy.raw()).identity.store(
+                ((*self.raw())
+                    .identity
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    & nogc_box::ID_MASK)
+                    | nogc_box::RELOCATED,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        copy
+    }
+
+    /// Return `true` for static storage or a permanently retained backing scope.
+    ///
+    /// Available in no-gc builds for publication decisions and
     /// write-site assertions in `Atom::reset` / `Var::bind` to catch
     /// region-local values being stored in program-lifetime containers.
-    #[cfg(all(feature = "no-gc", debug_assertions))]
+    #[cfg(feature = "no-gc")]
     pub fn is_static_alloc(&self) -> bool {
-        alloc_ctx::invocation_is_active() || static_arena::is_static_addr(self.0.as_ptr() as usize)
+        alloc_ctx::invocation_is_active()
+            || static_arena::is_static_addr(self.0.as_ptr() as usize)
+            || region::is_permanent_address(self.0.as_ptr() as usize)
+    }
+}
+
+/// Mutable no-GC access that refreshes child ownership before releasing the borrow.
+#[cfg(feature = "no-gc")]
+pub struct GcMut<'a, T: Trace + 'static> {
+    pointer: &'a mut GcPtr<T>,
+}
+#[cfg(feature = "no-gc")]
+impl<T: Trace + 'static> std::ops::Deref for GcMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.pointer.get()
+    }
+}
+#[cfg(feature = "no-gc")]
+impl<T: Trace + 'static> std::ops::DerefMut for GcMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut (*self.pointer.raw()).value }
+    }
+}
+#[cfg(feature = "no-gc")]
+impl<T: Trace + 'static> Drop for GcMut<'_, T> {
+    fn drop(&mut self) {
+        if !alloc_ctx::invocation_is_active() {
+            region::AllocationOwner::for_address(self.pointer.raw() as usize)
+                .adopt(&region::RegionLease::for_value(self.pointer.get()));
+        }
     }
 }
 
@@ -487,13 +830,40 @@ impl<T: 'static + std::fmt::Debug> std::fmt::Debug for StaticGcPtr<T> {
 /// In `no-gc` builds the allocation comes from the global bump-allocated
 /// `StaticArena` (never freed, no GC header overhead).  In GC builds
 /// `Box::leak` is used instead — the memory lives until the process exits.
+/// Either way the governor records the bytes under `MemoryClass::Static`
+/// (arena chunks in `no-gc` builds; `size_of::<T>()` in GC builds).
 pub fn static_alloc<T: 'static>(value: T) -> StaticGcPtr<T> {
+    static_alloc_inner(value)
+}
+
+/// Fallible [`static_alloc`]: return the value with the refusal if the
+/// governor cannot admit it.  In `no-gc` builds the governor is asked only
+/// when the arena must add a chunk.
+pub fn try_static_alloc<T: 'static>(value: T) -> Result<StaticGcPtr<T>, AllocError<T>> {
+    #[cfg(not(feature = "no-gc"))]
+    {
+        match governor::governor()
+            .try_charge_permanent(governor::MemoryClass::Static, std::mem::size_of::<T>())
+        {
+            Ok(()) => Ok(StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))),
+            Err(error) => Err(AllocError { value, error }),
+        }
+    }
+    #[cfg(feature = "no-gc")]
+    {
+        static_arena::static_arena().try_alloc_val(value)
+    }
+}
+
+fn static_alloc_inner<T: 'static>(value: T) -> StaticGcPtr<T> {
     #[cfg(feature = "no-gc")]
     {
         static_arena::static_alloc_val(value)
     }
     #[cfg(not(feature = "no-gc"))]
     {
+        governor::governor()
+            .charge_permanent(governor::MemoryClass::Static, std::mem::size_of::<T>());
         StaticGcPtr(NonNull::from(Box::leak(Box::new(value))))
     }
 }
@@ -696,6 +1066,7 @@ mod gc_full {
         }
 
         pub fn collect<F: FnOnce(&mut MarkVisitor)>(&self, trace_roots: F) {
+            let _pause = crate::fiber::gc_pause();
             let pre_count = self.inner.lock().unwrap().count;
             let pre_memory = self.memory_in_use.load(Ordering::Relaxed);
             tracing::debug!(
@@ -707,6 +1078,7 @@ mod gc_full {
             let mark_start = std::time::Instant::now();
             let mut visitor = MarkVisitor::new();
             trace_roots(&mut visitor);
+            crate::mutator::trace_suspended(&mut visitor);
             // Active bump regions are additional roots: a live region object
             // may hold `GcPtr`s into the heap, and those heap objects must not
             // be collected while the region can still reach them.  The mark
@@ -730,6 +1102,9 @@ mod gc_full {
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();
             // Bytes of objects with lives==0 that will be freed now.
             let mut freed_bytes: usize = 0;
+            // Bytes of unreachable objects whose grace period ends with this
+            // cycle: the next collection frees them unless they are re-rooted.
+            let mut pending_bytes: usize = 0;
             let mut current = inner.head;
             while !current.is_null() {
                 let header = unsafe { &*current };
@@ -743,6 +1118,9 @@ mod gc_full {
                 } else if lives > 0 {
                     // In grace period (unreachable but not yet freed).
                     header.lives.set(lives - 1);
+                    if lives == 1 {
+                        pending_bytes += obj_size;
+                    }
                     live.push(current);
                 } else {
                     // Grace period exhausted — collect now.
@@ -777,6 +1155,7 @@ mod gc_full {
                     bytes_before: pre_memory,
                     bytes_after: post_memory,
                     bytes_returned: freed_bytes,
+                    bytes_pending: pending_bytes,
                     duration: mark_elapsed + sweep_elapsed,
                 });
             });
@@ -787,16 +1166,21 @@ mod gc_full {
             );
             tracing::debug!(
                 target: "gc",
-                "collection complete: freed {} (~{} bytes), {} remaining (~{} bytes), mark={:.2?} sweep={:.2?}",
+                "collection complete: freed {} (~{} bytes), {} remaining (~{} bytes, ~{} pending), mark={:.2?} sweep={:.2?}",
                 freed_count,
                 freed_bytes,
                 inner.count,
                 post_memory,
+                pending_bytes,
                 mark_elapsed,
                 sweep_elapsed
             );
-            if freed_count == 0 {
+            if freed_count == 0 && pending_bytes == 0 {
                 // Zero-yield collection: exponential-backoff suppression.
+                // Objects that only entered their grace period this cycle do
+                // not count as zero yield: the next collection frees them, and
+                // suppressing it would keep that garbage until the heap grows
+                // by another headroom.
                 // Each consecutive zero-yield cycle doubles the headroom before
                 // the next GC attempt (capped at soft_limit/4).  This prevents a
                 // GC storm during deep recursion where all objects are live —
@@ -924,14 +1308,31 @@ mod gc_full {
     thread_local! {
         pub(crate) static ALLOC_ROOTS: RefCell<Vec<*mut GcBoxHeader>> = const { RefCell::new(Vec::new()) };
     }
+    crate::mutator_slot!("cljrs-gc/ALLOC_ROOTS", refcell ALLOC_ROOTS: Vec<*mut GcBoxHeader>, trace trace_saved_alloc_roots);
+
+    fn trace_saved_alloc_roots(roots: &Vec<*mut GcBoxHeader>, visitor: &mut MarkVisitor) {
+        for &header in roots {
+            // SAFETY: the detached mutator owns the still-live allocation frame.
+            unsafe { visitor.mark_header(header) };
+        }
+    }
 
     pub struct AllocRootGuard {
         saved_len: usize,
     }
 
+    impl AllocRootGuard {
+        /// Unroot every allocation made since this frame was pushed, keeping
+        /// the frame open for further allocations.  Equivalent to dropping
+        /// the guard and pushing a new frame at the same depth.
+        pub fn release(&self) {
+            ALLOC_ROOTS.with(|roots| roots.borrow_mut().truncate(self.saved_len));
+        }
+    }
+
     impl Drop for AllocRootGuard {
         fn drop(&mut self) {
-            ALLOC_ROOTS.with(|roots| roots.borrow_mut().truncate(self.saved_len));
+            self.release();
         }
     }
 
@@ -1078,6 +1479,9 @@ mod nogc_stubs {
     pub fn wait_for_threads_to_park() {}
 
     pub struct AllocRootGuard;
+    impl AllocRootGuard {
+        pub fn release(&self) {}
+    }
     impl Drop for AllocRootGuard {
         fn drop(&mut self) {}
     }
@@ -1271,6 +1675,98 @@ mod tests {
 mod nogc_tests {
     use super::*;
     use alloc_ctx::{ScratchGuard, StaticCtxGuard};
+
+    #[test]
+    fn cached_parent_survives_a_child_mutation_into_another_scope() {
+        struct Node {
+            child: Option<GcPtr<Node>>,
+            label: String,
+        }
+        impl Trace for Node {
+            fn immutable_children(&self) -> bool {
+                true
+            }
+            fn trace(&self, visitor: &mut MarkVisitor) {
+                if let Some(child) = &self.child {
+                    visitor.visit(child);
+                }
+            }
+        }
+        struct Root(GcPtr<Node>);
+        impl Trace for Root {
+            fn trace(&self, visitor: &mut MarkVisitor) {
+                visitor.visit(&self.0);
+            }
+        }
+        let (parent, lease) = {
+            let _source = ScratchGuard::new();
+            let mut child = GcPtr::new(Node {
+                child: None,
+                label: "middle".into(),
+            });
+            let parent = GcPtr::new(Node {
+                child: Some(child.clone()),
+                label: "parent".into(),
+            });
+            let lease = region::RegionLease::for_value(&Root(parent.clone()));
+            {
+                let _new_source = ScratchGuard::new();
+                child.get_mut().child = Some(GcPtr::new(Node {
+                    child: None,
+                    label: "new".into(),
+                }));
+            }
+            // This stops at the cached parent. The child's mutation guard must
+            // have acquired the newly referenced region independently.
+            let cached = region::RegionLease::for_value(&Root(parent.clone()));
+            drop(lease);
+            (parent, cached)
+        };
+        assert_eq!(
+            parent
+                .get()
+                .child
+                .as_ref()
+                .unwrap()
+                .get()
+                .child
+                .as_ref()
+                .unwrap()
+                .get()
+                .label,
+            "new"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn invocation_caches_follow_their_mutator_and_expire_before_reuse() {
+        let first = alloc_ctx::InvocationGuard::new(4096);
+        alloc_ctx::invocation_cache_insert("test", "same".into(), 1);
+        let mut other = mutator::MutatorState::fresh();
+        other.swap_with_current();
+        {
+            let _second = alloc_ctx::InvocationGuard::new(4096);
+            assert!(alloc_ctx::invocation_cache_get("test", "same").is_none());
+            alloc_ctx::invocation_cache_insert("test", "same".into(), 2);
+        }
+        other.swap_with_current();
+        assert_eq!(alloc_ctx::invocation_cache_get("test", "same"), Some(1));
+        drop(first);
+        let _next = alloc_ctx::InvocationGuard::new(4096);
+        assert!(alloc_ctx::invocation_cache_get("test", "same").is_none());
+    }
+
+    #[test]
+    fn immutable_flags_do_not_grow_boxes_or_change_identity() {
+        assert_eq!(std::mem::size_of::<GcBox<i64>>(), 16);
+        let _source = ScratchGuard::new();
+        let original = GcPtr::new(String::from("compact"));
+        let copy = unsafe { original.clone_immutable() };
+        assert!(copy.is_relocated_immutable());
+        assert!(!original.is_relocated_immutable());
+        assert!(GcPtr::identity_eq(&original, &copy));
+    }
 
     #[test]
     fn alloc_in_static_context() {

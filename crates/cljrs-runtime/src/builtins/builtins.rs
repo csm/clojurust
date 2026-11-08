@@ -24,11 +24,12 @@ use crate::builtins::util::numeric_as_i64;
 use crate::env::env::GlobalEnv;
 use bigdecimal::{BigDecimal, RoundingMode};
 use cljrs_gc::GcPtr;
+use cljrs_value::parking::sleep;
 use cljrs_value::value::{PrintValue, SetValue};
 use cljrs_value::{
-    Arity, Atom, CljxCons, CljxFuture, CljxPromise, ExceptionInfo, FutureState, Keyword, LazySeq,
-    MapValue, MultiFn, Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet,
-    PersistentList, PersistentQueue, PersistentVector, ProtocolFn, SharedAtom, SortedSet, Symbol,
+    Arity, Atom, CljxCons, CljxPromise, ExceptionInfo, Keyword, LazySeq, MapValue, MultiFn,
+    Namespace, NativeFn, ObjectArray, PersistentHashMap, PersistentHashSet, PersistentList,
+    PersistentQueue, PersistentVector, PromoteError, ProtocolFn, SharedAtom, SortedSet, Symbol,
     Thunk, TypeInstance, Value, ValueError, ValueResult, Volatile, demote, promote,
 };
 use num_bigint::{BigInt, Sign, ToBigInt};
@@ -41,24 +42,32 @@ use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::thread::sleep;
 use std::time::Duration;
 // ── Output capture (for with-out-str) ─────────────────────────────────────────
 
 /// One entry of the capture stack: a buffer, plus an optional sink that
 /// receives the buffered text incrementally (streamed capture).
+#[derive(Default)]
 struct OutputCapture {
     buf: String,
     sink: Option<Box<dyn FnMut(&str)>>,
 }
+
+/// A capture-stack entry. Entries are shared handles so a fiber spawned
+/// inside a capture (`future`, `thread`, `go`, ...) can be handed the
+/// enclosing entries and print into the same buffer or streaming sink, the
+/// way the JVM conveys the `*out*` binding. All fibers of a scheduler run on
+/// one OS thread, so `Rc` suffices.
+type CaptureEntry = std::rc::Rc<std::cell::RefCell<OutputCapture>>;
 
 /// A streamed capture flushes once its buffer holds this many bytes, even
 /// without a newline.
 const STREAM_FLUSH_THRESHOLD: usize = 1024;
 
 thread_local! {
-    static OUTPUT_CAPTURE: std::cell::RefCell<Vec<OutputCapture>> = const { std::cell::RefCell::new(Vec::new()) };
+    static OUTPUT_CAPTURE: std::cell::RefCell<Vec<CaptureEntry>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/OUTPUT_CAPTURE", refcell OUTPUT_CAPTURE: Vec<CaptureEntry>);
 
 // BigDecimal precision
 
@@ -71,6 +80,10 @@ struct BigDecimalPrecision {
 thread_local! {
     static BIG_DECIMAL_SCALE: std::cell::RefCell<Vec<BigDecimalPrecision>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+cljrs_gc::mutator_slot!(
+    "cljrs-runtime/BIG_DECIMAL_SCALE",
+    refcell BIG_DECIMAL_SCALE: Vec<BigDecimalPrecision>
+);
 
 fn round_bigdecimal(result: BigDecimal, prec: &BigDecimalPrecision) -> ValueResult<BigDecimal> {
     let precision: u64 = prec.precision;
@@ -114,23 +127,17 @@ fn apply_precision_or_default(result: BigDecimal) -> ValueResult<BigDecimal> {
     })
 }
 
-/// Push a new capture buffer onto the stack.
-pub fn push_output_capture() {
+fn push_capture_entry(entry: OutputCapture) {
     OUTPUT_CAPTURE.with(|stack| {
-        stack.borrow_mut().push(OutputCapture {
-            buf: String::new(),
-            sink: None,
-        })
+        stack
+            .borrow_mut()
+            .push(std::rc::Rc::new(std::cell::RefCell::new(entry)))
     });
 }
 
-/// Push `buf` as the capture buffer, continuing a capture previously taken off
-/// the stack with [`pop_output_capture`]. The async evaluator uses this to keep
-/// a `with-out-str` buffer installed only while its own task is being polled.
-/// Only the plain (non-streamed) capture it pushed round-trips this way; a
-/// streamed capture below it on the stack is never popped by that evaluator.
-pub fn resume_output_capture(buf: String) {
-    OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().push(OutputCapture { buf, sink: None }));
+/// Push a new capture buffer onto the stack.
+pub fn push_output_capture() {
+    push_capture_entry(OutputCapture::default());
 }
 
 /// Push a *streamed* capture: output written while it is the top of the
@@ -138,12 +145,14 @@ pub fn resume_output_capture(buf: String) {
 /// [`STREAM_FLUSH_THRESHOLD`] bytes are pending, and when the capture is
 /// popped. A nested [`push_output_capture`] (e.g. `with-out-str`) still
 /// captures its own output without streaming it.
+///
+/// Fibers spawned while the capture is active keep streaming into `sink`
+/// even after it is popped here, as JVM output written to a conveyed `*out*`
+/// does; the sink is dropped once the last such fiber finishes.
 pub fn push_streaming_output_capture(sink: Box<dyn FnMut(&str)>) {
-    OUTPUT_CAPTURE.with(|stack| {
-        stack.borrow_mut().push(OutputCapture {
-            buf: String::new(),
-            sink: Some(sink),
-        })
+    push_capture_entry(OutputCapture {
+        buf: String::new(),
+        sink: Some(sink),
     });
 }
 
@@ -152,50 +161,109 @@ pub fn push_streaming_output_capture(sink: Box<dyn FnMut(&str)>) {
 /// string is empty.
 pub fn pop_output_capture() -> Option<String> {
     let top = OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().pop())?;
-    match top.sink {
-        None => Some(top.buf),
+    let (buf, sink) = {
+        let mut entry = top.borrow_mut();
+        let buf = std::mem::take(&mut entry.buf);
+        (buf, entry.sink.take())
+    };
+    match sink {
+        None => Some(buf),
         Some(mut sink) => {
-            if !top.buf.is_empty() {
-                sink(&top.buf);
+            if !buf.is_empty() {
+                sink(&buf);
+            }
+            // Leave the sink installed for fibers still holding this entry.
+            let mut entry = top.borrow_mut();
+            if entry.sink.is_none() {
+                entry.sink = Some(sink);
             }
             Some(String::new())
         }
     }
 }
 
+/// A capture entry taken off the stack by [`suspend_output_capture`], to be
+/// put back with [`SuspendedOutputCapture::resume`]. The entry keeps its
+/// identity, so fibers spawned while it was installed keep writing to it.
+pub struct SuspendedOutputCapture(CaptureEntry);
+
+impl SuspendedOutputCapture {
+    /// Push this entry back onto the current capture stack.
+    pub fn resume(&self) {
+        OUTPUT_CAPTURE.with(|stack| stack.borrow_mut().push(self.0.clone()));
+    }
+
+    /// Take the captured text, ending the capture.
+    pub fn finish(self) -> String {
+        std::mem::take(&mut self.0.borrow_mut().buf)
+    }
+}
+
+/// Take the top capture entry off the stack without draining it. The async
+/// evaluator uses this to keep a `with-out-str` capture installed only while
+/// its own task is being polled.
+pub fn suspend_output_capture() -> Option<SuspendedOutputCapture> {
+    OUTPUT_CAPTURE
+        .with(|stack| stack.borrow_mut().pop())
+        .map(SuspendedOutputCapture)
+}
+
+/// The current fiber's capture stack, shared rather than copied, for
+/// conveying to a newly spawned fiber (see [`ConveyedOutputCapture::install`]).
+pub struct ConveyedOutputCapture(Vec<CaptureEntry>);
+
+/// Snapshot the active capture stack so a child fiber's output lands in the
+/// same buffers and streaming sinks as the spawning fiber's.
+pub fn convey_output_capture() -> ConveyedOutputCapture {
+    ConveyedOutputCapture(OUTPUT_CAPTURE.with(|stack| stack.borrow().clone()))
+}
+
+impl ConveyedOutputCapture {
+    /// Install the conveyed entries beneath anything already on the current
+    /// fiber's capture stack (normally empty at fiber start).
+    pub fn install(self) {
+        OUTPUT_CAPTURE.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let mut entries = self.0;
+            entries.append(&mut stack);
+            *stack = entries;
+        });
+    }
+}
+
 /// Write to the current capture buffer if active, otherwise to stdout.
 /// Returns true if captured, false if written to stdout.
 fn capture_or_print(s: &str) -> bool {
-    // Take any chunk due for a streamed flush out of the stack, and call the
-    // sink with the stack unborrowed (the sink may run arbitrary code).
-    let due = OUTPUT_CAPTURE.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        let top = stack.last_mut()?;
-        top.buf.push_str(s);
-        top.sink.as_ref()?;
-        let cut = if top.buf.len() >= STREAM_FLUSH_THRESHOLD {
-            top.buf.len()
-        } else {
-            top.buf.rfind('\n').map(|i| i + 1)?
-        };
-        let rest = top.buf.split_off(cut);
-        let chunk = std::mem::replace(&mut top.buf, rest);
-        // Borrow the sink out while it runs.
-        let depth = stack.len();
-        let top = stack.last_mut()?;
-        top.sink.take().map(|sink| (chunk, sink, depth))
-    });
-    let Some((chunk, mut sink, depth)) = due else {
-        return OUTPUT_CAPTURE.with(|stack| !stack.borrow().is_empty());
+    let Some(top) = OUTPUT_CAPTURE.with(|stack| stack.borrow().last().cloned()) else {
+        return false;
     };
-    sink(&chunk);
-    OUTPUT_CAPTURE.with(|stack| {
-        if let Some(entry) = stack.borrow_mut().get_mut(depth - 1)
-            && entry.sink.is_none()
-        {
+    // Take any chunk due for a streamed flush out of the entry, and call the
+    // sink with the entry unborrowed (the sink may run arbitrary code).
+    let due = {
+        let mut entry = top.borrow_mut();
+        entry.buf.push_str(s);
+        if entry.sink.is_none() {
+            None
+        } else {
+            let cut = if entry.buf.len() >= STREAM_FLUSH_THRESHOLD {
+                Some(entry.buf.len())
+            } else {
+                entry.buf.rfind('\n').map(|i| i + 1)
+            };
+            cut.and_then(|cut| {
+                let rest = entry.buf.split_off(cut);
+                let chunk = std::mem::replace(&mut entry.buf, rest);
+                entry.sink.take().map(|sink| (chunk, sink))
+            })
+        }
+    };
+    if let Some((chunk, mut sink)) = due {
+        sink(&chunk);
+        let mut entry = top.borrow_mut();
+        if entry.sink.is_none() {
             entry.sink = Some(sink);
         }
-    });
+    }
     true
 }
 
@@ -1411,8 +1479,15 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("ensure-reduced", Arity::Fixed(1), builtin_ensure_reduced),
         ("promise", Arity::Fixed(0), builtin_promise),
         ("deliver", Arity::Fixed(2), builtin_deliver),
-        // future/agent: not yet implemented — omitted from namespace
-        // future-done?, future-cancelled?, future-cancel, future-call* are stubs
+        ("future-call", Arity::Fixed(1), builtin_future_call),
+        ("future?", Arity::Fixed(1), builtin_future_q),
+        ("future-done?", Arity::Fixed(1), builtin_future_done_q),
+        (
+            "future-cancelled?",
+            Arity::Fixed(1),
+            builtin_future_cancelled_q,
+        ),
+        ("future-cancel", Arity::Fixed(1), builtin_future_cancel),
         // agent, await-agent, agent-error, restart-agent are stubs
         ("send", Arity::Variadic { min: 2 }, builtin_send_sentinel),
         (
@@ -1689,6 +1764,14 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("random-uuid", Arity::Fixed(0), builtin_random_uuid),
         // special builtins for clojurust
         ("sleep", Arity::Fixed(1), builtin_sleep),
+        ("locking-call", Arity::Fixed(2), builtin_locking_call),
+        (
+            "blocking-call",
+            Arity::Variadic { min: 1 },
+            builtin_blocking_call,
+        ),
+        ("monitor-enter", Arity::Fixed(1), builtin_monitor_enter),
+        ("monitor-exit", Arity::Fixed(1), builtin_monitor_exit),
         // Transients
         ("transient", Arity::Fixed(1), builtin_transient),
         ("persistent!", Arity::Fixed(1), builtin_persistent_bang),
@@ -1750,7 +1833,8 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("eval", Arity::Fixed(1), builtin_eval_sentinel),
     ];
 
-    intern_builtins(globals, ns, fns, BUILTIN_DOCS);
+    let docs = [BUILTIN_DOCS, EXPERIMENTAL_DOCS].concat();
+    intern_builtins(globals, ns, fns, &docs);
 
     // Math constants.
     globals.intern(
@@ -1781,12 +1865,7 @@ fn intern_builtins(
     }
 }
 
-/// The namespace experimental APIs live in.
-///
-/// Deliberately not referred into `user` and not part of `clojure.core`:
-/// everything here is reachable only by an explicit `require`, so
-/// `(when-var-exists future ...)` and similar feature probes see the same
-/// absence a JVM-less runtime would report.
+/// Compatibility namespace for the original experimental future APIs.
 pub const EXPERIMENTAL_NS: &str = "cljrs.core.experimental";
 
 /// Doc meta for the experimental builtins, kept separate from `BUILTIN_DOCS`
@@ -1794,7 +1873,7 @@ pub const EXPERIMENTAL_NS: &str = "cljrs.core.experimental";
 const EXPERIMENTAL_DOCS: &[(&str, &str)] = &[
     (
         "future-call",
-        "Runs a zero-arg fn as a task on this isolate's executor and returns a future. Read it with (await f) from an ^:async fn: (deref f) blocks the one thread the task needs in order to finish.",
+        "Runs a zero-arg fn as a task on this isolate's executor and returns a future. Dereferencing parks a calling fiber. Dynamic bindings are conveyed; execution is concurrent on one isolate.",
     ),
     ("future?", "Returns true if x is a future."),
     ("future-done?", "Returns true if the future has settled."),
@@ -1810,9 +1889,7 @@ const EXPERIMENTAL_DOCS: &[(&str, &str)] = &[
 
 /// Register the experimental native builtins into `ns` (see [`EXPERIMENTAL_NS`]).
 ///
-/// The future family lives here rather than in `clojure.core` because it cannot
-/// honour `clojure.core/future`'s contract on this runtime — see the crate
-/// README's "Experimental namespace" section.
+/// These names remain available alongside the core future family.
 pub fn register_experimental(globals: &Arc<GlobalEnv>, ns: &str) {
     let fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)> = vec![
         // futures — the executor comes from the installed async runtime
@@ -1843,7 +1920,7 @@ pub const EXPERIMENTAL_SOURCE: &str = include_str!("experimental.cljrs");
 /// on first access, which is fine since they are already fully in memory.
 struct ValueIter {
     current: Value,
-    error: Option<String>,
+    error: Option<ValueError>,
 }
 
 impl ValueIter {
@@ -1855,7 +1932,7 @@ impl ValueIter {
     }
 
     /// Check if an error occurred during iteration.
-    fn take_error(&mut self) -> Option<String> {
+    fn take_error(&mut self) -> Option<ValueError> {
         self.error.take()
     }
 }
@@ -1875,11 +1952,20 @@ impl Iterator for ValueIter {
                     // Root self.current so the LazySeq (and the entire chain
                     // it's part of) survives any GC triggered during realize().
                     let _current_root = crate::env::gc_roots::root_value(&self.current);
-                    self.current = ls.get().realize();
-                    if let Some(err) = ls.get().error() {
-                        self.error = Some(err);
-                        self.current = Value::Nil;
-                        return None;
+                    match ls.get().try_realize() {
+                        Ok(value) => self.current = value,
+                        // Not every consumer calls `take_error`; ending the
+                        // iteration would hand a truncated result to code in
+                        // a cancelled fiber. Continue as the cancellation
+                        // unwind, which the enclosing NativeFn boundary (or
+                        // `value_to_seq`, for the evaluator) turns back into
+                        // the typed error.
+                        Err(ValueError::Cancelled) => cljrs_value::parking::resume_cancelled(),
+                        Err(error) => {
+                            self.error = Some(error);
+                            self.current = Value::Nil;
+                            return None;
+                        }
                     }
                 }
                 Value::Cons(c) => {
@@ -2039,12 +2125,17 @@ pub(crate) fn value_to_seq(v: &Value) -> ValueResult<Vec<Value>> {
         | Value::DoubleArray(_)
         | Value::Str(_)
         | Value::TypeInstance(_) => {
-            let mut iter = ValueIter::new(v.clone());
-            let result: Vec<Value> = iter.by_ref().collect();
-            if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
-            }
-            Ok(result)
+            // The evaluator calls this directly (`apply`), outside any
+            // NativeFn boundary, so catch the iterator's cancellation unwind
+            // here: callers get a typed error and `finally` still runs.
+            cljrs_value::parking::catch_cancelled(|| {
+                let mut iter = ValueIter::new(v.clone());
+                let result: Vec<Value> = iter.by_ref().collect();
+                match iter.take_error() {
+                    Some(err) => Err(err),
+                    None => Ok(result),
+                }
+            })?
         }
         Value::Nil => Ok(Vec::new()),
         _ => Err(ValueError::WrongType {
@@ -3135,59 +3226,7 @@ fn builtin_gte(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn builtin_identical(args: &[Value]) -> ValueResult<Value> {
-    macro_rules! peq {
-        ($a:expr, $b:expr) => {
-            GcPtr::ptr_eq($a, $b)
-        };
-    }
-    let same = match (&args[0], &args[1]) {
-        (Value::Nil, Value::Nil) => true,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
-        (Value::Char(a), Value::Char(b)) => a == b,
-        (Value::Uuid(a), Value::Uuid(b)) => peq!(a, b),
-        (Value::BigInt(a), Value::BigInt(b)) => peq!(a, b),
-        (Value::BigDecimal(a), Value::BigDecimal(b)) => peq!(a, b),
-        (Value::Ratio(a), Value::Ratio(b)) => peq!(a, b),
-        (Value::Str(a), Value::Str(b)) => peq!(a, b),
-        (Value::Symbol(a), Value::Symbol(b)) => peq!(a, b),
-        (Value::Keyword(a), Value::Keyword(b)) => a.get() == b.get(),
-        (Value::List(a), Value::List(b)) => peq!(a, b),
-        (Value::Vector(a), Value::Vector(b)) => peq!(a, b),
-        (Value::Map(a), Value::Map(b)) => match (a, b) {
-            (MapValue::Array(a), MapValue::Array(b)) => peq!(a, b),
-            (MapValue::Hash(a), MapValue::Hash(b)) => peq!(a, b),
-            (MapValue::Sorted(a), MapValue::Sorted(b)) => peq!(a, b),
-            _ => false,
-        },
-        (Value::Set(a), Value::Set(b)) => match (a, b) {
-            (SetValue::Hash(a), SetValue::Hash(b)) => peq!(a, b),
-            (SetValue::Sorted(a), SetValue::Sorted(b)) => peq!(a, b),
-            _ => false,
-        },
-        (Value::Queue(a), Value::Queue(b)) => peq!(a, b),
-        (Value::NativeFunction(a), Value::NativeFunction(b)) => peq!(a, b),
-        (Value::Fn(a), Value::Fn(b)) => peq!(a, b),
-        (Value::Macro(a), Value::Macro(b)) => peq!(a, b),
-        (Value::Var(a), Value::Var(b)) => peq!(a, b),
-        (Value::Atom(a), Value::Atom(b)) => peq!(a, b),
-        (Value::Namespace(a), Value::Namespace(b)) => peq!(a, b),
-        (Value::LazySeq(a), Value::LazySeq(b)) => peq!(a, b),
-        (Value::Cons(a), Value::Cons(b)) => peq!(a, b),
-        (Value::Protocol(a), Value::Protocol(b)) => peq!(a, b),
-        (Value::ProtocolFn(a), Value::ProtocolFn(b)) => peq!(a, b),
-        (Value::MultiFn(a), Value::MultiFn(b)) => peq!(a, b),
-        (Value::Volatile(a), Value::Volatile(b)) => peq!(a, b),
-        (Value::Delay(a), Value::Delay(b)) => peq!(a, b),
-        (Value::Promise(a), Value::Promise(b)) => peq!(a, b),
-        (Value::Future(a), Value::Future(b)) => peq!(a, b),
-        (Value::Agent(a), Value::Agent(b)) => peq!(a, b),
-        (Value::TypeInstance(a), Value::TypeInstance(b)) => peq!(a, b),
-        (Value::NativeObject(a), Value::NativeObject(b)) => peq!(a, b),
-        _ => false,
-    };
-    Ok(Value::Bool(same))
+    Ok(Value::Bool(args[0].identical(&args[1])))
 }
 
 fn builtin_compare(args: &[Value]) -> ValueResult<Value> {
@@ -3444,7 +3483,7 @@ fn builtin_empty_q(args: &[Value]) -> ValueResult<Value> {
         Value::DoubleArray(a) => a.get().lock().unwrap().is_empty(),
         Value::ObjectArray(a) => a.get().0.lock().unwrap().is_empty(),
         Value::LazySeq(s) => {
-            let realized = s.get().realize();
+            let realized = s.get().try_realize()?;
             return builtin_empty_q(&[realized]);
         }
         Value::Cons(c) => matches!(c.get().head, Value::Nil),
@@ -3552,7 +3591,7 @@ fn builtin_list_star(args: &[Value]) -> ValueResult<Value> {
     let mut iter = ValueIter::new(last.clone());
     items.extend(iter.by_ref());
     if let Some(err) = iter.take_error() {
-        return Err(ValueError::Other(err));
+        return Err(err);
     }
     Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
 }
@@ -3981,7 +4020,7 @@ fn builtin_count(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(v.clone());
             let n = iter.by_ref().count();
             if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
+                return Err(err);
             }
             return Ok(Value::Long(n as i64));
         }
@@ -4059,10 +4098,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
     // Iteratively unwrap lazy seqs to avoid stack overflow.
     let mut val = args[0].unwrap_meta().clone();
     while let Value::LazySeq(ls) = &val {
-        let realized = ls.get().realize();
-        if let Some(err) = ls.get().error() {
-            return Err(ValueError::Other(err));
-        }
+        let realized = ls.get().try_realize()?;
         val = realized;
     }
     match &val {
@@ -4209,10 +4245,7 @@ fn builtin_seq(args: &[Value]) -> ValueResult<Value> {
 fn builtin_first(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().realize();
-            if let Some(err) = ls.get().error() {
-                return Err(ValueError::Other(err));
-            }
+            let v = ls.get().try_realize()?;
             builtin_first(&[v])
         }
         Value::Cons(c) => Ok(c.get().head.clone()),
@@ -4252,10 +4285,7 @@ fn builtin_first(args: &[Value]) -> ValueResult<Value> {
 fn builtin_rest(args: &[Value]) -> ValueResult<Value> {
     match args[0].unwrap_meta() {
         Value::LazySeq(ls) => {
-            let v = ls.get().realize();
-            if let Some(err) = ls.get().error() {
-                return Err(ValueError::Other(err));
-            }
+            let v = ls.get().try_realize()?;
             builtin_rest(&[v])
         }
         Value::Cons(c) => {
@@ -4374,7 +4404,7 @@ fn builtin_nth(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(args[0].clone());
             let result = iter.nth(idx);
             if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
+                return Err(err);
             }
             nth_or_not_found(result, default.as_ref(), idx, idx + 1)
         }
@@ -4501,7 +4531,9 @@ fn builtin_concat(args: &[Value]) -> ValueResult<Value> {
 fn concat_lazy(colls: Vec<Value>) -> Value {
     // Even the zero-arity and all-empty cases are lazy in Clojure. The thunk
     // discovers emptiness when the result is first observed.
-    Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(ConcatThunk { colls }))))
+    Value::LazySeq(GcPtr::new_isolated(LazySeq::new(Box::new(ConcatThunk {
+        colls,
+    }))))
 }
 
 /// Thunk for lazy concat: holds remaining collections to iterate.
@@ -4519,7 +4551,7 @@ impl cljrs_gc::Trace for ConcatThunk {
 }
 
 impl Thunk for ConcatThunk {
-    fn force(&self) -> Result<Value, String> {
+    fn force(&self) -> cljrs_value::ValueResult<Value> {
         // Root the collections so they survive GC while we iterate.
         let _colls_root = crate::env::gc_roots::root_values(&self.colls);
         let mut colls = self.colls.clone();
@@ -4534,10 +4566,7 @@ impl Thunk for ConcatThunk {
             // Peel through any lazy-seq wrappers on the head iteratively.
             let mut head = colls[0].clone();
             while let Value::LazySeq(ls) = &head {
-                let realized = ls.get().realize();
-                if let Some(err) = ls.get().error() {
-                    return Err(err);
-                }
+                let realized = ls.get().try_realize()?;
                 head = realized;
             }
 
@@ -4554,7 +4583,7 @@ impl Thunk for ConcatThunk {
                 _ => {}
             }
 
-            let (first, rest) = concat_first_rest(&head);
+            let (first, rest) = concat_first_rest(&head)?;
             match first {
                 Some(f) => {
                     colls[0] = rest;
@@ -4576,15 +4605,15 @@ impl Thunk for ConcatThunk {
 /// Extract first element and rest from a seq-like value without fully realizing it.
 /// Used by the lazy concat implementation.  Iteratively unwraps LazySeq to
 /// avoid stack overflow on deeply nested lazy chains.
-fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
+fn concat_first_rest(val: &Value) -> ValueResult<(Option<Value>, Value)> {
     // Iteratively unwrap lazy seqs first.
     let mut current = val.clone();
     while let Value::LazySeq(ls) = current {
-        current = ls.get().realize();
+        current = ls.get().try_realize()?;
     }
     let val = &current;
 
-    match val {
+    Ok(match val {
         Value::Nil => (None, Value::Nil),
         Value::Cons(c) => {
             let c = c.get();
@@ -4660,7 +4689,7 @@ fn concat_first_rest(val: &Value) -> (Option<Value>, Value) {
             }
         }
         _ => (None, Value::Nil),
-    }
+    })
 }
 
 fn builtin_keys(args: &[Value]) -> ValueResult<Value> {
@@ -4795,17 +4824,17 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         for item in iter.by_ref() {
             acc = crate::env::callback::invoke(&xf_rf, vec![acc, item])?;
             if let Value::Reduced(inner) = acc {
-                acc = *inner;
+                acc = (*inner).clone();
                 break;
             }
         }
         if let Some(err) = iter.take_error() {
-            return Err(ValueError::Other(err));
+            return Err(err);
         }
         // Call completion arity
         acc = crate::env::callback::invoke(&xf_rf, vec![acc])?;
         if let Value::Reduced(inner) = acc {
-            acc = *inner;
+            acc = (*inner).clone();
         }
         return Ok(acc);
     }
@@ -4842,7 +4871,7 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         };
     }
     if let Some(err) = iter.take_error() {
-        return Err(ValueError::Other(err));
+        return Err(err);
     }
     Ok(match meta {
         Some(m) => result.with_meta(m),
@@ -4866,17 +4895,7 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
                 // empty coll: call (f) for init
                 return crate::env::callback::invoke(f, vec![]);
             };
-            let mut acc = first;
-            for item in iter.by_ref() {
-                acc = crate::env::callback::invoke(f, vec![acc, item])?;
-                if let Value::Reduced(inner) = acc {
-                    return Ok(*inner);
-                }
-            }
-            if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
-            }
-            Ok(acc)
+            reduce_from(f, first, &mut iter)
         }
         3 => {
             // (reduce f init coll)
@@ -4886,23 +4905,33 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
                     got: args[2].type_name().to_string(),
                 });
             }
-            let mut acc = args[1].clone();
             let mut iter = ValueIter::new(args[2].clone());
-            for item in iter.by_ref() {
-                acc = crate::env::callback::invoke(f, vec![acc, item])?;
-                if let Value::Reduced(inner) = acc {
-                    return Ok(*inner);
-                }
-            }
-            if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
-            }
-            Ok(acc)
+            reduce_from(f, args[1].clone(), &mut iter)
         }
         n => Err(ValueError::Other(format!(
             "reduce requires 2 or 3 args, got {n}"
         ))),
     }
+}
+
+/// Fold `iter` into `init` with `f`, stopping early on a `reduced` value.
+///
+/// The accumulator is held in a box rooted for the whole fold: advancing a
+/// lazy `iter` runs code with GC safepoints while nothing else refers to it.
+/// The box is never moved from, so the root always points at a live `Value`.
+fn reduce_from(f: &Value, init: Value, iter: &mut ValueIter) -> ValueResult<Value> {
+    let mut acc = Box::new(init);
+    let _acc_root = crate::env::gc_roots::root_value(&acc);
+    for item in iter.by_ref() {
+        *acc = crate::env::callback::invoke(f, vec![(*acc).clone(), item])?;
+        if let Value::Reduced(inner) = &*acc {
+            return Ok((**inner).clone());
+        }
+    }
+    if let Some(err) = iter.take_error() {
+        return Err(err);
+    }
+    Ok((*acc).clone())
 }
 
 fn builtin_empty(args: &[Value]) -> ValueResult<Value> {
@@ -4949,7 +4978,7 @@ fn builtin_vec(args: &[Value]) -> ValueResult<Value> {
             let mut iter = ValueIter::new(coll.clone());
             let v: Vec<Value> = iter.by_ref().collect();
             if let Some(err) = iter.take_error() {
-                return Err(ValueError::Other(err));
+                return Err(err);
             }
             let result = Value::Vector(GcPtr::new(PersistentVector::from_iter(v)));
             Ok(match meta {
@@ -5194,6 +5223,7 @@ fn builtin_aget(args: &[Value]) -> ValueResult<Value> {
         let idx = numeric_as_i64(idx_val)? as usize;
         current = match &current {
             Value::ObjectArray(a) => {
+                cljrs_value::publish::read_slot(a.get() as *const _ as usize, idx);
                 let g = a.get().0.lock().unwrap();
                 at(g.get(idx).cloned(), idx, g.len(), |v| v)?
             }
@@ -5248,6 +5278,12 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
     let newval = args[2].clone();
     match &args[0] {
         Value::ObjectArray(a) => {
+            let count = a.get().0.lock().unwrap().len();
+            if idx >= count {
+                return Err(ValueError::IndexOutOfBounds { idx, count });
+            }
+            let newval =
+                cljrs_value::publish::publish_for_slot(newval, a.get() as *const _ as usize, idx);
             let mut guard = a.get().0.lock().unwrap();
             if idx >= guard.len() {
                 return Err(ValueError::IndexOutOfBounds {
@@ -5256,6 +5292,8 @@ fn builtin_aset(args: &[Value]) -> ValueResult<Value> {
                 });
             }
             guard[idx] = newval.clone();
+            drop(guard);
+            cljrs_value::publish::read_slot(a.get() as *const _ as usize, idx);
             Ok(newval)
         }
         Value::IntArray(_) => builtin_aset_int(args),
@@ -5953,7 +5991,7 @@ fn builtin_zipmap(args: &[Value]) -> ValueResult<Value> {
 fn seq_first_rest(v: &Value) -> ValueResult<Option<(Value, Value)>> {
     match v {
         Value::Nil => Ok(None),
-        Value::LazySeq(ls) => seq_first_rest(&ls.get().realize()),
+        Value::LazySeq(ls) => seq_first_rest(&ls.get().try_realize()?),
         Value::Cons(c) => {
             let cell = c.get();
             Ok(Some((cell.head.clone(), cell.tail.clone())))
@@ -6165,7 +6203,7 @@ fn builtin_queue(args: &[Value]) -> ValueResult<Value> {
 fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
     // Actual option parsing (meta/validator) is handled in apply.rs handle_atom_call.
     // This fallback is only hit by direct Value-level calls (e.g. tests via apply).
-    Ok(Value::Atom(GcPtr::new(Atom::new(args[0].clone()))))
+    Ok(Value::Atom(GcPtr::new_isolated(Atom::new(args[0].clone()))))
 }
 
 // ── shared-atom (Phase B3, two-tier ADR) ──────────────────────────────────────
@@ -6178,8 +6216,9 @@ fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
 /// promoted immediately; non-promotable values (closures, native resources,
 /// isolate-bound collections) are rejected here rather than at first write.
 fn builtin_shared_atom(args: &[Value]) -> ValueResult<Value> {
-    let sv = promote(&args[0]).map_err(|e| ValueError::Other(e.to_string()))?;
-    Ok(Value::SharedAtom(std::sync::Arc::new(SharedAtom::new(sv))))
+    let sv = promote(&args[0]).map_err(PromoteError::into_value_error)?;
+    let atom = SharedAtom::try_new(sv).map_err(ValueError::MemoryLimitExceeded)?;
+    Ok(Value::SharedAtom(std::sync::Arc::new(atom)))
 }
 
 /// `(shared-atom? x)` — true iff `x` is a `shared-atom`.
@@ -6197,7 +6236,11 @@ fn builtin_get_validator(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
-fn add_watch_to(watches: &Mutex<Vec<(Value, Value)>>, key: Value, f: Value) {
+fn add_watch_to(
+    watches: &cljrs_gc::mutator::TrackedMutex<Vec<(Value, Value)>>,
+    key: Value,
+    f: Value,
+) {
     let mut ws = watches.lock().unwrap();
     if let Some(entry) = ws.iter_mut().find(|(k, _)| k == &key) {
         entry.1 = f;
@@ -6206,7 +6249,7 @@ fn add_watch_to(watches: &Mutex<Vec<(Value, Value)>>, key: Value, f: Value) {
     }
 }
 
-fn remove_watch_from(watches: &Mutex<Vec<(Value, Value)>>, key: &Value) {
+fn remove_watch_from(watches: &cljrs_gc::mutator::TrackedMutex<Vec<(Value, Value)>>, key: &Value) {
     watches.lock().unwrap().retain(|(k, _)| k != key);
 }
 
@@ -6214,8 +6257,8 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
     let key = args[1].clone();
     let f = args[2].clone();
     match &args[0] {
-        Value::Atom(a) => add_watch_to(&a.get().watches, key, f),
-        Value::Var(v) => add_watch_to(&v.get().watches, key, f),
+        Value::Atom(a) => a.get().add_watch(key, f),
+        Value::Var(v) => v.get().add_watch(key, f),
         Value::Agent(a) => add_watch_to(&a.get().watches, key, f),
         v => {
             return Err(ValueError::WrongType {
@@ -6230,8 +6273,8 @@ fn builtin_add_watch(args: &[Value]) -> ValueResult<Value> {
 fn builtin_remove_watch(args: &[Value]) -> ValueResult<Value> {
     let key = &args[1];
     match &args[0] {
-        Value::Atom(a) => remove_watch_from(&a.get().watches, key),
-        Value::Var(v) => remove_watch_from(&v.get().watches, key),
+        Value::Atom(a) => a.get().remove_watch(key),
+        Value::Var(v) => v.get().remove_watch(key),
         Value::Agent(a) => remove_watch_from(&a.get().watches, key),
         v => {
             return Err(ValueError::WrongType {
@@ -6249,121 +6292,34 @@ fn builtin_deref(args: &[Value]) -> ValueResult<Value> {
         Value::Atom(a) => Ok(a.get().deref()),
         Value::SharedAtom(sa) => Ok(demote(&sa.deref_val())),
         Value::Var(v) => Ok(v.get().deref().unwrap_or(Value::Nil)),
-        Value::Delay(d) => d.get().force().map_err(ValueError::Other),
+        Value::Delay(d) => d.get().force(),
         Value::Agent(a) => Ok(a.get().get_state()),
-        Value::Promise(p) => {
-            if with_timeout {
-                let timeout_ms = match &args[1] {
-                    Value::Long(n) => *n as u64,
+        Value::Promise(_) | Value::Future(_) => {
+            if matches!(&args[0], Value::Future(_))
+                && crate::env::callback::current_is_async()
+                && cljrs_value::parking::current().is_none()
+            {
+                return Err(ValueError::Other("deref on a future is not allowed inside an ^:async function; use (await ...) instead".into()));
+            }
+            let timeout = if with_timeout {
+                match &args[1] {
+                    Value::Long(n) => Some(Duration::from_millis((*n).max(0) as u64)),
                     v => {
                         return Err(ValueError::WrongType {
                             expected: "long (timeout-ms)",
                             got: v.type_name().to_string(),
                         });
                     }
-                };
-                let timeout_val = args[2].clone();
-                let guard = p.get().value.lock().unwrap();
-                if guard.is_some() {
-                    return Ok(guard.as_ref().unwrap().clone());
-                }
-                let (guard, _) = p
-                    .get()
-                    .cond
-                    .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                    .unwrap();
-                Ok(guard.as_ref().cloned().unwrap_or(timeout_val))
-            } else {
-                Ok(p.get().deref_blocking())
-            }
-        }
-        Value::Future(f) => {
-            // `deref` blocks the OS thread; inside an `^:async` function that
-            // would park the single LocalSet executor. Steer callers to `await`.
-            if crate::env::callback::current_is_async() {
-                return Err(ValueError::Other(
-                    "deref on a future is not allowed inside an ^:async function; use (await ...) instead".into(),
-                ));
-            }
-            if with_timeout {
-                let timeout_ms = match &args[1] {
-                    Value::Long(n) => *n as u64,
-                    v => {
-                        return Err(ValueError::WrongType {
-                            expected: "long (timeout-ms)",
-                            got: v.type_name().to_string(),
-                        });
-                    }
-                };
-                let timeout_val = args[2].clone();
-                let guard = f.get().state.lock().unwrap();
-                match &*guard {
-                    FutureState::Done(v) => {
-                        f.get().mark_observed();
-                        Ok(v.clone())
-                    }
-                    FutureState::Failed(v) => {
-                        f.get().mark_observed();
-                        Err(ValueError::Thrown(v.clone()))
-                    }
-                    FutureState::GasExhausted => {
-                        f.get().mark_observed();
-                        Err(ValueError::GasExhausted)
-                    }
-                    FutureState::Cancelled => {
-                        Err(ValueError::Thrown(CljxFuture::cancelled_error()))
-                    }
-                    FutureState::Running => {
-                        let (guard, _) = f
-                            .get()
-                            .cond
-                            .wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
-                            .unwrap();
-                        match &*guard {
-                            FutureState::Done(v) => {
-                                f.get().mark_observed();
-                                Ok(v.clone())
-                            }
-                            FutureState::Failed(v) => {
-                                f.get().mark_observed();
-                                Err(ValueError::Thrown(v.clone()))
-                            }
-                            FutureState::GasExhausted => {
-                                f.get().mark_observed();
-                                Err(ValueError::GasExhausted)
-                            }
-                            FutureState::Cancelled => {
-                                Err(ValueError::Thrown(CljxFuture::cancelled_error()))
-                            }
-                            FutureState::Running => Ok(timeout_val),
-                        }
-                    }
                 }
             } else {
-                let mut guard = f.get().state.lock().unwrap();
-                loop {
-                    match &*guard {
-                        FutureState::Done(v) => {
-                            f.get().mark_observed();
-                            return Ok(v.clone());
-                        }
-                        FutureState::Failed(v) => {
-                            f.get().mark_observed();
-                            return Err(ValueError::Thrown(v.clone()));
-                        }
-                        FutureState::GasExhausted => {
-                            f.get().mark_observed();
-                            return Err(ValueError::GasExhausted);
-                        }
-                        FutureState::Cancelled => {
-                            return Err(ValueError::Thrown(CljxFuture::cancelled_error()));
-                        }
-                        FutureState::Running => {
-                            guard = f.get().cond.wait(guard).unwrap();
-                        }
-                    }
-                }
-            }
+                None
+            };
+            let value = match &args[0] {
+                Value::Promise(p) => p.get().wait_value(timeout),
+                Value::Future(f) => f.get().wait_value(timeout)?,
+                _ => unreachable!(),
+            };
+            Ok(value.unwrap_or_else(|| args.get(2).cloned().unwrap_or(Value::Nil)))
         }
         Value::Volatile(v) => Ok(v.get().deref()),
         Value::Reduced(inner) => Ok((**inner).clone()),
@@ -6378,8 +6334,8 @@ fn builtin_reset_bang(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(a.get().reset(args[1].clone())),
         Value::SharedAtom(sa) => {
-            let sv = promote(&args[1]).map_err(|e| ValueError::Other(e.to_string()))?;
-            sa.reset(sv);
+            let sv = promote(&args[1]).map_err(PromoteError::into_value_error)?;
+            sa.try_reset(sv).map_err(ValueError::MemoryLimitExceeded)?;
             Ok(args[1].clone())
         }
         v => Err(ValueError::WrongType {
@@ -6501,7 +6457,8 @@ fn builtin_spit(args: &[Value]) -> ValueResult<Value> {
         Value::Str(s) => s.get().clone(),
         v => v.to_string(),
     };
-    std::fs::write(&path, &content).map_err(|e| ValueError::Other(e.to_string()))?;
+    cljrs_value::parking::blocking(move || std::fs::write(&path, &content))
+        .map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::Nil)
 }
 
@@ -6515,7 +6472,8 @@ fn builtin_slurp(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let content = std::fs::read_to_string(&path).map_err(|e| ValueError::Other(e.to_string()))?;
+    let content = cljrs_value::parking::blocking(move || std::fs::read_to_string(&path))
+        .map_err(|e| ValueError::Other(e.to_string()))?;
     Ok(Value::string(content))
 }
 
@@ -7743,6 +7701,8 @@ fn builtin_random_sample(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn value_compare_result(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
+    // Recurses through nested collections without reaching a safepoint.
+    cljrs_value::realization::check_stack();
     match (a, b) {
         (Value::Nil, Value::Nil) => Ok(std::cmp::Ordering::Equal),
         (Value::Nil, _) => Ok(std::cmp::Ordering::Less),
@@ -8230,9 +8190,19 @@ fn builtin_prefer_method(args: &[Value]) -> ValueResult<Value> {
     if !over_values.contains(&over) {
         over_values.push(over);
         drop(prefers);
+        let first = cljrs_value::publish::publish_for_named_slot(
+            args[1].clone(),
+            mf.get() as *const _ as usize,
+            format!("prefer:{}", args[1]),
+        );
+        let second = cljrs_value::publish::publish_for_named_slot(
+            args[2].clone(),
+            mf.get() as *const _ as usize,
+            format!("prefer:{}", args[2]),
+        );
         let mut preference_vals = mf.get().preference_vals.lock().unwrap();
-        preference_vals.insert(format!("{}", args[1]), args[1].clone());
-        preference_vals.insert(format!("{}", args[2]), args[2].clone());
+        preference_vals.insert(format!("{}", args[1]), first);
+        preference_vals.insert(format!("{}", args[2]), second);
         drop(preference_vals);
         mf.get().bump_method_generation();
     }
@@ -8250,8 +8220,18 @@ fn builtin_remove_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    let removed = mf.get().methods.lock().unwrap().remove(&key).is_some();
+    let removed = mf.get().remove_method(&key);
     mf.get().dispatch_vals.lock().unwrap().remove(&key);
+    cljrs_value::publish::publish_for_named_slot(
+        Value::Nil,
+        mf.get() as *const _ as usize,
+        format!("method:{key}"),
+    );
+    cljrs_value::publish::publish_for_named_slot(
+        Value::Nil,
+        mf.get() as *const _ as usize,
+        format!("dispatch:{key}"),
+    );
     if removed {
         mf.get().bump_method_generation();
     }
@@ -8278,7 +8258,10 @@ fn builtin_methods(args: &[Value]) -> ValueResult<Value> {
             .unwrap_or_else(|| Value::string(k.clone()));
         m = m.assoc(dispatch_val, v.clone());
     }
-    Ok(Value::Map(m))
+    let value = Value::Map(m);
+    #[cfg(feature = "no-gc")]
+    cljrs_gc::region::RegionLease::for_value(&value).protect_read();
+    Ok(value)
 }
 
 fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
@@ -8314,15 +8297,9 @@ fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Atom(a) => {
-            let mut guard = a.get().value.lock().unwrap();
-            if *guard == args[1] {
-                *guard = args[2].clone();
-                Ok(Value::Bool(true))
-            } else {
-                Ok(Value::Bool(false))
-            }
-        }
+        Value::Atom(a) => Ok(Value::Bool(
+            a.get().compare_and_set(&args[1], args[2].clone()),
+        )),
         Value::SharedAtom(sa) => {
             // Lock-free CAS: succeed only if the live value still equals the
             // expected one, by content, at the moment of the atomic store.
@@ -8330,8 +8307,11 @@ fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
             if demote(&cur) != args[1] {
                 return Ok(Value::Bool(false));
             }
-            let sv = promote(&args[2]).map_err(|e| ValueError::Other(e.to_string()))?;
-            Ok(Value::Bool(sa.compare_and_set(&cur, sv)))
+            let sv = promote(&args[2]).map_err(PromoteError::into_value_error)?;
+            let swapped = sa
+                .try_compare_and_set(&cur, sv)
+                .map_err(ValueError::MemoryLimitExceeded)?;
+            Ok(Value::Bool(swapped))
         }
         v => Err(ValueError::WrongType {
             expected: "atom",
@@ -8366,7 +8346,7 @@ fn builtin_volatile_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_force(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Delay(d) => d.get().force().map_err(ValueError::Other),
+        Value::Delay(d) => d.get().force(),
         other => Ok(other.clone()), // non-delay passes through
     }
 }
@@ -8395,7 +8375,7 @@ fn builtin_realized_q(args: &[Value]) -> ValueResult<Value> {
 // ── reduced ──────────────────────────────────────────────────────────────────
 
 fn builtin_reduced(args: &[Value]) -> ValueResult<Value> {
-    Ok(Value::Reduced(Box::new(args[0].clone())))
+    Ok(Value::Reduced(std::sync::Arc::new(args[0].clone())))
 }
 
 fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
@@ -8404,7 +8384,7 @@ fn builtin_reduced_q(args: &[Value]) -> ValueResult<Value> {
 
 fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
-        Value::Reduced(inner) => Ok(*inner.clone()),
+        Value::Reduced(inner) => Ok((**inner).clone()),
         other => Ok(other.clone()),
     }
 }
@@ -8412,7 +8392,7 @@ fn builtin_unreduced(args: &[Value]) -> ValueResult<Value> {
 fn builtin_ensure_reduced(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Reduced(_) => Ok(args[0].clone()),
-        other => Ok(Value::Reduced(Box::new(other.clone()))),
+        other => Ok(Value::Reduced(std::sync::Arc::new(other.clone()))),
     }
 }
 
@@ -8506,7 +8486,7 @@ fn builtin_multi_fn(args: &[Value]) -> ValueResult<Value> {
         Some(v) => format!("{v}"),
         None => ":default".to_string(),
     };
-    Ok(Value::MultiFn(GcPtr::new(MultiFn::new(
+    Ok(Value::MultiFn(GcPtr::new_isolated(MultiFn::new(
         name,
         args[1].clone(),
         default_dispatch,
@@ -8533,16 +8513,13 @@ fn builtin_add_method(args: &[Value]) -> ValueResult<Value> {
         }
     };
     let key = format!("{}", args[1]);
-    mf.get()
-        .methods
-        .lock()
-        .unwrap()
-        .insert(key.clone(), args[2].clone());
-    mf.get()
-        .dispatch_vals
-        .lock()
-        .unwrap()
-        .insert(key, args[1].clone());
+    mf.get().set_method(key.clone(), args[2].clone());
+    let dispatch = cljrs_value::publish::publish_for_named_slot(
+        args[1].clone(),
+        mf.get() as *const _ as usize,
+        format!("dispatch:{key}"),
+    );
+    mf.get().dispatch_vals.lock().unwrap().insert(key, dispatch);
     mf.get().bump_method_generation();
     Ok(Value::MultiFn(mf))
 }
@@ -8640,8 +8617,7 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
             }
         };
         let proto = proto.get();
-        let mut impls = proto.impls.lock().unwrap();
-        let table = impls.entry(type_tag.clone()).or_default();
+        let mut prepared = Vec::new();
         for (k, f) in methods.iter() {
             let method_name: Arc<str> = match k.unwrap_meta() {
                 Value::Keyword(kw) => Arc::from(kw.get().name.as_ref()),
@@ -8654,7 +8630,11 @@ fn builtin_extend(args: &[Value]) -> ValueResult<Value> {
                     });
                 }
             };
-            table.insert(method_name, f.clone());
+            let function = f.clone();
+            prepared.push((method_name, function));
+        }
+        for (method, function) in prepared {
+            proto.set_implementation(type_tag.clone(), method, function);
         }
     }
     cljrs_value::bump_protocol_generation();
@@ -8729,7 +8709,7 @@ fn builtin_make_type_instance_mut(args: &[Value]) -> ValueResult<Value> {
             });
         }
     };
-    let cell = GcPtr::new(Atom::new(Value::Map(mut_map)));
+    let cell = GcPtr::new_isolated(Atom::new(Value::Map(mut_map)));
     Ok(Value::TypeInstance(GcPtr::new(TypeInstance {
         type_tag,
         fields,
@@ -8998,8 +8978,7 @@ fn builtin_with_meta(args: &[Value]) -> ValueResult<Value> {
 ///
 /// The task runs on the installed async runtime's executor, which is this
 /// isolate's: cooperative, not parallel, since every Clojure value is `!Send`.
-/// Read the result with `(await f)`; `(deref f)` blocks the one thread the task
-/// needs in order to finish.
+/// Dereferencing parks a calling fiber. Dynamic bindings are conveyed.
 fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
     let thunk = match args {
         [thunk] => thunk.clone(),
@@ -9019,7 +8998,8 @@ fn builtin_future_call(args: &[Value]) -> ValueResult<Value> {
         )
     })?;
     let call_env = crate::env::env::Env::new(globals, &ns);
-    Ok(rt.spawn_async_call(thunk, Vec::new(), call_env))
+    rt.spawn_fiber_call(thunk, Vec::new(), call_env)
+        .map_err(|e| ValueError::Other(e.to_string()))
 }
 
 fn builtin_future_q(args: &[Value]) -> ValueResult<Value> {
@@ -9256,7 +9236,14 @@ fn builtin_resolve_sentinel(_args: &[Value]) -> ValueResult<Value> {
     })
 }
 
-/// Sleep -- pause current thread for N ms
+/// Run a zero-argument callback while this computation owns an object monitor.
+fn builtin_locking_call(args: &[Value]) -> ValueResult<Value> {
+    let _root = crate::env::gc_roots::root_values(args);
+    let _monitor = crate::env::monitor::enter(&args[0])?;
+    crate::env::callback::invoke(&args[1], Vec::new())
+}
+
+/// Pause the current fiber, or the OS thread outside a fiber, for N ms.
 fn builtin_sleep(args: &[Value]) -> ValueResult<Value> {
     sleep(Duration::from_millis(
         i64::max(0, numeric_as_i64(&args[0])?) as u64,
@@ -9306,6 +9293,26 @@ fn builtin_native_type(args: &[Value]) -> ValueResult<Value> {
     }
 }
 
+fn builtin_monitor_enter(args: &[Value]) -> ValueResult<Value> {
+    crate::env::monitor::monitor_enter(&args[0])?;
+    Ok(Value::Nil)
+}
+fn builtin_monitor_exit(args: &[Value]) -> ValueResult<Value> {
+    crate::env::monitor::monitor_exit(&args[0])?;
+    Ok(Value::Nil)
+}
+
+/// Invoke an owned-work native adapter without moving the Clojure callable.
+fn builtin_blocking_call(args: &[Value]) -> ValueResult<Value> {
+    let _roots = crate::env::gc_roots::root_values(args);
+    match args[0].unwrap_meta() {
+        Value::NativeFunction(native) => native.get().call_blocking(&args[1..]),
+        _ => Err(ValueError::Other(
+            "blocking requires a typed native function, not a Clojure closure".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod doc_tests {
     use super::*;
@@ -9348,23 +9355,14 @@ mod doc_tests {
         }
     }
 
-    /// The future family is deliberately absent from `clojure.core`: it cannot
-    /// honour that namespace's contract on a one-thread-per-isolate runtime, and
-    /// feature probes (`when-var-exists future`) must keep seeing nothing there.
     #[test]
-    fn future_family_is_not_in_clojure_core() {
+    fn future_family_is_in_core_and_experimental_namespace() {
         let globals = test_globals();
         register_experimental(&globals, EXPERIMENTAL_NS);
         for (name, _) in EXPERIMENTAL_DOCS {
-            assert!(
-                globals.lookup_var("clojure.core", name).is_none(),
-                "{name:?} is registered in clojure.core; it belongs in {EXPERIMENTAL_NS}"
-            );
+            assert!(globals.lookup_var("clojure.core", name).is_some());
+            assert!(globals.lookup_var(EXPERIMENTAL_NS, name).is_some());
         }
-        assert!(
-            globals.lookup_var("clojure.core", "future").is_none(),
-            "clojure.core/future is defined; it belongs in {EXPERIMENTAL_NS}"
-        );
     }
 
     #[test]

@@ -51,12 +51,10 @@ use std::sync::{Arc, OnceLock, Weak, mpsc};
 
 use cljrs_ir::IrFunction;
 use cljrs_runtime::Runtime;
-use cljrs_runtime::env::env::Env;
 use cljrs_runtime::tiered::backend::JitBackend;
 use cljrs_runtime::tiered::tiers::Tiers;
 use cljrs_value::Value;
 
-mod async_jit;
 pub mod code_cache;
 mod jit_compiler;
 mod jit_worker;
@@ -106,12 +104,12 @@ impl JitBackend for Jit {
         crate::rt_abi::take_pending_exception_value()
     }
 
-    fn deopt_sentinel(&self) -> usize {
-        crate::rt_abi::deopt_sentinel_addr()
+    fn take_pending_resource_error(&self) -> Option<cljrs_value::ValueError> {
+        crate::rt_abi::take_pending_resource_error()
     }
 
-    fn compile_async_arity(&self, callee: &Value, nargs: usize, env: &mut Env) {
-        async_jit::compile_async_arity(callee, nargs, env);
+    fn deopt_sentinel(&self) -> usize {
+        crate::rt_abi::deopt_sentinel_addr()
     }
 }
 

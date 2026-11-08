@@ -210,6 +210,9 @@ fn versioned_values_survive_gc() {
 
     // Native fallback path: a pure-Rust namespace with no Clojure source.
     let nf = cljrs_value::NativeFn {
+        blocking_func: None,
+        diagnostic_id: Default::default(),
+        captures: Default::default(),
         name: Arc::from("native-fn"),
         arity: cljrs_value::Arity::Fixed(0),
         func: Arc::new(|_args| Ok(Value::Long(7))),

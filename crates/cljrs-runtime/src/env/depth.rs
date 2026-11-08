@@ -30,6 +30,7 @@ thread_local! {
     /// invocation; `None` outside one.
     static CALL_DEPTH: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
+cljrs_gc::mutator_slot!("cljrs-runtime/CALL_DEPTH", cell CALL_DEPTH: Option<(u64, u64)>);
 
 /// Installs the call-depth budget for one invocation's dynamic extent.
 ///
