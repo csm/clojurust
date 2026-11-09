@@ -231,3 +231,14 @@ jobs:
             echo
             cat "$RUNNER_TEMP/release-notes.md"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  binaries:
+    name: Release binaries
+    needs: [check, release]
+    # Skip on dry runs: there is no release to attach binaries to.
+    if: needs.check.outputs.should_release == 'true' && inputs.dry_run != true
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      tag: ${{ needs.check.outputs.tag }}
+      head_sha: ${{ needs.check.outputs.head_sha }}
+    secrets: inherit
