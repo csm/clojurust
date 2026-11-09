@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use cljrs_gc::GcPtr;
 use cljrs_gc::mutator::TrackedMutex;

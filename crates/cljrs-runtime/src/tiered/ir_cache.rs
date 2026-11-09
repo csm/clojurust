@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
-use std::time::Instant;
+use web_time::Instant;
 
 use cljrs_ir::IrFunction;
 
