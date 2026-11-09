@@ -237,6 +237,10 @@ jobs:
     needs: [check, release]
     # Skip on dry runs: there is no release to attach binaries to.
     if: needs.check.outputs.should_release == 'true' && inputs.dry_run != true
+    # A called workflow can only narrow the caller's token, never widen it:
+    # release-binaries.yml uploads assets to the release, so grant write here.
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-binaries.yml
     with:
       tag: ${{ needs.check.outputs.tag }}
