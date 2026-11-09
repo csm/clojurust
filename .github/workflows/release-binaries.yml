@@ -1,0 +1,116 @@
+name: Release Binaries
+
+# Called by nightly.yml after a release is created, or run manually to
+# (re)attach binaries to an existing release.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.5)'
+        required: true
+        type: string
+      head_sha:
+        description: 'Exact commit SHA to build from (defaults to the tag)'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build and attach binaries to (e.g. v0.2.5)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Binary (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — the primary server/desktop target
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+
+          # Linux aarch64 — Raspberry Pi, AWS Graviton, etc.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+
+          # macOS Apple Silicon (macos-latest is currently macos-15 on arm64)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+
+          # Windows x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    env:
+      TAG: ${{ inputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Prefer the exact SHA the nightly workflow tested; fall back to the
+          # tag for manual dispatch.
+          ref: ${{ inputs.head_sha != '' && inputs.head_sha || inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Restore only — cache entries for release builds are written by ci.yml
+      # on pushes to main, so a job that checks out a specific ref cannot
+      # contaminate the shared cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: "false"
+
+      - name: Build
+        run: cargo build -p cljrs --release --target ${{ matrix.target }}
+
+      - name: Archive and checksum (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          ARCHIVE="cljrs-${TAG}-${{ matrix.target }}.tar.gz"
+          tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" cljrs
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            # macOS ships shasum instead of sha256sum
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          fi
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $archive = "cljrs-$env:TAG-${{ matrix.target }}.zip"
+          Compress-Archive `
+            -Path "target\${{ matrix.target }}\release\cljrs.exe" `
+            -DestinationPath $archive
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Checksum (Windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
