@@ -42,6 +42,7 @@ num-traits   = { workspace = true }
 rand         = { workspace = true }
 rpds         = { workspace = true }
 uuid         = { workspace = true, features = ["v4"] }
+web-time      = { workspace = true }
 
 # `logging` installs a subscriber, which is a host-side concern: a wasm32
 # runtime has no stderr to format to and installs none.

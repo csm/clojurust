@@ -44,7 +44,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use web_time::Instant;
 
 use cljrs_gc::{MemoryCharge, MemoryClass, governor};
 use cljrs_value::Value;

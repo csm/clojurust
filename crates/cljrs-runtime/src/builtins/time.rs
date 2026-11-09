@@ -1,7 +1,7 @@
 use cljrs_value::{Value, ValueError, ValueResult};
 use num_traits::ToPrimitive;
 use std::sync::OnceLock;
-use std::time::{Instant, SystemTime};
+use web_time::{Instant, SystemTime};
 
 pub(crate) fn builtin_nanotime(_args: &[Value]) -> ValueResult<Value> {
     match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {

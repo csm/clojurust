@@ -66,7 +66,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::Waker;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * 1024;
@@ -121,7 +121,7 @@ type ShedHook = Arc<dyn Fn(PressureLevel) + Send + Sync>;
 type ShedHookVec = Vec<(ShedHookId, ShedHook)>;
 
 fn unix_nanos() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
