@@ -741,20 +741,25 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
 
     #[cfg(feature = "no-gc")]
     let mut initial_scope = cljrs_gc::alloc_ctx::ScratchGuard::new();
-    for i in (1..bindings.len()).step_by(2) {
-        match eval(&bindings[i], env) {
-            Ok(value) => current_vals.push(value),
-            Err(error) => {
-                #[cfg(feature = "no-gc")]
-                {
-                    initial_scope.pop_for_return();
-                    return crate::interp::eval::publish_result(Err(error), None);
-                }
-                #[cfg(not(feature = "no-gc"))]
-                return Err(error);
-            }
+    // Initial entry binds like `let`: each initializer sees the patterns bound
+    // by the initializers before it (not a shadowed outer binding).  The
+    // values are collected and rebound in the per-iteration frame below; this
+    // temporary frame only serves the initializers.
+    let init_result = env.with_frame(|env| -> Result<(), EvalError> {
+        for (pat, init) in patterns.iter().zip(bindings.iter().skip(1).step_by(2)) {
+            let value = eval(init, env)?;
+            bind_pattern(pat, value.clone(), env)?;
+            current_vals.push(value);
         }
+        Ok(())
+    });
+    #[cfg(feature = "no-gc")]
+    if let Err(error) = init_result {
+        initial_scope.pop_for_return();
+        return crate::interp::eval::publish_result(Err(error), None);
     }
+    #[cfg(not(feature = "no-gc"))]
+    init_result?;
     #[cfg(feature = "no-gc")]
     let mut recur_lease = cljrs_gc::region::RegionLease::for_values(&current_vals);
     #[cfg(feature = "no-gc")]
