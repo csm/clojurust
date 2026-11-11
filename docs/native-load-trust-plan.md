@@ -9,7 +9,7 @@ expression is even parsed, with no flag and no trust decision. A library constru
 
 This document confirms the report against the current tree, widens it to the neighbouring paths
 that share the same flaw, lays out the options for fixing it, and recommends one. **Nothing here is
-implemented yet**; the open decisions at the end need a maintainer's call first.
+implemented yet**; the maintainer's calls on the open questions are recorded under *Decisions*.
 
 ---
 
@@ -190,8 +190,8 @@ without waiting on the trust-store design.
 ### Step 2 — make it livable (the trust store)
 
 - New module `cljrs_project::trust`: load/save the store, canonicalise roots, `is_trusted(root)`.
-- New `cljrs trust` / `cljrs untrust` subcommands; `build-native` records trust on success (if
-  that sub-decision goes that way).
+- New `cljrs trust` / `cljrs untrust` subcommands; `build-native` records trust on success
+  (decision 3).
 - The gate from step 1 gains a third allow condition: project root is in the store or in
   `CLJRS_TRUSTED_PROJECTS`. `--native` remains as the one-off override; the skip notice changes to
   point at `cljrs trust`.
@@ -202,17 +202,28 @@ Step 1 alone resolves the issue as filed. Step 2 is what keeps people from expor
 
 ---
 
-## Open decisions
+## Decisions
 
-1. **Is a breaking default acceptable in a patch release?** After step 1, existing mixed projects
-   need `--native` (then `cljrs trust`) or their native functions are unregistered. The
-   alternative — warn now, enforce later — leaves the hole open for a release.
-2. **Trust key:** path only, or path + config digest? (Recommended: path only.)
-3. **Does `build-native` imply trust?** (Recommended: yes, announced.)
-4. **Should `:paths` / dependency source roots from an untrusted config also be withheld?** That
-   would make trust cover Clojure code too, which is the stricter and more uniform rule, but it
-   means a fresh clone does nothing useful until trusted. Recommended: no for now — keep the gate
-   about native code, rely on C1/C2 for the ancestor case, and revisit.
-5. **Should `eval` consult project config at all?** Orthogonal once the gate exists; leaving it
-   as-is avoids a second behaviour change.
-6. **F2 (digest-pinned artifacts):** worth doing later, or does it cost more workflow than it buys?
+Settled by the maintainer after reviewing the options above:
+
+1. **Breaking default: accepted.** Step 1 ships with native loading off unless explicitly allowed.
+   Existing mixed projects lose their native functions until they pass `--native` (step 1) or run
+   `cljrs trust` (step 2). No warn-only transition release. The skip notice and the changelog entry
+   carry the migration instruction.
+2. **Trust key: canonical path only.** No digest of `cljrs.edn`; editing the config does not
+   revoke trust.
+3. **`build-native` grants trust: tentatively yes.** A successful `cljrs build-native` records the
+   project root in the trust store and prints that it did so. This is a lean, not a firm call, so
+   it is implemented as one isolated call site in `commands/build_native.rs` that can be removed
+   without touching the gate. It only applies from step 2, when the store exists.
+4. **Non-native config passes the gate.** `:paths`, dependency source roots, signature settings
+   and everything else in an untrusted `cljrs.edn` keep working as today. The gate covers native
+   code only: the project library, `:rust/load :dylib` dependencies, and any toolchain subprocess
+   run on their behalf. The ancestor-directory case for non-native config is covered by the
+   discovery limits (C1/C2) alone.
+
+## Still open
+
+- **Should `eval` consult project config at all?** Orthogonal once the gate exists; left as-is
+  unless decided otherwise.
+- **F2 (digest-pinned artifacts):** not planned. Revisit if path-only trust proves too coarse.
