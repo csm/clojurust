@@ -168,6 +168,9 @@ tests/
   auto_resolution_properties.rs   — tree-walker behavior
   gas_meter_ir.rs, versioned_ir.rs, partition_ir.rs, destructure_lowering.rs,
   osr_transfer.rs, region_phi_uaf.rs — tiered behavior
+  loop_binding_scope.rs            — `loop` initializers see earlier loop-locals
+                                     and `recur` rebinds in parallel, in the
+                                     tree-walker and the IR tier (issue #477)
   deftype_mutable_tiered.rs        — deftype mutable-field writes under forced
                                      eager IR lowering: the lowerer must decline
                                      a `set!` on a local (own binary — it flips
@@ -1035,7 +1038,11 @@ Evaluate a sequence of forms, returning the value of the last one.
 
 ### `eval_loop(args, env) -> EvalResult`
 
-Evaluate a `loop*` form.  Each iteration is scoped in its own allocation frame
+Evaluate a `loop*` form.  Initial entry binds like `let`: each initializer is
+evaluated with the patterns before it already bound (in a temporary frame), so
+`(let [a 40] (loop [a 2 b (inc a)] …))` binds `b` to `3`.  `recur` evaluates
+all its arguments against the current iteration, then rebinds every pattern
+together in the next iteration's frame.  Each iteration is scoped in its own allocation frame
 so intermediate allocations are freed per iteration: under GC a
 `cljrs_gc::push_alloc_frame()` that drops at the end of the iteration; under
 `no-gc` a `ScratchGuard` popped before the tail expression (recur args or return

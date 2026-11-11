@@ -359,10 +359,26 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
     let init_forms: Vec<Form> = bindings.iter().skip(1).step_by(2).cloned().collect();
 
     // Evaluate initial binding values.
+    // Initial entry binds like `let`: each initializer sees the patterns bound
+    // by the initializers before it.  The temporary frame only serves the
+    // initializers; the values are rebound per iteration below.
     let mut current_vals: Vec<Value> = Vec::with_capacity(patterns.len());
-    for form in &init_forms {
-        current_vals.push(Box::pin(eval_async_inner(form, env)).await?);
+    env.push_frame();
+    for (pat, form) in patterns.iter().zip(init_forms.iter()) {
+        let value = match Box::pin(eval_async_inner(form, env)).await {
+            Ok(v) => v,
+            Err(e) => {
+                env.pop_frame();
+                return Err(e);
+            }
+        };
+        if let Err(e) = bind_pattern(pat, value.clone(), env) {
+            env.pop_frame();
+            return Err(e);
+        }
+        current_vals.push(value);
     }
+    env.pop_frame();
 
     let body = &args[1..];
     loop {

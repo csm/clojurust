@@ -453,15 +453,22 @@ fn interpret_ir_body(
             return Err(EvalError::GasExhausted);
         }
 
-        // Resolve phi nodes based on predecessor.
-        for phi in &block.phis {
-            if let Inst::Phi(dst, entries) = phi {
-                for (from_block, var_id) in entries {
-                    if *from_block == prev_block_id {
-                        regs.set(*dst, regs.get_cloned(*var_id));
-                        break;
-                    }
+        // Resolve phi nodes based on predecessor.  Phis are a parallel copy:
+        // read every incoming value before writing any destination, or a
+        // `(recur b a)` that swaps loop locals would see the first phi's new
+        // value in the second (issue #477).
+        if !block.phis.is_empty() {
+            let mut incoming: Vec<(VarId, Value)> = Vec::with_capacity(block.phis.len());
+            for phi in &block.phis {
+                if let Inst::Phi(dst, entries) = phi
+                    && let Some((_, var_id)) =
+                        entries.iter().find(|(from, _)| *from == prev_block_id)
+                {
+                    incoming.push((*dst, regs.get_cloned(*var_id)));
                 }
+            }
+            for (dst, value) in incoming {
+                regs.set(dst, value);
             }
         }
 
