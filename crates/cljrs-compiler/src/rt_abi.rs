@@ -338,7 +338,7 @@ pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Va
     intern_keyword(name)
 }
 
-/// Create a symbol.  `ptr`/`len` is the simple name.
+/// Create a symbol from its reader spelling, including namespace and version.
 ///
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Va
 pub unsafe extern "C" fn rt_const_symbol(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
-    box_val(Value::symbol(Symbol::simple(name)))
+    box_val(Value::symbol(Symbol::parse(name)))
 }
 
 /// Materialize an exact regex, ratio, or BigDecimal constant from its source
@@ -5396,6 +5396,26 @@ mod async_sm_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_symbols_preserve_reader_identity() {
+        let _frame = cljrs_gc::push_alloc_frame();
+        for text in [
+            "plain",
+            "bulwark.commands/register!",
+            "/",
+            "clojure.core//",
+            "library/f@abc1234",
+        ] {
+            // The bytes remain valid for the complete ABI call.
+            let actual = unsafe { rt_const_symbol(text.as_ptr(), text.len() as u64) };
+            assert_eq!(
+                unsafe { val_ref(actual) },
+                &Value::symbol(Symbol::parse(text)),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn boxed_abi_bridges_have_realization_boundaries() {
