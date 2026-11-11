@@ -161,7 +161,7 @@ tests/
                                      pins refused in either half of the name
                                      (`mylib/render@sha` and an alias pointing
                                      at the namespace `mylib@sha`)
-  named_fn_identity.rs, ns_metadata.rs, partition_arities.rs, shared_atom.rs,
+  named_fn_identity.rs, ns_metadata.rs, partition_arities.rs, reduce_kv.rs, shared_atom.rs,
   symbolic_nan.rs, threading_macros.rs, auto_gensym.rs, auto_keyword_macro.rs,
   assoc_in_metadata.rs, empty_metadata.rs, into_metadata.rs, vec_metadata.rs,
   defonce_metadata.rs, defonce_metadata_properties.rs,
