@@ -1075,7 +1075,7 @@ mod gc_full {
                 pre_count,
                 pre_memory
             );
-            let mark_start = std::time::Instant::now();
+            let mark_start = web_time::Instant::now();
             let mut visitor = MarkVisitor::new();
             trace_roots(&mut visitor);
             crate::mutator::trace_suspended(&mut visitor);
@@ -1096,7 +1096,7 @@ mod gc_full {
             visitor.drain();
             let mark_elapsed = mark_start.elapsed();
 
-            let sweep_start = std::time::Instant::now();
+            let sweep_start = web_time::Instant::now();
             let mut inner = self.inner.lock().unwrap();
             let mut live: Vec<*mut GcBoxHeader> = Vec::with_capacity(inner.count);
             let mut dead: Vec<*mut GcBoxHeader> = Vec::new();

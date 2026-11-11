@@ -20,6 +20,7 @@ consumer and it had no independent artifact, so it is a module now.  Targets `wa
 | `src/dom/events.rs` | Event-to-map conversion, `DomListener`, `DomEventChan` |
 | `src/dom/fns.rs` | All `cljrs.dom` native functions and their registration |
 | `www/index.html` | Self-contained browser REPL UI (pure JS, no bundler required once wasm-pack output is present) |
+| `tests/node-smoke.cjs` | Node smoke test of a `--target nodejs` build: evaluates forms that force a GC cycle and use `time` (run in CI) |
 
 ## Public API
 
@@ -76,6 +77,17 @@ cp crates/cljrs-wasm/pkg/cljrs_wasm.js crates/cljrs-wasm/pkg/cljrs_wasm_bg.wasm 
 cd crates/cljrs-wasm/www && python3 -m http.server 8080
 # Open http://localhost:8080
 ```
+
+To smoke-test the wasm build without a browser (as CI does):
+
+```bash
+wasm-pack build crates/cljrs-wasm --target nodejs --release --out-dir pkg-node
+node crates/cljrs-wasm/tests/node-smoke.cjs crates/cljrs-wasm/pkg-node
+```
+
+Code linked into this crate must not call `std::time::Instant::now` or
+`SystemTime::now`: on `wasm32-unknown-unknown` they panic ("time not
+implemented on this platform") and trap the instance. Use `web_time` instead.
 
 ## What works
 
