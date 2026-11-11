@@ -59,11 +59,28 @@ jobs:
       TAG: ${{ inputs.tag }}
 
     steps:
+      # Build from the release tag, not from main.  The nightly workflow bumps
+      # every crate version in a commit that only the tag references (main's
+      # manifests stay at their development version), so a checkout of
+      # `head_sha` would produce binaries whose `--version` reports the
+      # development version (0.1.0) instead of the release version.
       - uses: actions/checkout@v4
         with:
-          # Prefer the exact SHA the nightly workflow tested; fall back to the
-          # tag for manual dispatch.
-          ref: ${{ inputs.head_sha != '' && inputs.head_sha || inputs.tag }}
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      # When called from the nightly workflow, make sure the tag really is the
+      # commit that was tested (plus the version bump).
+      - name: Verify tag descends from the tested commit
+        if: inputs.head_sha != ''
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          if ! git merge-base --is-ancestor "$HEAD_SHA" HEAD; then
+            echo "::error::$TAG does not descend from tested commit $HEAD_SHA"
+            exit 1
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -78,7 +95,14 @@ jobs:
           save-if: "false"
 
       - name: Build
-        run: cargo build -p cljrs --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          cargo build -p cljrs --release --target ${{ matrix.target }}
+          # Sanity check: the binary must report the tagged version.
+          BIN="target/${{ matrix.target }}/release/cljrs"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          "$BIN" --version | grep -F "${TAG#v}" \
+            || { echo "::error::cljrs --version does not report ${TAG#v}"; exit 1; }
 
       - name: Archive and checksum (Unix)
         if: matrix.archive == 'tar.gz'
