@@ -8,8 +8,8 @@ expression is even parsed, with no flag and no trust decision. A library constru
 `dlopen`, so the later "could not find symbol" check is too late to matter.
 
 This document confirms the report against the current tree, widens it to the neighbouring paths
-that share the same flaw, lays out the options for fixing it, and recommends one. **Nothing here is
-implemented yet**; the maintainer's calls on the open questions are recorded under *Decisions*.
+that share the same flaw, lays out the options for fixing it, and recommends one. The maintainer's calls on the open questions are recorded
+under *Decisions*, and the result under *What was implemented*.
 
 ---
 
@@ -82,14 +82,14 @@ Native loading is off unless the flag or env var is present.
 
 ### Option B — Per-project trust store (`cljrs trust`)
 
-A user-level file (`$XDG_CONFIG_HOME/cljrs/trusted-projects.edn`, outside any project) lists
+A user-level file (`~/.cljrs/trusted-projects`, outside any project) lists
 project roots allowed to load native code. `cljrs trust [DIR]` adds one, `cljrs untrust` removes
 one, `cljrs trust --list` shows them. An untrusted config with `:rust` (or a `:rust/load :dylib`
 dep being reached) is skipped with a one-line notice naming the command to run. This is the model
 of `direnv allow`, `mise trust`, and editor workspace trust.
 
 - **For:** meets all four goals; one explicit step per checkout; CI can set
-  `CLJRS_TRUSTED_PROJECTS=<path>[:<path>…]` or pass `--trust-project`.
+  `CLJRS_TRUSTED_PROJECTS=<path>[:<path>…]`.
 - **Against:** new subcommand, new on-disk state, and a breaking change for existing projects on
   upgrade (their native functions stop registering until `cljrs trust` is run — the notice must be
   loud and specific).
@@ -108,7 +108,7 @@ of `direnv allow`, `mise trust`, and editor workspace trust.
 
 Independently of trust, narrow which `cljrs.edn` is found:
 
-- **C1.** Stop the upward walk at `$HOME` and at filesystem/mount boundaries.
+- **C1.** Stop the upward walk at `$HOME`.
 - **C2.** Refuse a config (or its directory) not owned by the current user, in the manner of git's
   `safe.directory`. This closes the shared-`/tmp` and multi-user-box cases outright.
 - **C3.** Stop at the nearest VCS root.
@@ -165,40 +165,8 @@ Things that reduce blast radius without constituting a trust decision:
 
 ## Recommendation
 
-**B + E + F1, with C1/C2 as hardening**, delivered in two steps so that a fix can ship quickly
-without waiting on the trust-store design.
-
-### Step 1 — stop the bleeding (small, suitable for a patch release)
-
-- Add a single gate function in `crates/cljrs/src/native/mod.rs` (say `native_allowed(project_root)
-  -> Decision`) consulted by `load_project_lib` *before* `native_lib_path`, and by the two loader
-  hooks in `native/pinned.rs` before any `cargo` invocation.
-- In this step the gate is Option A's rule: allow only with `--native` / `CLJRS_NATIVE=1`, never
-  with `--no-native` / `CLJRS_NO_NATIVE=1`. Otherwise skip and print one line:
-  `cljrs: <path>/cljrs.edn declares native code; not loaded (pass --native to allow)`.
-- Add `--no-config` / `CLJRS_NO_CONFIG=1`, checked in `setup_globals` before `apply_deps_config`
-  and in the `deps`/`compile`/`build-native` call sites of `load_config`.
-- Add C1 and C2 to `find_config_file` (a skipped foreign-owned config warns rather than silently
-  continuing upward to a different one).
-- Tests: an integration test reproducing the issue's script and asserting the constructor does not
-  run under `eval` — including with an unbalanced expression — and that no `cargo` process is
-  spawned; unit tests for the gate's precedence and for discovery stopping rules.
-- Docs: `docs/book/src/rust-interop/{project-setup,interpreter}.md`, `cli/build-native.md`, the
-  README, the `cljrs` and `cljrs-project` crate READMEs, and a changelog entry flagged as a
-  behaviour change.
-
-### Step 2 — make it livable (the trust store)
-
-- New module `cljrs_project::trust`: load/save the store, canonicalise roots, `is_trusted(root)`.
-- New `cljrs trust` / `cljrs untrust` subcommands; `build-native` records trust on success
-  (decision 3).
-- The gate from step 1 gains a third allow condition: project root is in the store or in
-  `CLJRS_TRUSTED_PROJECTS`. `--native` remains as the one-off override; the skip notice changes to
-  point at `cljrs trust`.
-- Interactive `cljrs repl` may offer the prompt inline; non-TTY sessions never prompt.
-
-Step 1 alone resolves the issue as filed. Step 2 is what keeps people from exporting
-`CLJRS_NATIVE=1` globally and undoing it.
+**B + E + F1, with C1/C2 as hardening.** This is what was chosen and built; see *What was
+implemented* below.
 
 ---
 
@@ -206,21 +174,53 @@ Step 1 alone resolves the issue as filed. Step 2 is what keeps people from expor
 
 Settled by the maintainer after reviewing the options above:
 
-1. **Breaking default: accepted.** Step 1 ships with native loading off unless explicitly allowed.
-   Existing mixed projects lose their native functions until they pass `--native` (step 1) or run
-   `cljrs trust` (step 2). No warn-only transition release. The skip notice and the changelog entry
-   carry the migration instruction.
+1. **Breaking default: accepted.** The fix ships with native loading off unless explicitly allowed.
+   Existing mixed projects lose their native functions until they pass `--native`, run
+   `cljrs trust`, or rebuild with `cljrs build-native`. No warn-only transition release. The skip
+   notice
+   carries the migration instruction.
 2. **Trust key: canonical path only.** No digest of `cljrs.edn`; editing the config does not
    revoke trust.
 3. **`build-native` grants trust: tentatively yes.** A successful `cljrs build-native` records the
    project root in the trust store and prints that it did so. This is a lean, not a firm call, so
-   it is implemented as one isolated call site in `commands/build_native.rs` that can be removed
-   without touching the gate. It only applies from step 2, when the store exists.
+   it is implemented as one isolated call site (`trust_built_project` in
+   `commands/build_native.rs`) that can be removed without touching the gate.
 4. **Non-native config passes the gate.** `:paths`, dependency source roots, signature settings
    and everything else in an untrusted `cljrs.edn` keep working as today. The gate covers native
    code only: the project library, `:rust/load :dylib` dependencies, and any toolchain subprocess
    run on their behalf. The ancestor-directory case for non-native config is covered by the
    discovery limits (C1/C2) alone.
+
+## What was implemented
+
+| Piece | Where |
+|---|---|
+| Trust store (`~/.cljrs/trusted-projects`, plain text, one canonical root per line) and `CLJRS_TRUSTED_PROJECTS` | `crates/cljrs-project/src/trust.rs` |
+| The gate: `NativePolicy` (`Trusted` / `Allow` / `Deny`), `check`, consulted before any `dlopen` and before any `cargo` run in a config-named directory | `crates/cljrs/src/native/mod.rs` |
+| Gate applied to the project `:rust` library | `native::load_project_lib` |
+| Gate applied to `:rust/load :dylib` dependencies (both the `require` hook and the pinned-symbol hook) | `crates/cljrs/src/native/pinned.rs` |
+| `--native`, `--no-native`, `--no-config` and their `CLJRS_*` variables | `crates/cljrs/src/cli.rs` |
+| `cljrs trust [DIR]`, `cljrs trust --list`, `cljrs untrust [DIR]` | `crates/cljrs/src/commands/trust.rs` |
+| `build-native` records trust on success | `crates/cljrs/src/commands/build_native.rs` |
+| C1: discovery stops at `$HOME`. C2: a config owned by another non-root user is refused unless its root is trusted | `crates/cljrs-project/src/config.rs` |
+| End-to-end tests, including the issue's reproduction and a recording `cargo` stand-in | `crates/cljrs/tests/native_trust.rs` |
+| User documentation | `docs/book/src/cli/trust.md` and the pages that link to it |
+
+Behaviour when the gate refuses: the project library is skipped with a one-line notice; a plain
+`require` of a native dependency is a runtime error that names the remedy; a pinned (`ns/f@sha`)
+lookup falls back to the current binary's implementation, as it does without `:rust/load :dylib`.
+
+Deliberately left out:
+
+- **An inline trust prompt in `cljrs repl`.** The notice names the command; a prompt can be added
+  later without changing the gate.
+- **A `--trust-project` flag.** `--native` covers the one-off case and `CLJRS_TRUSTED_PROJECTS`
+  the non-interactive one.
+- **Stopping discovery at mount boundaries.** `$HOME` and ownership cover the reported cases
+  without breaking projects on a separately mounted volume.
+- **The ownership check on non-unix platforms.** It always passes there.
+- **Gating `cljrs compile` and AOT-compiled binaries.** `compile` is an explicit build; the
+  binaries it produces link their Rust code statically.
 
 ## Still open
 

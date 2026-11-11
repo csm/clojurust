@@ -168,8 +168,9 @@ pub fn setup_globals(
 
 /// Load the nearest `cljrs.edn` and wire its data into `globals`.
 ///
-/// Silently does nothing when no config file is found; prints a warning to
-/// stderr when the file exists but cannot be parsed.
+/// Silently does nothing when no config file is found (or discovery is off,
+/// `--no-config`); prints a warning to stderr when the file exists but cannot
+/// be parsed or is refused because another user owns it.
 fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
     match cljrs_project::config::load_config(cwd) {
         Ok(Some(config)) => {
@@ -197,12 +198,16 @@ fn apply_deps_config(globals: &Arc<GlobalEnv>, cwd: &Path) {
             }
             // Load the native shared library (if :rust is configured) so that
             // native functions are registered before any Clojure code runs.
+            // Subject to the trust gate: an untrusted project loads nothing.
             if let Some(rust_config) = &config.rust {
-                native::load_project_lib(rust_config, globals);
+                native::load_project_lib(rust_config, config.root.as_deref(), globals);
             }
             *globals.deps_config.write().unwrap() = Some(Arc::new(config));
         }
         Ok(None) => {}
+        Err(e @ cljrs_project::config::DepsError::ForeignOwner { .. }) => {
+            eprintln!("cljrs: warning: {e}")
+        }
         Err(e) => eprintln!("cljrs: warning: could not load cljrs.edn: {e}"),
     }
 }

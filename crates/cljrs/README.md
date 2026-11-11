@@ -22,7 +22,8 @@ src/
                       source-path helpers, `eval_in` / `eval_form`, the async
                       driver, and error formatting
   native/           — loading native (Rust) code into a running environment
-    mod.rs          — the project's own `:rust` cdylib and the cargo/path helpers
+    mod.rs          — the trust gate (`NativePolicy`, `check`), the project's
+                      own `:rust` cdylib, and the cargo/path helpers
     pinned.rs       — pinned native packages (`:rust/load :dylib`): wrapper
                       generation, cargo build + cache, dlopen + ABI handshake
   extensions.rs     — `default_set()`: the runtime extensions this build ships,
@@ -46,9 +47,16 @@ build.rs            — captures `rustc -V` for the pinned-package ABI fingerpri
     test.rs         — `test`: namespace discovery, the runner, the summary
     deps.rs         — `deps fetch` / `deps status`
     build_native.rs — `build-native`: cargo-build the project's `:rust` crate
+                      and record the project as trusted
+    trust.rs        — `trust` / `untrust`: manage the native-code trust store
     lsp.rs          — `lsp`: run the language server over stdio
     nrepl.rs        — `nrepl`: serve an nREPL session
 tests/
+  native_trust.rs   — the native-code trust gate end to end, against the real
+                      binary: an untrusted project loads no library and starts
+                      no `cargo`; `--native`, `cljrs trust`, `build-native` and
+                      `CLJRS_TRUSTED_PROJECTS` allow it; `--no-native` and
+                      `--no-config` switch it off; foreign-owned configs
   embedding_book_examples.rs — the snippets from the book's Embedding chapter
                       (`docs/book/src/embedding/`), compiled and run so the
                       documented host API cannot drift
@@ -85,6 +93,9 @@ tests/
 | `test`        | Run `clojure.test` namespaces (named on the CLI or auto-discovered)    |
 | `deps fetch`  | Clone / update git dependencies declared in `cljrs.edn`                |
 | `deps status` | Show which dependencies are cached and which are missing               |
+| `build-native`| `cargo build` the project's `:rust` crate; on success, trust the project |
+| `trust`       | Allow a project to load native code (`--list` shows trusted roots)     |
+| `untrust`     | Stop allowing a project to load native code                            |
 
 ### -main entry point
 
@@ -156,6 +167,52 @@ to the source search path (after any `--src-path` CLI flags), and the parsed
 `DepsConfig` is stored in `GlobalEnv.deps_config` so that versioned symbol
 resolution can use it without a second parse.
 
+The walk stops at the user's home directory, and on unix a `cljrs.edn` owned
+by another user (other than root) is ignored with a warning unless its project
+is trusted.  `--no-config` / `CLJRS_NO_CONFIG` skips discovery entirely.
+
+### Native code and project trust
+
+A `cljrs.edn` can request native code: the project's own `:rust` crate
+(`native::load_project_lib`) and `:rust/load :dylib` dependencies
+(`native::pinned`).  Because the config is discovered rather than chosen, it
+cannot authorise that itself.  Every such load goes through `native::check`
+first — before any library is opened and before any `cargo` process is started
+in a directory the config names:
+
+| Policy (`native::NativePolicy`) | Set by | Native code loads for |
+|---|---|---|
+| `Trusted` (default) | — | project roots in `~/.cljrs/trusted-projects` or `CLJRS_TRUSTED_PROJECTS` |
+| `Allow` | `--native` / `CLJRS_NATIVE` | any project, this run only |
+| `Deny` | `--no-native` / `CLJRS_NO_NATIVE` (wins over allow) | nothing |
+
+`cljrs trust [DIR]` adds a root to the store, `cljrs untrust [DIR]` removes
+one, and a successful `cljrs build-native` adds the project it built.  Trust
+is keyed on the canonical path of the directory holding `cljrs.edn`.  When the
+gate refuses: the project library is skipped with a one-line notice, a plain
+`require` of a native dependency is a runtime error naming the remedy, and a
+pinned (`ns/f@sha`) lookup falls back to the current binary's implementation.
+Everything else in an untrusted `cljrs.edn` (`:paths`, `:deps` source roots,
+signature settings) is used as normal.  `build-native` and `compile` are
+explicit build commands and are not gated.
+
+```rust
+// cljrs::native
+pub enum NativePolicy { Trusted, Allow, Deny }
+impl NativePolicy {
+    pub fn from_requests(allow: bool, deny: bool) -> NativePolicy; // deny wins
+    /// `None` root = a config built in code by the host, not discovered.
+    pub fn decide(self, project_root: Option<&Path>) -> Result<(), Refusal>;
+}
+pub enum Refusal { Disabled, Untrusted(PathBuf) }   // impl Display
+pub fn set_policy(policy: NativePolicy);   // process-wide; the CLI sets it once
+pub fn policy() -> NativePolicy;
+pub fn check(project_root: Option<&Path>) -> Result<(), Refusal>;
+pub fn load_project_lib(rust_config: &RustConfig, project_root: Option<&Path>,
+                        globals: &Arc<GlobalEnv>);
+pub fn native_lib_path(crate_dir: &Path, crate_name: &str, release: bool) -> PathBuf;
+```
+
 #### `compile` and `cljrs.edn`
 
 `cljrs compile` reads `cljrs.edn` to determine:
@@ -188,6 +245,9 @@ dependency:
 
 These appear before the subcommand and apply to every command:
 
+- `--native` — load native code declared by `cljrs.edn` for this run even if the project is not trusted (also `CLJRS_NATIVE`).  Conflicts with `--no-native`.
+- `--no-native` — never load native code declared by `cljrs.edn` (also `CLJRS_NO_NATIVE`, which overrides `CLJRS_NATIVE`).
+- `--no-config` — do not look for a `cljrs.edn` at all (also `CLJRS_NO_CONFIG`).
 - `--stack-size-mb <MB>` — thread stack size (default 64).  Raise if you hit stack overflows in deeply recursive code.
 - `--debug` — enable debug logging
 - `--trace` — enable trace logging (implies `--debug`)
@@ -399,7 +459,8 @@ tests/
 /// Install both native loader hooks on the environment (idempotent): the
 /// pinned-native loader (versioned-symbol resolution) and the native-require
 /// loader (plain `require` of a `:rust/load :dylib` dep).  Called by the
-/// cljrs CLI during setup_globals.
+/// cljrs CLI during setup_globals.  Both hooks pass `native::check` for the
+/// config's project root before fetching, building or loading anything.
 pub fn install(globals: &Arc<GlobalEnv>);   // cljrs::native::pinned
 
 /// The host's ABI fingerprint: "cljrs <version>; <rustc -V>; <debug|release>".

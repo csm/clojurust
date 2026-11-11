@@ -16,3 +16,4 @@ pub mod nrepl;
 pub mod repl;
 pub mod run;
 pub mod test;
+pub mod trust;
