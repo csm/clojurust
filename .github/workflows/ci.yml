@@ -62,6 +62,11 @@ jobs:
       - name: Build cljrs-wasm
         run: wasm-pack build crates/cljrs-wasm --target web --no-typescript --release
 
+      - name: Smoke-test cljrs-wasm under Node
+        run: |
+          wasm-pack build crates/cljrs-wasm --target nodejs --no-typescript --release --out-dir pkg-node
+          node crates/cljrs-wasm/tests/node-smoke.cjs crates/cljrs-wasm/pkg-node
+
   fiber-asan:
     name: Fiber AddressSanitizer (${{ matrix.mode }})
     runs-on: ubuntu-latest

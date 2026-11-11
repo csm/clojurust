@@ -1571,6 +1571,14 @@
   [& _]
   nil)
 
+(defmacro time
+  "Evaluates expr and prints the time it took. Returns the value of expr."
+  [expr]
+  `(let [start# (System/nanoTime)
+         ret# ~expr]
+     (println (str "\"Elapsed time: " (/ (double (- (System/nanoTime) start#)) 1000000.0) " msecs\""))
+     ret#))
+
 (defmacro prn-str
   [& body]
   (list 'str (cons 'pr-str body) \newline))
