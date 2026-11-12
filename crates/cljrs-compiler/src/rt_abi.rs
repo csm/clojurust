@@ -1446,7 +1446,7 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::Map(m) => m.count(),
         Value::Set(s) => s.count(),
         Value::List(l) => l.get().count(),
-        Value::Str(s) => s.get().len(),
+        Value::Str(s) => s.get().chars().count(),
         Value::Nil => 0,
         // Lazy/cons seqs — e.g. the result of `filter`/`map`/`mapcat` — must
         // be walked and realized to be counted.  Without this arm `count`
@@ -5759,6 +5759,23 @@ mod tests {
             "count of a 3-element cons chain must be 3, got {:?}",
             unsafe { &*n }
         );
+    }
+
+    #[test]
+    fn test_count_unicode_strings() {
+        for (text, expected) in [
+            ("", 0),
+            ("ascii", 5),
+            ("café", 4),
+            ("日本語", 3),
+            ("😀", 1),
+            ("e\u{301}", 2),
+        ] {
+            let value = Value::string(text);
+            let _root = cljrs_runtime::env::gc_roots::root_value(&value);
+            let count = unsafe { rt_count(&value) };
+            assert_eq!(unsafe { &*count }, &Value::Long(expected), "{text:?}");
+        }
     }
 }
 
