@@ -261,8 +261,8 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
         }
     };
 
-    // Capture closed-over locals.
-    let (closed_over_names, closed_over_vals) = env.all_local_bindings();
+    let (closed_over_names, closed_over_vals) =
+        super::capture::capture_locals(&arities, name.as_deref(), env);
 
     let mut cljrs_fn = CljxFn::new(
         name.clone(),
@@ -1874,7 +1874,7 @@ pub fn push_letfn_frame(args: &[Form], env: &mut Env) -> EvalResult<()> {
     // (letfn [(f [params] body...) ...] body...)
     //
     // Three passes, because a closure here captures VALUES, not cells:
-    // `eval_fn` snapshots `env.all_local_bindings()`, so a name bound after the
+    // `eval_fn` snapshots the referenced local bindings, so a name bound after the
     // closure was built is invisible to it forever. Binding each fn as it was
     // built therefore gave letfn `let`-like sequential scope — a backward
     // reference resolved, a forward one or a mutual pair raised "unbound
@@ -1886,8 +1886,8 @@ pub fn push_letfn_frame(args: &[Form], env: &mut Env) -> EvalResult<()> {
 
     env.push_frame();
 
-    // Pass 1: bind every name to nil, so the pass-2 snapshot CONTAINS all of
-    // them. A capture list cannot grow after the fact; it can only be corrected.
+    // Pass 1: bind every name to nil, so pass 2 can capture any referenced
+    // sibling. A capture list cannot grow after the fact; only be corrected.
     for binding in &bindings {
         if let Some(parts) = binding.as_list() {
             if parts.is_empty() {
@@ -1903,8 +1903,8 @@ pub fn push_letfn_frame(args: &[Form], env: &mut Env) -> EvalResult<()> {
         }
     }
 
-    // Pass 2: build the closures. Each captures the real value of any sibling
-    // already built and nil for the rest.
+    // Pass 2: build the closures. Each captures the real value of any referenced
+    // sibling already built and nil for referenced siblings not yet built.
     let mut built: Vec<(Arc<str>, Value)> = Vec::new();
     for binding in &bindings {
         if let Some(parts) = binding.as_list() {
