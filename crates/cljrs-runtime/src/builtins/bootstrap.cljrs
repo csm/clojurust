@@ -388,9 +388,8 @@
   logical true."
   [pred coll] (vec (filter pred coll)))
 
-(defn swap!
-  "Atomically swaps the value of atom to be (apply f current-value args)."
-  [a f & args] (reset! a (apply f (deref a) args)))
+;; swap! keeps its native evaluator entry so update functions can park or yield
+;; without turning the read/update/write into an unconditional reset!.
 
 (defmacro when
   "Evaluates test. If logical true, evaluates body in an implicit do."

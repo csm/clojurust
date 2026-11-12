@@ -461,6 +461,9 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
                 applied.extend(spread);
                 return apply_value(&callee, applied, env);
             }
+            if nf.get().name.as_ref() == "swap!" {
+                return crate::interp::apply::eval_swap_bang(args, env);
+            }
             // Register the caller's env as a GC root: native functions may
             // call back into Clojure (via invoke()), which creates a fresh Env
             // and may trigger GC.

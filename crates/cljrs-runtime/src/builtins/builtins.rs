@@ -1070,8 +1070,10 @@ const BUILTIN_DOCS: &[(&str, &str)] = &[
         "reset!",
         "Sets the value of atom to newval, without regard to the current value.",
     ),
-    // "swap!" is redefined in bootstrap.cljrs (in terms of reset!/deref) and
-    // carries its own docstring there, superseding this native's.
+    (
+        "swap!",
+        "Atomically swaps the value of atom to be (apply f current-value args). Retries f if the value changes before commit.",
+    ),
     (
         "compare-and-set!",
         "Atomically sets the value of atom to newval if and only if the current value is identical to oldval.",
