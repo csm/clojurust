@@ -37,5 +37,8 @@ fn symbol_key_is_evaluated() {
 
 #[test]
 fn literal_key_still_works() {
-    assert!(matches!(eval("(let [{v :value} {:value 2}] v)"), Value::Long(2)));
+    assert!(matches!(
+        eval("(let [{v :value} {:value 2}] v)"),
+        Value::Long(2)
+    ));
 }
