@@ -110,11 +110,12 @@ impl CaptureScan<'_> {
                     return false;
                 };
                 let depth = self.bound.len();
-                let mut safe = bindings.len() % 2 == 0;
-                for pair in bindings.chunks_exact(2) {
+                let (pairs, remainder) = bindings.as_chunks::<2>();
+                let mut safe = remainder.is_empty();
+                for [pattern, initializer] in pairs {
                     // Initializers see earlier bindings, including an outer
                     // binding of their own name until this pair is installed.
-                    safe = safe && self.form(&pair[1]) && self.bind(&pair[0]);
+                    safe = safe && self.form(initializer) && self.bind(pattern);
                 }
                 safe = safe && self.forms(&args[1..]);
                 self.bound.truncate(depth);
