@@ -1,6 +1,6 @@
 //! Macro expansion pipeline.
 
-use crate::builtins::form::{form_to_value, resolve_auto_forms};
+use crate::builtins::form::{expand_anon_fn, form_to_value, resolve_auto_forms};
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_types::span::Span;
@@ -151,6 +151,12 @@ fn macroexpand_all_inner(form: &Form, env: &mut Env) -> EvalResult<Form> {
 
     let span = expanded.span.clone();
     let kind = match &expanded.kind {
+        // Reader anonymous functions must become fn* before IR/AOT lowering.
+        // Recurse into the expansion so macros in its body are expanded too;
+        // quote boundaries are preserved by the ordinary walk below.
+        FormKind::AnonFn(body) => {
+            return macroexpand_all_inner(&expand_anon_fn(body, span), env);
+        }
         FormKind::List(parts) if !parts.is_empty() => {
             // Check if the head is a special form that shouldn't be walked.
             let head_name = match &parts[0].kind {

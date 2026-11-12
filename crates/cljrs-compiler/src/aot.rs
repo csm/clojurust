@@ -1676,12 +1676,10 @@ fn expand_reader_cond_form(form: &cljrs_reader::Form) -> cljrs_reader::Form {
 /// Recursively expand anonymous-function reader macros (`#(...)`) into `(fn*
 /// [...] ...)` forms.
 ///
-/// `macroexpand_all` deliberately leaves `#(...)` as an `AnonFn` node — the
-/// tree-walking interpreter expands it lazily at eval time — but the AOT lowerer
-/// has no such fallback and rejects an un-expanded `AnonFn`.  This pass runs over
-/// the compilable forms before lowering so any `#(...)` (in the entry namespace
-/// or in a compiled required namespace such as `clojure.tools.cli`) is turned
-/// into a lowerable `fn*`.
+/// `macroexpand_all` expands anonymous functions in evaluated positions, but
+/// leaves quoted forms and some reader wrappers untouched. This pass also
+/// expands those remaining reader forms before AOT lowering, which has no
+/// interpreter fallback for an unexpanded `AnonFn`.
 fn expand_anon_fns(form: &cljrs_reader::Form) -> cljrs_reader::Form {
     use cljrs_reader::form::FormKind;
     let map_vec = |v: &[cljrs_reader::Form]| v.iter().map(expand_anon_fns).collect::<Vec<_>>();
