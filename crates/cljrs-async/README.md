@@ -430,6 +430,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/future_family.rs` | `cljrs.core.experimental`'s `future`/`future-call`/`future?`/`future-done?`/`future-cancelled?`/`future-cancel` on the isolate executor: cooperative start, interleaving, throwing bodies, sticky cancellation, and cancelled-error parity between the tree-walking and compiled await paths |
 | `tests/toplevel_interop.rs` | `(.method target)` / `(.-field target)` at top level, evaluated on a fiber |
 | `tests/async_root_order.rs` | two `LocalSet` tasks whose async loops hold value roots across `await` and finish out of LIFO order keep their roots through collections |
+| `tests/colored_collection_roots.rs` | direct colored-evaluator tests that vector elements, map keys and values, and set elements survive collection during later evaluation and across `await` (csm/clojurust#494) |
 | `tests/loop_garbage.rs` | collections during `loop*`/`recur` free dead intermediates in the tree-walker, the IR tier, and a top-level fiber (csm/clojurust#428) |
 | `tests/reader_conditional_parity.rs` | property + example tests that `#?`/`#?@` resolve identically on a fiber and in the sync evaluator (containers, `let*`/`loop*` binding vectors) |
 | `tests/gc_service.rs` | the background GC service lets an idle executor suspend (counting waker and paused-clock checks), collects after same-thread and cross-thread requests, services credit recalls while idle, keeps a parked `go` block's roots, and leaves no wakers after repeated `init` or `LocalSet` shutdown |
