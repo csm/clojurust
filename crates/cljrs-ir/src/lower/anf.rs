@@ -964,8 +964,8 @@ fn lower_destructure_associative(
 
         // A `:keys`/`:strs`/`:syms` directive keyword may itself be
         // namespace-qualified (`:person/keys [a b]`), supplying a default
-        // namespace for every unqualified symbol in its vector; an
-        // individual symbol's own namespace (`ui/dest`) takes precedence.
+        // namespace for every unqualified entry in its vector; an
+        // individual entry's own namespace (`ui/dest`) takes precedence.
         let directive = if let FormKind::Keyword(kname) = &k.kind {
             Some(split_ns_name(kname))
         } else {
@@ -976,7 +976,7 @@ fn lower_destructure_associative(
             Some((directive_ns, "keys")) => {
                 if let FormKind::Vector(syms) = &v.kind {
                     for sym_form in syms {
-                        if let FormKind::Symbol(sym) = &sym_form.kind {
+                        if let FormKind::Symbol(sym) | FormKind::Keyword(sym) = &sym_form.kind {
                             let (sym_ns, sym_name) = split_ns_name(sym);
                             let full_key = match sym_ns.or(directive_ns) {
                                 Some(ns) => format!("{ns}/{sym_name}"),
