@@ -1248,43 +1248,11 @@ fn validate_atom_value(atom: &GcPtr<Atom>, new_val: &Value, env: &mut Env) -> Ev
 // ── swap! ─────────────────────────────────────────────────────────────────────
 
 fn handle_swap_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
-    let mut evaled: Vec<Value> = arg_forms
+    let evaled: Vec<Value> = arg_forms
         .iter()
         .map(|f| eval(f, env))
         .collect::<EvalResult<_>>()?;
-
-    if evaled.len() < 2 {
-        return Err(EvalError::Arity {
-            name: "swap!".into(),
-            expected: "2+".into(),
-            got: evaled.len(),
-        });
-    }
-
-    let atom_val = evaled.remove(0);
-    let f = evaled.remove(0);
-
-    let atom = match &atom_val {
-        Value::Atom(a) => a.clone(),
-        Value::SharedAtom(sa) => return shared_atom_swap(sa, &f, evaled, env),
-        v => {
-            return Err(EvalError::Runtime(format!(
-                "swap! requires an atom, got {}",
-                v.type_name()
-            )));
-        }
-    };
-
-    let previous_payload = atom.get().snapshot();
-    let old_val = previous_payload.value.clone();
-    let mut args = vec![old_val.clone()];
-    args.extend(evaled);
-    let new_val = crate::env::apply::apply_value(&f, args, env)?;
-    validate_atom_value(&atom, &new_val, env)?;
-    let new_val = atom.get().reset(new_val);
-    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
-    check_watch_error()?;
-    Ok(new_val)
+    eval_swap_bang(evaled, env)
 }
 
 // ── with-bindings* ────────────────────────────────────────────────────────────
@@ -1490,16 +1458,26 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             )));
         }
     };
-    let previous_payload = atom.get().snapshot();
-    let old_val = previous_payload.value.clone();
-    let mut call_args = vec![old_val.clone()];
-    call_args.extend(args);
-    let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
-    validate_atom_value(&atom, &new_val, env)?;
-    let new_val = atom.get().reset(new_val);
-    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
-    check_watch_error()?;
-    Ok(new_val)
+    let mut inputs = vec![atom_val.clone(), f.clone()];
+    inputs.extend(args.iter().cloned());
+    let _inputs_root = crate::env::gc_roots::root_values(&inputs);
+    loop {
+        let previous_payload = atom.get().snapshot();
+        let old_val = previous_payload.value.clone();
+        let _old_root = crate::env::gc_roots::root_value(&old_val);
+        let mut call_args = vec![old_val.clone()];
+        call_args.extend(args.iter().cloned());
+        let new_val = crate::env::apply::apply_value(&f, call_args, env)?;
+        let _new_root = crate::env::gc_roots::root_value(&new_val);
+        validate_atom_value(&atom, &new_val, env)?;
+        // Even isolate-local atoms have concurrent writers when the update function
+        // parks or yields on a fiber. Retry instead of overwriting their newer value.
+        if atom.get().compare_and_set(&old_val, new_val.clone()) {
+            fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
+            check_watch_error()?;
+            return Ok(new_val);
+        }
+    }
 }
 
 /// Execute `volatile!` with already-evaluated args: `[init-val]`.
