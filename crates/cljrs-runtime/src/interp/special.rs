@@ -237,7 +237,12 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
     let arities = match &rest[0].unmeta().kind {
         FormKind::Vector(_) => {
             // Single arity: (fn* [params] body...)
-            vec![parse_arity(&rest[0], &rest[1..])?]
+            // Resolve auto-keywords in patterns in the defining namespace,
+            // before either the interpreter or IR consumes the parameters.
+            vec![parse_arity(
+                &resolve_auto_forms(&rest[0], env)?,
+                &rest[1..],
+            )?]
         }
         FormKind::List(_) => {
             // Multi-arity: (fn* ([params] body...) ...)
@@ -247,7 +252,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
                         if forms.is_empty() {
                             return Err(EvalError::Runtime("arity clause requires params".into()));
                         }
-                        parse_arity(&forms[0], &forms[1..])
+                        parse_arity(&resolve_auto_forms(&forms[0], env)?, &forms[1..])
                     } else {
                         Err(EvalError::Runtime("expected arity clause (list)".into()))
                     }
