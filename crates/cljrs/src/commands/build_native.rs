@@ -1,5 +1,6 @@
 //! `cljrs build-native` — build the project's own `:rust` crate as a shared
-//! library, the one `cljrs run` and `cljrs repl` load at startup.
+//! library, the one `cljrs run` and `cljrs repl` load at startup — and record
+//! the project as trusted to load it.
 
 use miette::IntoDiagnostic as _;
 
@@ -51,5 +52,38 @@ pub fn run(args: Args) -> miette::Result<i32> {
     eprintln!("[build-native] built {}", lib_path.display());
     println!("{}", lib_path.display());
 
+    // Building a project's native crate is an explicit decision to run its
+    // native code, so it also records the project as trusted to load it.
+    // This is the only place a build grants trust; the gate itself
+    // (`native::check`) knows nothing about it.
+    if let Some(root) = config.root.as_deref() {
+        trust_built_project(root);
+    }
+
     Ok(0)
+}
+
+/// Record `root` in the trust store after a successful build, saying so when
+/// it is newly added.  A failure to record is a warning, not a build failure:
+/// the library is built, and `cljrs trust` or `--native` still work.
+fn trust_built_project(root: &std::path::Path) {
+    let recorded = cljrs_project::trust::TrustStore::open().and_then(|mut store| {
+        let (canonical, added) = store.add(root)?;
+        if added {
+            store.save()?;
+        }
+        Ok((canonical, added))
+    });
+    match recorded {
+        Ok((canonical, true)) => eprintln!(
+            "[build-native] trusted {} to load native code (undo with `cljrs untrust`)",
+            canonical.display()
+        ),
+        Ok((_, false)) => {}
+        Err(e) => eprintln!(
+            "[build-native] warning: could not record {} as trusted ({e}); \
+             run `cljrs trust` or pass --native to load the library",
+            root.display()
+        ),
+    }
 }

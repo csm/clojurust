@@ -18,11 +18,19 @@ cljrs [GLOBAL OPTIONS] <SUBCOMMAND> [SUBCOMMAND OPTIONS]
 | [`compile`](compile.md) | AOT-compile a source file to a native binary |
 | [`test`](test.md) | Run `clojure.test` namespaces |
 | [`deps`](deps.md) | Manage project dependencies declared in `cljrs.edn` |
+| [`build-native`](build-native.md) | Build the project's `:rust` crate as a shared library |
+| [`trust`](trust.md) | Allow (`trust`) or stop allowing (`untrust`) a project to load native code |
 | [`ir`](ir.md) | Inspect, pre-lower, and visualize the IR (`build`/`dump`/`viz`) |
 
 ## Global options
 
 These options are accepted by every subcommand.
+
+### `--native`, `--no-native`, `--no-config`
+
+Control whether native code declared by `cljrs.edn` is loaded, and whether
+`cljrs.edn` is consulted at all. By default native code loads only for
+projects you have trusted. See [`trust`](trust.md).
 
 ### `--stack-size-mb <MB>`
 

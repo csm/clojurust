@@ -30,11 +30,16 @@ mode. Use this when profiling or shipping.
    - Linux: `target/debug/libmy_project.so`
    - macOS: `target/debug/libmy_project.dylib`
    - Windows: `target/debug/my_project.dll`
+6. Records the project as [trusted](trust.md) to load native code, printing a
+   line when it is newly added. Undo with `cljrs untrust`.
 
 ## Auto-loading
 
-Once the library exists, `cljrs run` and `cljrs repl` load it automatically on
-startup — no flags required. If the library is absent (not yet built or
+Once the library exists and the project is [trusted](trust.md) — which a
+successful `cljrs build-native` takes care of — `cljrs run` and `cljrs repl`
+load it automatically on startup, with no flags required. A library built some
+other way (plain `cargo build`, or a checkout whose `target/` came from
+elsewhere) is not loaded until you run `cljrs trust` or pass `--native`. If the library is absent (not yet built or
 deleted), a warning is printed but the interpreter continues; calls to
 unregistered native functions will produce a runtime error.
 

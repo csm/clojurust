@@ -3,8 +3,9 @@
 ## Purpose
 
 The project layer: everything needed to turn a `cljrs.edn` file into resolved
-source paths and dependency checkouts — configuration parsing (`config`) and
-the git operations that materialize what it declares (`vcs`).
+source paths and dependency checkouts — configuration parsing and discovery
+(`config`), the record of which projects may run native code (`trust`), and
+the git operations that materialize what the config declares (`vcs`).
 
 ## Status
 
@@ -70,8 +71,9 @@ what it needs.
 
 | File | Description |
 |------|-------------|
-| `src/lib.rs` | Crate root; declares `config` and the native-only, `vcs`-feature-gated `vcs` |
-| `src/config.rs` | `cljrs.edn` types (`DepsConfig`, `RustConfig`, `Dependency`, `Alias`, `GitDep`, `TrustedSigner`), `find_config_file`, `load_config` |
+| `src/lib.rs` | Crate root; declares `config`, `trust`, and the native-only, `vcs`-feature-gated `vcs` |
+| `src/config.rs` | `cljrs.edn` types (`DepsConfig`, `RustConfig`, `Dependency`, `Alias`, `GitDep`, `TrustedSigner`), `find_config_file`, `load_config` (home-directory boundary, ownership check, `set_discovery_enabled`) |
+| `src/trust.rs` | Native-code project trust: `TrustStore` (`~/.cljrs/trusted-projects`), `CLJRS_TRUSTED_PROJECTS`, `is_trusted` |
 | `src/config/parse.rs` | Walk the `cljrs-reader` Form tree from `cljrs.edn` source into `DepsConfig` |
 | `src/vcs.rs` | `VcsError` and the `gix`-backed git operations |
 | `src/vcs/signature.rs` | Native PGP/SSH commit-signature verification and the `TrustedKeys` set |
@@ -84,16 +86,27 @@ what it needs.
 ### `cljrs_project::config`
 
 ```rust
-/// Find the nearest `cljrs.edn` by walking up from `start`.
+/// Find the nearest `cljrs.edn` by walking up from `start`.  The walk checks
+/// the user's home directory and stops there; a `start` outside it is walked
+/// to the filesystem root.  Locates only — applies no ownership check.
 pub fn find_config_file(start: &Path) -> Option<PathBuf>
 
-/// Load and parse the nearest `cljrs.edn`, returning None if absent.
+/// Load and parse the nearest `cljrs.edn`, returning None if absent or if
+/// discovery is off.  Sets `DepsConfig::root`.  On unix, a config (or config
+/// directory) owned by another non-root user is `Err(ForeignOwner)` unless
+/// its root is trusted (`trust::is_trusted`); the walk does not continue past
+/// a refused config.
 pub fn load_config(start: &Path) -> DepsResult<Option<DepsConfig>>
+
+/// Process-wide switch for `load_config` (`cljrs --no-config` turns it off).
+pub fn set_discovery_enabled(enabled: bool)
+pub fn discovery_enabled() -> bool
 
 /// Parse `cljrs.edn` source text directly (used in tests / CLI).
 pub fn parse_config(src: &str, config_path: &Path) -> Result<DepsConfig, String>
 
 pub struct DepsConfig {
+    pub root:                     Option<PathBuf>,   // dir of the cljrs.edn; set by load_config
     pub paths:                    Vec<PathBuf>,
     pub deps:                     Vec<(Arc<str>, Dependency)>,
     pub aliases:                  Vec<(Arc<str>, Alias)>,
@@ -146,9 +159,52 @@ pub struct Alias {
     pub extra_deps:  Vec<(Arc<str>, Dependency)>,
 }
 
-pub enum DepsError { Io(std::io::Error), Parse(String) }
+pub enum DepsError {
+    Io(std::io::Error),
+    Parse(String),
+    /// `what` is "the file" or "its directory"; `root` is what to `cljrs trust`.
+    ForeignOwner { path: PathBuf, root: PathBuf, what: &'static str, owner: u32 },
+}
 pub type DepsResult<T> = Result<T, DepsError>;
 ```
+
+`DepsConfig` also carries `root: Option<PathBuf>` — the directory of the
+`cljrs.edn` it was loaded from (`None` for a config parsed from a string or
+built in code). Native-code trust is keyed on it.
+
+### `cljrs_project::trust`
+
+Which project roots the user has allowed to run native code. Written only by
+explicit user action; consulted by the `cljrs` CLI's native-load gate and by
+`load_config`'s ownership check. Trust is keyed on the canonical path of the
+root and covers exactly that directory.
+
+```rust
+pub const TRUSTED_PROJECTS_ENV: &str = "CLJRS_TRUSTED_PROJECTS"; // a path list
+
+/// `~/.cljrs/trusted-projects`; None when the home directory is unknown.
+pub fn store_path() -> Option<PathBuf>
+
+/// True when `root` is listed in CLJRS_TRUSTED_PROJECTS or the store.
+/// Fails closed: an unresolvable root or unreadable store is "not trusted".
+pub fn is_trusted(root: &Path) -> bool
+
+pub struct TrustStore { /* private */ }
+impl TrustStore {
+    pub fn open() -> io::Result<TrustStore>;            // missing file = empty
+    pub fn open_at(path: impl Into<PathBuf>) -> io::Result<TrustStore>;
+    pub fn path(&self) -> &Path;
+    pub fn roots(&self) -> &[PathBuf];
+    pub fn contains(&self, root: &Path) -> bool;        // canonicalises `root`
+    /// Returns the canonical path and whether it was newly added.
+    pub fn add(&mut self, root: &Path) -> io::Result<(PathBuf, bool)>;
+    pub fn remove(&mut self, root: &Path) -> bool;
+    pub fn save(&self) -> io::Result<()>;               // atomic replace
+}
+```
+
+The store is plain text: one canonical directory per line; `#` comments and
+blank lines are ignored.
 
 ### `cljrs_project::vcs` (native targets, `vcs` feature)
 

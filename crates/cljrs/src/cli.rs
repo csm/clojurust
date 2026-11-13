@@ -49,6 +49,24 @@ pub struct Cli {
     #[arg(long, global = true)]
     enforce_native_versions: bool,
 
+    /// Load native code declared by `cljrs.edn` for this run even though the
+    /// project has not been trusted with `cljrs trust`.  Also enabled by the
+    /// `CLJRS_NATIVE` environment variable.
+    #[arg(long, global = true, conflicts_with = "no_native")]
+    native: bool,
+
+    /// Never load native code declared by `cljrs.edn`, even for a trusted
+    /// project.  Also enabled by the `CLJRS_NO_NATIVE` environment variable,
+    /// which overrides `--native` / `CLJRS_NATIVE`.
+    #[arg(long, global = true)]
+    no_native: bool,
+
+    /// Do not look for a `cljrs.edn` at all: no project paths, dependencies
+    /// or native code.  Also enabled by the `CLJRS_NO_CONFIG` environment
+    /// variable.
+    #[arg(long, global = true)]
+    no_config: bool,
+
     /// JIT compilation invocation threshold (default 1000; 0 = disable JIT).
     /// Also read from CLJRS_JIT_THRESHOLD env var.
     #[arg(
@@ -146,14 +164,26 @@ pub enum Commands {
     ///
     /// Reads the `:rust` key from `cljrs.edn`, runs `cargo build` in the
     /// declared crate directory, and prints the path of the resulting
-    /// `.so` / `.dylib` / `.dll`.  The library is loaded automatically by
-    /// `cljrs run` and `cljrs repl` to register native functions before any
-    /// Clojure code is evaluated.
+    /// `.so` / `.dylib` / `.dll`.  A successful build also records the
+    /// project as trusted (see `cljrs trust`), so the library is then loaded
+    /// automatically by `cljrs run` and `cljrs repl` to register native
+    /// functions before any Clojure code is evaluated.
     ///
     /// The user crate must declare `crate-type = ["cdylib"]` (or
     /// `["cdylib", "rlib"]`) and export a `#[no_mangle] pub extern "C" fn
     /// cljrs_init_<crate>(registry: *mut cljrs_interop::Registry)` entry point.
     BuildNative(commands::build_native::Args),
+    /// Allow a project to load native code.
+    ///
+    /// Native code declared by a `cljrs.edn` — the project's `:rust` crate
+    /// and any `:rust/load :dylib` dependency — is built and loaded only for
+    /// project roots recorded in `~/.cljrs/trusted-projects`.  This adds one;
+    /// `--list` shows them.  Trust is per directory and survives edits to
+    /// `cljrs.edn`.  Non-interactive callers can set `CLJRS_TRUSTED_PROJECTS`
+    /// to a path list instead.
+    Trust(commands::trust::Args),
+    /// Stop allowing a project to load native code.
+    Untrust(commands::trust::UntrustArgs),
     /// Run the clojurust language server (LSP) over stdio.
     ///
     /// Speaks the Language Server Protocol on stdin/stdout for editor
@@ -265,6 +295,16 @@ fn run(cli: Cli) -> miette::Result<i32> {
         None => {}
     }
 
+    // Decide, before any session exists, whether `cljrs.edn` is consulted and
+    // whether native code it declares may be loaded.
+    if cli.no_config || env_flag("CLJRS_NO_CONFIG") {
+        cljrs_project::config::set_discovery_enabled(false);
+    }
+    crate::native::set_policy(crate::native::NativePolicy::from_requests(
+        cli.native || env_flag("CLJRS_NATIVE"),
+        cli.no_native || env_flag("CLJRS_NO_NATIVE"),
+    ));
+
     let gc_stats_target = cli.gc_stats.clone();
     let jit_stats_target = cli.jit_stats.clone();
     let versioning = VersioningFlags {
@@ -294,6 +334,11 @@ fn run(cli: Cli) -> miette::Result<i32> {
     result
 }
 
+/// Whether a boolean environment switch is on: set, non-empty, and not `0`.
+fn env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Hand each subcommand to the module that owns it.
 fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result<i32> {
     match command {
@@ -305,6 +350,8 @@ fn run_command(command: Commands, versioning: VersioningFlags) -> miette::Result
         Commands::Test(args) => commands::test::run(args, versioning),
         Commands::Deps { command } => commands::deps::run(command),
         Commands::BuildNative(args) => commands::build_native::run(args),
+        Commands::Trust(args) => commands::trust::run(args),
+        Commands::Untrust(args) => commands::trust::run_untrust(args),
         Commands::Lsp => commands::lsp::run(),
         Commands::Nrepl(args) => commands::nrepl::run(args, versioning),
     }
