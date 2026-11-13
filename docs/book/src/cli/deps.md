@@ -131,7 +131,8 @@ are rejected.
 
 When `:rust` is present, `cljrs run` and `cljrs repl` automatically load the
 compiled shared library from `<crate>/target/debug/lib<name>.so` (or
-equivalent). Build it first with `cljrs build-native`.
+equivalent) — provided the project is [trusted](trust.md). Build it first with
+`cljrs build-native`, which also grants that trust.
 
 ### Dependency descriptors
 
@@ -158,7 +159,9 @@ vendor {:local/root "../vendor/utils"}
 A dependency that ships Rust code can have that code built as a cdylib and
 loaded into the runtime, so `(require '[my.lib])` brings in a namespace no
 Clojure source provides. Opt in with `:rust/load :dylib` and name the crate's
-init function:
+init function. Because this builds and loads native code, it only happens in a
+project you have [trusted](trust.md) (or with `--native`); otherwise the
+`require` fails with a message saying so, and nothing is built:
 
 ```clojure
 {:deps

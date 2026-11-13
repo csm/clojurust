@@ -144,7 +144,7 @@ See [`TODO.md`](TODO.md) for the full itemised roadmap.
 
 | Crate | Description | Status |
 |-------|-------------|--------|
-| [`cljrs`](crates/cljrs) | `cljrs` CLI: `run`, `repl`, `eval`, `test`, `compile`, `ir` (`build`/`dump`/`viz`), `deps`, `lsp`, `nrepl`, `build-native` (clap-based) | functional |
+| [`cljrs`](crates/cljrs) | `cljrs` CLI: `run`, `repl`, `eval`, `test`, `compile`, `ir` (`build`/`dump`/`viz`), `deps`, `lsp`, `nrepl`, `build-native`, `trust`/`untrust` (clap-based) | functional |
 
 Each crate has its own `README.md` with purpose, status, file layout, and public API.
 

@@ -11,6 +11,15 @@
 //!
 //! Both are host policy, not runtime policy: `cljrs_runtime` exposes the loader
 //! hooks and this is the CLI deciding to fill them in.
+//!
+//! ## The trust gate
+//!
+//! Both paths are requested by `cljrs.edn`, and a `cljrs.edn` is found by
+//! walking up from the working directory — so the file asking for native code
+//! cannot be what authorises it. Every path therefore passes [`check`] first,
+//! **before** anything is loaded and before any `cargo` process is started in
+//! a directory the config names (a toolchain proxy run there can itself be
+//! redirected by files in that directory). See [`NativePolicy`] for the rule.
 
 pub mod pinned;
 
@@ -18,6 +27,115 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cljrs_runtime::tiered::GlobalEnv;
+
+// ── Trust gate ────────────────────────────────────────────────────────────────
+
+/// When config-requested native code may be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativePolicy {
+    /// The default: only for a project root the user has trusted
+    /// ([`cljrs_project::trust::is_trusted`]).
+    Trusted,
+    /// `--native` / `CLJRS_NATIVE`: for any project, for this process only.
+    Allow,
+    /// `--no-native` / `CLJRS_NO_NATIVE`: never, trusted or not.
+    Deny,
+}
+
+impl NativePolicy {
+    /// Combine the "allow" and "deny" requests (each a CLI flag or its
+    /// environment variable).  Deny wins over allow.
+    pub fn from_requests(allow: bool, deny: bool) -> NativePolicy {
+        if deny {
+            NativePolicy::Deny
+        } else if allow {
+            NativePolicy::Allow
+        } else {
+            NativePolicy::Trusted
+        }
+    }
+
+    /// The decision for a config rooted at `project_root`.
+    ///
+    /// `None` means the config was not discovered on disk — the host program
+    /// built it and handed it over — so there is no project to distrust; only
+    /// [`NativePolicy::Deny`] refuses it.
+    pub fn decide(self, project_root: Option<&Path>) -> Result<(), Refusal> {
+        match (self, project_root) {
+            (NativePolicy::Deny, _) => Err(Refusal::Disabled),
+            (NativePolicy::Allow, _) | (NativePolicy::Trusted, None) => Ok(()),
+            (NativePolicy::Trusted, Some(root)) => {
+                if cljrs_project::trust::is_trusted(root) {
+                    Ok(())
+                } else {
+                    Err(Refusal::Untrusted(root.to_path_buf()))
+                }
+            }
+        }
+    }
+}
+
+/// Why [`check`] refused to load native code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// Native loading is switched off for this process.
+    Disabled,
+    /// The project at this root has not been trusted.
+    Untrusted(PathBuf),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Disabled => f.write_str("native loading is disabled (--no-native)"),
+            Refusal::Untrusted(root) => write!(
+                f,
+                "the project at {} is not trusted to run native code; \
+                 run `cljrs trust` there to allow it, or pass --native for this run only",
+                root.display()
+            ),
+        }
+    }
+}
+
+/// The process-wide policy: 0 = Trusted, 1 = Allow, 2 = Deny.
+static POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Set the process-wide native-loading policy.  Called once by the CLI,
+/// before any session is created.
+pub fn set_policy(policy: NativePolicy) {
+    let raw = match policy {
+        NativePolicy::Trusted => 0,
+        NativePolicy::Allow => 1,
+        NativePolicy::Deny => 2,
+    };
+    POLICY.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process-wide native-loading policy.
+pub fn policy() -> NativePolicy {
+    match POLICY.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => NativePolicy::Allow,
+        2 => NativePolicy::Deny,
+        _ => NativePolicy::Trusted,
+    }
+}
+
+/// The gate every config-requested native load passes: may native code named
+/// by the config rooted at `project_root` be built and loaded?
+pub fn check(project_root: Option<&Path>) -> Result<(), Refusal> {
+    policy().decide(project_root)
+}
+
+/// Report a refusal on stderr, at most once per process: a session can reach
+/// the gate many times (one per pinned lookup) and the answer does not change.
+/// A [`Refusal::Disabled`] is the user's own request and is not reported.
+pub(crate) fn report_refusal(refusal: &Refusal) {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    if matches!(refusal, Refusal::Untrusted(_)) {
+        REPORTED.call_once(|| eprintln!("cljrs: native code not loaded: {refusal}"));
+    }
+}
 
 /// Return the expected on-disk path for the shared library produced by
 /// `cargo build` inside `crate_dir`.
@@ -78,16 +196,31 @@ fn target_dir_from_metadata(json: &str) -> Option<PathBuf> {
 /// its `cljrs_init_<crate>`
 /// entry point to register native functions into `globals`.
 ///
+/// `project_root` is the directory of the `cljrs.edn` that declared the crate
+/// ([`cljrs_project::config::DepsConfig::root`]).  Nothing is loaded, and no
+/// `cargo` process is started, unless [`check`] passes for it; a refusal is
+/// reported once and the session carries on without the native functions.
+///
 /// A missing library emits a warning and returns — callers of unregistered
 /// functions will get a runtime error rather than a startup crash, which is
 /// friendlier during development.
-pub fn load_project_lib(rust_config: &cljrs_project::config::RustConfig, globals: &Arc<GlobalEnv>) {
+pub fn load_project_lib(
+    rust_config: &cljrs_project::config::RustConfig,
+    project_root: Option<&Path>,
+    globals: &Arc<GlobalEnv>,
+) {
     let Some(init_fn) = rust_config.init_fn.as_deref() else {
         return;
     };
     let Some(crate_name) = rust_config.crate_name() else {
         return;
     };
+    // The gate comes before `native_lib_path`, which runs `cargo metadata`
+    // inside the crate directory.
+    if let Err(refusal) = check(project_root) {
+        report_refusal(&refusal);
+        return;
+    }
     // Symbol name is the last segment of the Rust path, e.g. "cljrs_init_my_project".
     let sym_name = init_fn.rsplit("::").next().unwrap_or(init_fn);
 
@@ -143,6 +276,55 @@ pub fn load_project_lib(rust_config: &cljrs_project::config::RustConfig, globals
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deny beats allow; neither leaves the trust-store default.
+    #[test]
+    fn deny_wins_over_allow() {
+        assert_eq!(
+            NativePolicy::from_requests(false, false),
+            NativePolicy::Trusted
+        );
+        assert_eq!(
+            NativePolicy::from_requests(true, false),
+            NativePolicy::Allow
+        );
+        assert_eq!(NativePolicy::from_requests(false, true), NativePolicy::Deny);
+        assert_eq!(NativePolicy::from_requests(true, true), NativePolicy::Deny);
+    }
+
+    /// A directory nobody has trusted is refused by default, allowed by
+    /// `Allow`, and refused as "disabled" by `Deny`.
+    #[test]
+    fn an_untrusted_root_is_refused_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            NativePolicy::Trusted.decide(Some(root)),
+            Err(Refusal::Untrusted(root.to_path_buf()))
+        );
+        assert_eq!(NativePolicy::Allow.decide(Some(root)), Ok(()));
+        assert_eq!(
+            NativePolicy::Deny.decide(Some(root)),
+            Err(Refusal::Disabled)
+        );
+    }
+
+    /// A config the host built in code has no root to distrust, but the off
+    /// switch still applies to it.
+    #[test]
+    fn a_rootless_config_is_only_refused_when_disabled() {
+        assert_eq!(NativePolicy::Trusted.decide(None), Ok(()));
+        assert_eq!(NativePolicy::Allow.decide(None), Ok(()));
+        assert_eq!(NativePolicy::Deny.decide(None), Err(Refusal::Disabled));
+    }
+
+    /// The refusal tells the user both ways out.
+    #[test]
+    fn the_untrusted_message_names_the_remedies() {
+        let msg = Refusal::Untrusted(PathBuf::from("/p")).to_string();
+        assert!(msg.contains("cljrs trust"), "{msg}");
+        assert!(msg.contains("--native"), "{msg}");
+    }
 
     /// The shape cargo emits today: one compact line.
     #[test]

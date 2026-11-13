@@ -11,7 +11,7 @@ default = ["vcs", "vcs-net"]
 
 # The `vcs` module: local git operations (gitoxide) plus commit-signature
 # verification (rPGP / ssh-key). Without it the crate is just the `cljrs.edn`
-# config model and has no dependencies outside the workspace.
+# config model and the trust store, with only small non-workspace dependencies.
 vcs = ["dep:gix", "dep:pgp", "dep:ssh-key"]
 
 # `fetch_remote` and friends: cloning/fetching a remote into the local cache.
@@ -49,6 +49,10 @@ tokio      = { workspace = true, optional = true, features = [
     "io-util",
 ] }
 tokio-util = { workspace = true, optional = true }
+
+# `geteuid`, for the config-ownership check in `config::load_config`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

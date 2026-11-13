@@ -12,6 +12,7 @@
   - [test](cli/test.md)
   - [deps](cli/deps.md)
   - [build-native](cli/build-native.md)
+  - [trust](cli/trust.md)
   - [ir](cli/ir.md)
 
 # The Language
