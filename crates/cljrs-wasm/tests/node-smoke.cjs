@@ -13,6 +13,10 @@ const pkgDir = path.resolve(process.argv[2] || path.join(__dirname, "..", "pkg-n
 const { Repl } = require(path.join(pkgDir, "cljrs_wasm.js"));
 
 const cases = [
+  // Keyword entries in :keys bind locals in the browser REPL (#493).
+  ["(let [{:keys [:x]} {:x 5}] x)", "5"],
+  ["(let [{:keys [:person/x]} {:person/x 6}] x)", "6"],
+  ["((fn [{:keys [:x] :or {x 7}}] x) {})", "7"],
   // Enough allocation to trigger a GC cycle.
   ["(count (vec (repeat 100000 0)))", "100000"],
   ["(defn f [x y] (reduce + (map (fn [a] a) [x y])))", "#'user/f"],
