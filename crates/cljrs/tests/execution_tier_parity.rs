@@ -39,6 +39,23 @@ const PROGRAM: &str = r#"
   ;; counts how many times it actually ran (issue #363).
   [{:keys [x] :or {x (do (swap! parity-or-default-count inc) 1)}}]
   x)
+;; `loop` binds like `let` on entry: a later initializer sees the loop-local,
+;; not a shadowed outer binding; `recur` still evaluates every argument against
+;; the current iteration before rebinding them together (issue #477).
+(defn parity-loop-init [x]
+  (let [a 40]
+    (loop [a x b (inc a) swap? true]
+      (if swap?
+        (recur b a false)
+        [a b]))))
+(defn parity-loop-init-destructure [x]
+  (let [a 40]
+    (loop [[a] [x] b (inc a)]
+      [a b])))
+(defn parity-loop-init-closure [x]
+  (let [a 40]
+    (loop [a x f (fn [] a)]
+      (f))))
 (def parity-input [1 2 3 4])
 (def parity-literal-sink nil)
 (def parity-seq-sink nil)
@@ -66,6 +83,9 @@ const PROGRAM: &str = r#"
   (parity-kwargs-as {:a 3})
   (try (parity-kwargs :a 1 :b) (catch Exception e nil))
   (parity-seq-rest 1 2)
+  (parity-loop-init 2)
+  (parity-loop-init-destructure 2)
+  (parity-loop-init-closure 2)
   ;; Keeping allocation-heavy results reachable also prevents AOT's region
   ;; optimizer from turning the JIT warm-up into an allocation stress test.
   (def parity-literal-sink (parity-literals))
@@ -108,6 +128,12 @@ const PROGRAM: &str = r#"
          (catch Exception e
            (str "error|" (ex-message e))))))
 (println (str "seq-rest|value|" (pr-str (parity-seq-rest 1 2))))
+(println (str "loop-init|value|" (pr-str (parity-loop-init 2))))
+(println (str "loop-init-destructure|value|"
+              (pr-str (parity-loop-init-destructure 2))))
+(println (str "loop-init-closure|value|" (pr-str (parity-loop-init-closure 2))))
+(println (str "loop-init-top-level|value|"
+              (pr-str (loop [loop-a 2 b loop-a] b))))
 (println
   (str "arithmetic-error|"
        (try
@@ -283,7 +309,7 @@ fn parse_records(tier: Tier, output: &Output) -> BTreeMap<String, Outcome> {
             tier.name()
         );
     }
-    assert_eq!(records.len(), 22, "{} stdout:\n{stdout}", tier.name());
+    assert_eq!(records.len(), 26, "{} stdout:\n{stdout}", tier.name());
     records
 }
 
@@ -337,6 +363,13 @@ fn values_and_errors_match_across_all_execution_tiers() {
         Outcome::Error("No value supplied for key: :b".to_string())
     );
     assert_eq!(tree["seq-rest"], Outcome::Value("[1 2]".to_string()));
+    assert_eq!(tree["loop-init"], Outcome::Value("[3 2]".to_string()));
+    assert_eq!(
+        tree["loop-init-destructure"],
+        Outcome::Value("[2 3]".to_string())
+    );
+    assert_eq!(tree["loop-init-closure"], Outcome::Value("2".to_string()));
+    assert_eq!(tree["loop-init-top-level"], Outcome::Value("2".to_string()));
     assert_eq!(
         tree["overflow-add"],
         Outcome::Value("9223372036854775808N".to_string())

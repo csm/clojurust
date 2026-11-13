@@ -7,7 +7,7 @@ use std::future::Future;
 use std::pin::{Pin, pin};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Private unwind payload for infallible Rust parking APIs.
 #[derive(Debug)]

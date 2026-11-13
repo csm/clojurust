@@ -19,5 +19,7 @@ inventory     = { workspace = true }
 
 # Not available on wasm32-unknown-unknown (pulls in errno).  The wasm build
 # uses a fixed 64 MB heap limit instead.
+web-time = { workspace = true }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 system-memory = "0.1.7"

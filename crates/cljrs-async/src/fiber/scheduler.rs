@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::task::{Wake, Waker};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use super::FiberId;
 use cljrs_gc::fiber::SafepointError;

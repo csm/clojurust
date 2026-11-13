@@ -1165,11 +1165,33 @@ fn lower_loop(ctx: &mut LowerCtx, args: &[Form]) -> R {
     }
 
     // Evaluate initial values; generate gensym names for phi nodes.
+    // Initial entry binds like `let`: each initializer sees the patterns bound
+    // by the initializers before it, so bind them in a temporary scope as we
+    // go.  The header block rebinds the patterns from the phi nodes.
     let mut binding_info: Vec<BindingInfo> = Vec::new();
+    ctx.push_scope();
     let mut i = 0;
     while i + 1 < bindings.len() {
         let pattern = bindings[i].clone();
-        let init_val = lower_form(ctx, &bindings[i + 1])?;
+        let init_val = match lower_form(ctx, &bindings[i + 1]) {
+            Ok(v) => v,
+            Err(e) => {
+                ctx.pop_scope();
+                return Err(e);
+            }
+        };
+        if i + 2 < bindings.len() {
+            let bound = if let FormKind::Symbol(s) = &pattern.kind {
+                ctx.bind_local(Arc::from(s.as_str()), init_val);
+                Ok(())
+            } else {
+                lower_destructure_binding(ctx, &pattern, init_val)
+            };
+            if let Err(e) = bound {
+                ctx.pop_scope();
+                return Err(e);
+            }
+        }
         let gensym_name: Arc<str> = Arc::from(format!("__loop_{}", ctx.fresh_var().0).as_str());
         binding_info.push(BindingInfo {
             pattern,
@@ -1178,6 +1200,7 @@ fn lower_loop(ctx: &mut LowerCtx, args: &[Form]) -> R {
         });
         i += 2;
     }
+    ctx.pop_scope();
 
     let header = ctx.fresh_block();
     let init_block = ctx.current_block_id();

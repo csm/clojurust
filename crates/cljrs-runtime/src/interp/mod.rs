@@ -8,6 +8,7 @@
 
 pub mod apply;
 pub mod arity;
+mod capture;
 pub mod destructure;
 pub mod eval;
 pub mod macros;

@@ -70,10 +70,15 @@ pub fn run(args: Args, versioning: VersioningFlags) -> miette::Result<i32> {
 
     let _gc_config = session::build_gc_config(gc_soft_limit_mb, gc_hard_limit_mb)?;
 
-    // Load cljrs.edn; silently absent is fine.
-    let deps_config = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| cljrs_project::config::load_config(&cwd).ok().flatten());
+    // Load cljrs.edn; silently absent is fine, but one that is present and
+    // unusable (unparseable, or refused because another user owns it) is
+    // reported rather than quietly compiled without.
+    let deps_config = std::env::current_dir().ok().and_then(|cwd| {
+        cljrs_project::config::load_config(&cwd).unwrap_or_else(|e| {
+            eprintln!("cljrs: warning: {e}");
+            None
+        })
+    });
 
     let rust_config = deps_config.as_ref().and_then(|c| c.rust.clone());
 

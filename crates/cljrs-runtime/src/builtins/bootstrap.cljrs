@@ -1064,8 +1064,20 @@
            (recur (next s) (inc i) (conj acc v))))
        (seq acc)))))
 
-(defn reduce-kv [f init m]
-  (reduce (fn [acc kv] (f acc (first kv) (second kv))) init m))
+(defn reduce-kv
+  "Reduces an associative collection. f is called with the accumulator, a
+  key and its value. For a vector the keys are the zero-based indices and
+  the values are the whole elements; for a map they come from each entry.
+  Honours reduced, and returns init when the collection is empty."
+  [f init m]
+  (if (vector? m)
+    (let [n (count m)]
+      (loop [i 0 acc init]
+        (if (< i n)
+          (let [r (f acc i (nth m i))]
+            (if (reduced? r) @r (recur (inc i) r)))
+          acc)))
+    (reduce (fn [acc kv] (f acc (key kv) (val kv))) init m)))
 
 (defn update
   "Returns a new structure with the value at key updated by applying f to
@@ -1569,6 +1581,14 @@
 (defmacro comment
   [& _]
   nil)
+
+(defmacro time
+  "Evaluates expr and prints the time it took. Returns the value of expr."
+  [expr]
+  `(let [start# (System/nanoTime)
+         ret# ~expr]
+     (println (str "\"Elapsed time: " (/ (double (- (System/nanoTime) start#)) 1000000.0) " msecs\""))
+     ret#))
 
 (defmacro prn-str
   [& body]

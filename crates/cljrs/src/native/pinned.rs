@@ -23,7 +23,10 @@
 //!    back to a native function; `require` calls the other for a namespace no
 //!    source path provides.
 //! 2. The hook checks `cljrs.edn` for a dep covering the namespace with
-//!    `:rust/load :dylib` and a `:rust/init` function.
+//!    `:rust/load :dylib` and a `:rust/init` function, then passes the trust
+//!    gate ([`super::check`]) for the project that `cljrs.edn` belongs to.
+//!    The config opting in is not enough: an untrusted project builds and
+//!    loads nothing.
 //! 3. The dep's source is materialized — fetched and checked out at the
 //!    pinned commit (`cljrs_project::vcs`), or taken as-is from
 //!    `:local/root` — and wrapped in a generated cdylib crate that pins the
@@ -112,6 +115,13 @@ fn load_pinned(globals: &Arc<GlobalEnv>, base_ns: &str, commit: &str) -> EvalRes
     if !decl.is_pinned() {
         return Ok(false);
     }
+    // The trust gate, before anything is fetched, built or loaded.  Declining
+    // leaves versioned resolution on its default path: the current binary's
+    // implementation, with provenance verification.
+    if let Err(refusal) = super::check(config.root.as_deref()) {
+        super::report_refusal(&refusal);
+        return Ok(false);
+    }
     let dep = decl
         .validate()
         .map_err(|e| EvalError::Runtime(format!("pinned native {base_ns}: {e}")))?;
@@ -152,6 +162,11 @@ fn load_require(globals: &Arc<GlobalEnv>, ns: &str) -> EvalResult<bool> {
     let Some(decl) = find_dylib_dep(&config, ns) else {
         return Ok(false);
     };
+    // The trust gate, before anything is fetched, built or loaded.  This is an
+    // error rather than a decline: the namespace exists only as native code,
+    // so declining would surface as a misleading "namespace not found".
+    super::check(config.root.as_deref())
+        .map_err(|refusal| EvalError::Runtime(format!("native dep {ns}: {refusal}")))?;
     let dep = decl
         .validate()
         .map_err(|e| EvalError::Runtime(format!("native dep {ns}: {e}")))?;

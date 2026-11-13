@@ -30,3 +30,4 @@ uuid         = { workspace = true }
 regex        = { workspace = true, optional = true }
 regex-lite   = { workspace = true, optional = true }
 arc-swap     = { workspace = true }
+web-time     = { workspace = true }

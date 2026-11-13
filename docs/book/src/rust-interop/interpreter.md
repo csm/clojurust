@@ -17,25 +17,39 @@ cljrs run src/main.cljrs
 cljrs repl
 ```
 
-`cljrs build-native` is just `cargo build` run inside the crate directory
+`cljrs build-native` is `cargo build` run inside the crate directory
 declared by `:rust :crate` in `cljrs.edn`. It inherits your normal Rust
-toolchain, `RUSTFLAGS`, and `cargo` configuration.
+toolchain, `RUSTFLAGS`, and `cargo` configuration. On success it also records
+the project as trusted to load native code.
+
+## Trust
+
+Native code is loaded only for a project you have trusted; a `cljrs.edn`
+cannot authorise its own `:rust` section. `cljrs build-native` grants that
+trust, so the workflow above needs nothing extra. If you build the library
+with plain `cargo build`, or clone a project that already has one, run
+`cljrs trust` once in the project (or pass `--native` for a single run).
+Without it the session starts normally but the native functions are not
+registered. See [`cljrs trust`](../cli/trust.md).
 
 ## How auto-loading works
 
 When `cljrs run` (or `repl`) starts:
 
 1. It locates `cljrs.edn` by walking up the directory tree.
-2. If `:rust` is present, it derives the library path from the crate name and
+2. If `:rust` is present, it checks that the project is trusted (or that
+   `--native` was passed). If not, it prints a notice and stops here — no
+   library is opened and no `cargo` process is started.
+3. It derives the library path from the crate name and
    profile (`debug` by default):
    - Linux: `<crate_dir>/target/debug/lib<crate_name>.so`
    - macOS: `<crate_dir>/target/debug/lib<crate_name>.dylib`
    - Windows: `<crate_dir>/target/debug/<crate_name>.dll`
-3. It opens the library with `dlopen` and looks up the symbol named after the
+4. It opens the library with `dlopen` and looks up the symbol named after the
    last `::` segment of `:rust :init` (e.g. `"cljrs_init_my_project"`).
-4. It calls the symbol with a `*mut Registry`, which registers all native
+5. It calls the symbol with a `*mut Registry`, which registers all native
    functions into the global namespace table.
-5. The library is kept loaded for the lifetime of the process.
+6. The library is kept loaded for the lifetime of the process.
 
 All of this happens before any Clojure source is evaluated, so native functions
 are visible to `ns`/`require` forms and to top-level code.

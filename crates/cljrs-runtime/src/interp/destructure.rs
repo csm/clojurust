@@ -1,6 +1,5 @@
 //! Sequential and associative destructuring for `let*`, `fn*`, and `loop*`.
 
-use crate::builtins::form::form_to_value;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
@@ -298,7 +297,9 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
                 // Regular {binding-form lookup-key} pair.
                 // In Clojure map destructuring {a :x}, the key position is the
                 // binding target and the value position is the lookup key.
-                let lookup_key = form_to_value(v)?;
+                // The lookup key is an EXPRESSION (`{v (identity :value)}`), so
+                // evaluate it; literals evaluate to themselves.
+                let lookup_key = crate::interp::eval::eval_unscoped(&v.clone(), env)?;
                 let mut bound_val = get_val(&lookup_key);
                 // Apply defaults for simple symbol bindings.
                 if let FormKind::Symbol(sym) = &k.kind

@@ -1,9 +1,11 @@
 //! `cljrs-project` — the project layer: what a clojurust *project* is made of.
 //!
-//! Two things, which every consumer needs together:
+//! Three things, which every consumer needs together:
 //!
 //! * [`config`] — the `cljrs.edn` model: source paths, dependencies, aliases,
 //!   the `:rust` native-crate declaration, and trusted commit signers.
+//! * [`trust`] — which project roots the user has allowed to run native code:
+//!   the per-user trust store and the `CLJRS_TRUSTED_PROJECTS` list.
 //! * [`vcs`] — the git operations that turn a declared dependency into files on
 //!   disk: fetch, cache, worktree checkout, and commit-signature verification.
 //!
@@ -18,5 +20,6 @@
 //! which is what selects gix's http transport and so the reqwest/rustls stack.
 
 pub mod config;
+pub mod trust;
 #[cfg(all(feature = "vcs", not(target_arch = "wasm32")))]
 pub mod vcs;
