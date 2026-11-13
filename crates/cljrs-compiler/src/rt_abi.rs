@@ -338,7 +338,7 @@ pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Va
     intern_keyword(name)
 }
 
-/// Create a symbol.  `ptr`/`len` is the simple name.
+/// Create a symbol from its reader spelling, including namespace and version.
 ///
 /// # Safety
 /// `ptr` must point to valid UTF-8 data of `len` bytes.
@@ -347,7 +347,7 @@ pub unsafe extern "C" fn rt_const_keyword(ptr: *const u8, len: u64) -> *const Va
 pub unsafe extern "C" fn rt_const_symbol(ptr: *const u8, len: u64) -> *const Value {
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len as *const () as usize) };
     let name = std::str::from_utf8(bytes).unwrap_or("??");
-    box_val(Value::symbol(Symbol::simple(name)))
+    box_val(Value::symbol(Symbol::parse(name)))
 }
 
 /// Materialize an exact regex, ratio, or BigDecimal constant from its source
@@ -1446,7 +1446,7 @@ pub unsafe extern "C" fn rt_count(coll: *const Value) -> *const Value {
         Value::Map(m) => m.count(),
         Value::Set(s) => s.count(),
         Value::List(l) => l.get().count(),
-        Value::Str(s) => s.get().len(),
+        Value::Str(s) => s.get().chars().count(),
         Value::Nil => 0,
         // Lazy/cons seqs — e.g. the result of `filter`/`map`/`mapcat` — must
         // be walked and realized to be counted.  Without this arm `count`
@@ -5398,6 +5398,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constant_symbols_preserve_reader_identity() {
+        let _frame = cljrs_gc::push_alloc_frame();
+        for text in [
+            "plain",
+            "bulwark.commands/register!",
+            "/",
+            "clojure.core//",
+            "library/f@abc1234",
+        ] {
+            // The bytes remain valid for the complete ABI call.
+            let actual = unsafe { rt_const_symbol(text.as_ptr(), text.len() as u64) };
+            assert_eq!(
+                unsafe { val_ref(actual) },
+                &Value::symbol(Symbol::parse(text)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn boxed_abi_bridges_have_realization_boundaries() {
         let source = include_str!("rt_abi.rs");
         let mut checked = 0;
@@ -5739,6 +5759,23 @@ mod tests {
             "count of a 3-element cons chain must be 3, got {:?}",
             unsafe { &*n }
         );
+    }
+
+    #[test]
+    fn test_count_unicode_strings() {
+        for (text, expected) in [
+            ("", 0),
+            ("ascii", 5),
+            ("café", 4),
+            ("日本語", 3),
+            ("😀", 1),
+            ("e\u{301}", 2),
+        ] {
+            let value = Value::string(text);
+            let _root = cljrs_runtime::env::gc_roots::root_value(&value);
+            let count = unsafe { rt_count(&value) };
+            assert_eq!(unsafe { &*count }, &Value::Long(expected), "{text:?}");
+        }
     }
 }
 

@@ -14,6 +14,10 @@ ANF lowering and escape analysis run in pure Rust (`cljrs_ir::lower`, in the
 `cljrs-ir` crate); the Cranelift codegen backend here consumes the resulting
 `IrFunction` structs directly.
 
+The runtime ABI reconstructs symbol constants with `Symbol::parse`.
+Compiled literals retain namespace and version fields, including symbols used as registry keys.
+`tests/qualified_symbols.rs` covers native AOT namespace, name, equality, and map lookup behavior.
+
 **Phase:** 8.1 (optimization) + 10.0 (backend refactor) + 11 (AOT compilation) + no-gc phases 6–7 — end-to-end AOT working for multi-file programs with variadic functions, protocols, escape analysis optimization, apply, core HOFs, sequence/collection ops, type predicates, atom constructor, and inline expansions.  Under the `no-gc` feature the AOT driver also runs the **blacklist analysis** (`escape.rs`) which rejects programs that cannot be safely compiled without a GC.
 
 **Phase 10.0 (backend refactor):** `Compiler` and `FunctionTranslator` are now generic over `cranelift_module::Module` (`Compiler<M: Module = ObjectModule>`).  The shared CLIF-emitting logic (`compile_function`, `declare_function`) and the full `rt_abi` symbol declaration table (`declare_runtime_funcs`) work with any `Module` backend.  AOT-specific construction (`Compiler::new`) and finalisation (`Compiler::finish`) live in `impl Compiler<ObjectModule>`; the free function `new_compiler_from_module` lets the `jit/` module hand a pre-built `JITModule` to the shared codegen.
