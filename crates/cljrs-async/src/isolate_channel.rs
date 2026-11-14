@@ -354,6 +354,14 @@ impl IsolateReceiver {
         IsolateRecv::Value(deserialize(msg.value))
     }
 
+    /// A handle for waiting until this receiver is worth polling again,
+    /// usable without borrowing the receiver across an `await`.
+    pub fn signal(&self) -> RecvSignal {
+        RecvSignal {
+            shared: self.shared.clone(),
+        }
+    }
+
     /// Close the channel: drop every queued message (returning its charge)
     /// and make later sends fail with `CloneError::Disconnected`.
     pub fn close(&mut self) {
@@ -378,6 +386,26 @@ impl IsolateReceiver {
     /// Wire bytes currently queued.
     pub fn queued_bytes(&self) -> usize {
         self.shared.lock().queued_bytes
+    }
+}
+
+/// Wakeup handle for an [`IsolateReceiver`], from [`IsolateReceiver::signal`].
+pub struct RecvSignal {
+    shared: Arc<Shared>,
+}
+
+impl RecvSignal {
+    /// Wait for a send or for the last sender to go away.  A wakeup sent
+    /// while nobody waits is kept, so checking the queue and then waiting
+    /// does not lose it.
+    pub async fn wait(&self) {
+        self.shared.recv_ready.notified().await;
+    }
+
+    /// Wake one more waiter.  A waiter that found the channel disconnected
+    /// calls this so every other waiter sees the disconnect too.
+    pub fn pass_on(&self) {
+        self.shared.recv_ready.notify_one();
     }
 }
 

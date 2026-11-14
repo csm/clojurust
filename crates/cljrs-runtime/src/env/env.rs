@@ -184,7 +184,24 @@ pub struct GlobalEnv {
     /// than being tree-walked at startup.
     #[allow(clippy::type_complexity)]
     pub compiled_ns_loaders: RwLock<HashMap<Arc<str>, CompiledNsLoader>>,
+    /// Builds the runtime of a new isolate, installed by the host (the CLI).
+    /// `None` means this runtime may not start isolates from Clojure; see
+    /// [`IsolateFactory`].
+    isolate_factory: RwLock<Option<IsolateFactory>>,
 }
+
+/// Builds a runtime equivalent to the one it is installed on, for a new
+/// isolate (see `spawn-isolate` in `cljrs-async`).
+///
+/// It is called on the new isolate's own OS thread, inside that thread's
+/// Tokio `LocalSet`, and returns a fully initialised `GlobalEnv` (stdlib,
+/// async, source paths) or a message saying why it could not.  A `GlobalEnv`
+/// holds heap pointers and never crosses threads, so a new isolate cannot
+/// reuse its parent's; the factory is the only thing the two share.  A host
+/// that wants child isolates to spawn isolates too installs the factory on
+/// the runtime it returns.  A runtime with no factory refuses to spawn, which
+/// is how a sandboxing host keeps guest code on one metered isolate.
+pub type IsolateFactory = Arc<dyn Fn() -> Result<Arc<GlobalEnv>, String> + Send + Sync>;
 
 /// Loader callback for an AOT-compiled namespace (see
 /// `GlobalEnv::compiled_ns_loaders`).  Given the global env, it loads the
@@ -240,6 +257,7 @@ impl GlobalEnv {
             tier_state: AtomicU8::new(TierState::TreeWalk as u8),
             tiers: crate::tiered::tiers::Tiers::new(id),
             async_rt: RwLock::new(None),
+            isolate_factory: RwLock::new(None),
             version_cache: Mutex::new(HashMap::new()),
             deps_config: RwLock::new(None),
             verify_commit_signatures: AtomicBool::new(false),
@@ -822,6 +840,17 @@ impl GlobalEnv {
     /// Return the async runtime, if one has been registered.
     pub fn async_runtime(&self) -> Option<Arc<dyn AsyncRuntime>> {
         self.async_rt.read().unwrap().clone()
+    }
+
+    /// Install the factory that builds the runtime of each isolate spawned
+    /// from this one, replacing any earlier factory.
+    pub fn set_isolate_factory(&self, factory: IsolateFactory) {
+        *self.isolate_factory.write().unwrap() = Some(factory);
+    }
+
+    /// The installed isolate factory, if this runtime may spawn isolates.
+    pub fn isolate_factory(&self) -> Option<IsolateFactory> {
+        self.isolate_factory.read().unwrap().clone()
     }
 
     /// Return `(source_file, git_repo_root)` for the named namespace, if
