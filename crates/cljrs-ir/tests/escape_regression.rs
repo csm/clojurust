@@ -671,3 +671,113 @@ fn stage4_skipped_when_one_destructured_binding_escapes() {
          escapes into a returned vector; IR:\n{optimized}"
     );
 }
+
+/// Vars defined while some region is open and used after that region's
+/// `RegionEnd` (in the same block, or anywhere in another block, phis and
+/// terminators included), excluding provably-scalar constants and predicate
+/// results.  Compiled code boxes collections into the innermost open region,
+/// so any such non-scalar var dangles once the region closes.
+///
+/// Only regions opened and closed within a single block are checked, which
+/// covers the straight-line bodies these tests lower.
+fn vars_outliving_their_region(ir: &IrFunction) -> Vec<cljrs_ir::VarId> {
+    use cljrs_ir::{Const, KnownFn, Terminator};
+    fn term_uses(t: &Terminator) -> Vec<cljrs_ir::VarId> {
+        match t {
+            Terminator::Return(v) => vec![*v],
+            Terminator::Branch { cond, .. } => vec![*cond],
+            Terminator::RecurJump { args, .. } => args.clone(),
+            _ => vec![],
+        }
+    }
+    let mut bad = Vec::new();
+    for (bi, block) in ir.blocks.iter().enumerate() {
+        let mut open: Vec<(cljrs_ir::VarId, Vec<cljrs_ir::VarId>)> = Vec::new();
+        let mut closed: Vec<cljrs_ir::VarId> = Vec::new();
+        for inst in &block.insts {
+            bad.extend(inst.uses().into_iter().filter(|u| closed.contains(u)));
+            match inst {
+                Inst::RegionStart(h) => open.push((*h, Vec::new())),
+                Inst::RegionEnd(h) => {
+                    if let Some(i) = open.iter().position(|(o, _)| o == h) {
+                        let (_, defs) = open.remove(i);
+                        closed.extend(defs);
+                    }
+                }
+                Inst::Const(_, Const::Nil | Const::Bool(_) | Const::Long(_))
+                | Inst::CallKnown(_, KnownFn::Contains, _) => {}
+                _ => {
+                    if let (Some(d), Some((_, defs))) = (inst.dst(), open.last_mut()) {
+                        defs.push(d);
+                    }
+                }
+            }
+        }
+        bad.extend(
+            term_uses(&block.terminator)
+                .into_iter()
+                .filter(|u| closed.contains(u)),
+        );
+        for (oi, other) in ir.blocks.iter().enumerate() {
+            if oi == bi {
+                continue;
+            }
+            let uses = other
+                .phis
+                .iter()
+                .chain(other.insts.iter())
+                .flat_map(|i| i.uses())
+                .chain(term_uses(&other.terminator));
+            bad.extend(uses.filter(|u| closed.contains(u)));
+        }
+    }
+    for sub in &ir.subfunctions {
+        bad.extend(vars_outliving_their_region(sub));
+    }
+    bad
+}
+
+#[test]
+fn set_literal_region_does_not_capture_an_earlier_lookup() {
+    // #501: the `#{:x}` region used to open at the head of the block, so the
+    // `{:a 1}` default and the result of `get` were boxed into it and freed
+    // at its RegionEnd while `value` was still live.
+    let ir = lower(
+        "(fn [options]
+           (let [value (get options :missing {:a 1})]
+             (contains? #{:x} :x)
+             (callee)
+             value))",
+    );
+    let optimized = optimize(ir);
+    assert!(
+        region_alloc_count(&optimized) >= 1,
+        "the set literal should still be region-promoted; IR:\n{optimized}"
+    );
+    let bad = vars_outliving_their_region(&optimized);
+    assert!(
+        bad.is_empty(),
+        "{bad:?} outlive the region they were produced in; IR:\n{optimized}"
+    );
+}
+
+#[test]
+fn set_literal_region_is_refused_when_a_live_value_is_produced_inside_it() {
+    // Here the lookup sits *between* the set literal and its use, so no
+    // placement of the set's region can exclude it: the set must stay on the
+    // heap rather than free `value` with the region.
+    let ir = lower(
+        "(fn [options]
+           (let [s #{:x}
+                 value (get options :missing {:a 1})]
+             (contains? s :x)
+             (callee)
+             value))",
+    );
+    let optimized = optimize(ir);
+    let bad = vars_outliving_their_region(&optimized);
+    assert!(
+        bad.is_empty(),
+        "{bad:?} outlive the region they were produced in; IR:\n{optimized}"
+    );
+}

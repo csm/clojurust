@@ -283,13 +283,14 @@ pub(crate) fn region_contains_throw(
 
 // ── Collect use-blocks ───────────────────────────────────────────────────────
 
-/// Walk the propagation chain and collect all blocks where `alloc_var` (or
-/// any value derived from it through phi/known-call forwarding) is used.
-pub(crate) fn collect_use_blocks(
+/// Walk the propagation chain from `alloc_var` and return it — `alloc_var`
+/// plus every value derived from it through phi/known-call forwarding —
+/// together with every block where a value in the chain is used.
+pub(crate) fn collect_use_chain(
     alloc_var: VarId,
     uses: &HashMap<VarId, Vec<super::escape::UseInfo>>,
     ir_func: &IrFunction,
-) -> HashSet<BlockId> {
+) -> (HashSet<VarId>, HashSet<BlockId>) {
     use super::escape::{UseKind, known_fn_arg_escapes};
 
     let mut worklist: Vec<VarId> = vec![alloc_var];
@@ -333,7 +334,7 @@ pub(crate) fn collect_use_blocks(
         }
     }
 
-    use_blocks
+    (visited, use_blocks)
 }
 
 // ── Alloc-op → RegionAllocKind mapping ──────────────────────────────────────
@@ -360,12 +361,213 @@ fn alloc_operands(inst: &Inst) -> Vec<VarId> {
     }
 }
 
+// ── Region scope placement ──────────────────────────────────────────────────
+//
+// While a region is open it is the innermost entry of the thread-local region
+// stack, and compiled code allocates *opportunistically* into it: the rt_abi
+// collection constructors and re-boxing accessors (`rt_alloc_map`, `rt_get`,
+// `assoc`, …) and any callee they reach go through `box_coll_val`, which
+// bump-allocates into the active region instead of the GC heap.  So a scope
+// opened for one non-escaping allocation also captures every other collection
+// produced while it is open, and frees all of them at its `RegionEnd`.
+//
+// The scope is therefore (a) placed as tightly as the CFG allows — opened
+// immediately before the defining instruction and closed right after the last
+// instruction of the end block that touches the value — and (b) only emitted
+// when no non-scalar value produced inside it is used after it closes.
+// Without (b), `(let [v (get m k {:a 1})] (contains? #{:x} :x) ... v)`
+// returned `v` from the `#{:x}` region after that region was freed (#501).
+
+/// Position of an instruction within a block.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InstPos {
+    Phi,
+    Inst(usize),
+    Term,
+}
+
+/// Where a `RegionStart`/`RegionEnd` pair goes: `RegionStart` is inserted at
+/// `start_idx` of `start`'s instructions and `RegionEnd` at `end_idx` of
+/// `end`'s (both indices refer to the instruction lists before insertion).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegionScope {
+    start: BlockId,
+    start_idx: usize,
+    end: BlockId,
+    end_idx: usize,
+}
+
+impl RegionScope {
+    fn contains(&self, span: &HashSet<BlockId>, block: BlockId, pos: InstPos) -> bool {
+        if !span.contains(&block) {
+            return false;
+        }
+        let after_start = block != self.start
+            || match pos {
+                InstPos::Phi => false,
+                InstPos::Inst(i) => i >= self.start_idx,
+                InstPos::Term => true,
+            };
+        let before_end = block != self.end
+            || match pos {
+                InstPos::Phi => true,
+                InstPos::Inst(i) => i < self.end_idx,
+                InstPos::Term => false,
+            };
+        after_start && before_end
+    }
+}
+
+fn terminator_uses(term: &Terminator) -> Vec<VarId> {
+    match term {
+        Terminator::Branch { cond, .. } => vec![*cond],
+        Terminator::Return(v) => vec![*v],
+        Terminator::RecurJump { args, .. } => args.clone(),
+        Terminator::Jump(_) | Terminator::Unreachable => vec![],
+    }
+}
+
+/// Every var's use positions.
+fn use_positions(ir_func: &IrFunction) -> HashMap<VarId, Vec<(BlockId, InstPos)>> {
+    let mut m: HashMap<VarId, Vec<(BlockId, InstPos)>> = HashMap::new();
+    for block in &ir_func.blocks {
+        for phi in &block.phis {
+            for v in phi.uses() {
+                m.entry(v).or_default().push((block.id, InstPos::Phi));
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            for v in inst.uses() {
+                m.entry(v).or_default().push((block.id, InstPos::Inst(i)));
+            }
+        }
+        for v in terminator_uses(&block.terminator) {
+            m.entry(v).or_default().push((block.id, InstPos::Term));
+        }
+    }
+    m
+}
+
+/// Plan a region scope for `def_var` (defined in `def_block`), whose value
+/// and derived values (`chain`) are used only within `span` — the blocks
+/// from `start` (dominating every use) to `end` (post-dominating every use).
+///
+/// Returns `None` when no safe placement exists: `end` does not
+/// post-dominate `start` (an exit path would leave the region open), a value
+/// derived from `def_var` is used after the scope closes, the scope would
+/// interleave with another region, or a non-scalar value produced inside the
+/// scope is used after it closes (it may have been opportunistically
+/// allocated into the region).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_region_scope(
+    ir_func: &IrFunction,
+    def_var: VarId,
+    def_block: BlockId,
+    chain: &HashSet<VarId>,
+    start: BlockId,
+    end: BlockId,
+    span: &HashSet<BlockId>,
+    postdoms: &HashMap<BlockId, HashSet<BlockId>>,
+) -> Option<RegionScope> {
+    if !postdoms.get(&start).is_some_and(|p| p.contains(&end)) {
+        return None;
+    }
+    let by_id = block_by_id_map(ir_func);
+
+    let start_idx = if start == def_block {
+        by_id
+            .get(&def_block)?
+            .insts
+            .iter()
+            .position(|inst| inst.dst() == Some(def_var))?
+    } else {
+        0
+    };
+
+    let end_block = by_id.get(&end)?;
+    let end_idx = end_block
+        .insts
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| {
+            inst.dst() == Some(def_var) || inst.uses().iter().any(|v| chain.contains(v))
+        })
+        .map(|(i, _)| i + 1)
+        .max()
+        .unwrap_or(0);
+
+    let scope = RegionScope {
+        start,
+        start_idx,
+        end,
+        end_idx,
+    };
+
+    let scalar = provably_scalar_vars(ir_func);
+    let uses = use_positions(ir_func);
+    let used_outside = |v: VarId| {
+        uses.get(&v)
+            .into_iter()
+            .flatten()
+            .any(|&(b, pos)| !scope.contains(span, b, pos))
+    };
+    // Region handles opened inside the scope; a `RegionEnd` inside the scope
+    // for any other handle would close an enclosing region early.
+    let mut opened_inside: HashSet<VarId> = HashSet::new();
+
+    for block in &ir_func.blocks {
+        if !span.contains(&block.id) {
+            continue;
+        }
+        let positioned = block.phis.iter().map(|inst| (InstPos::Phi, inst)).chain(
+            block
+                .insts
+                .iter()
+                .enumerate()
+                .map(|(i, inst)| (InstPos::Inst(i), inst)),
+        );
+        for (pos, inst) in positioned {
+            if !scope.contains(span, block.id, pos) {
+                continue;
+            }
+            match inst {
+                Inst::RegionStart(h) => {
+                    opened_inside.insert(*h);
+                }
+                Inst::RegionEnd(h) if !opened_inside.contains(h) => return None,
+                _ => {}
+            }
+            if let Some(d) = inst.dst()
+                && (chain.contains(&d) || !scalar.contains(&d))
+                && used_outside(d)
+            {
+                return None;
+            }
+        }
+    }
+    Some(scope)
+}
+
+/// Insert the `RegionStart`/`RegionEnd` pair planned by [`plan_region_scope`].
+pub(crate) fn apply_region_scope(ir_func: &mut IrFunction, scope: RegionScope, region: VarId) {
+    // `end_idx` > `start_idx` when both land in one block, so insert the end
+    // first to keep `start_idx` valid.
+    if let Some(b) = ir_func.blocks.iter_mut().find(|b| b.id == scope.end) {
+        b.insts.insert(scope.end_idx, Inst::RegionEnd(region));
+    }
+    if let Some(b) = ir_func.blocks.iter_mut().find(|b| b.id == scope.start) {
+        b.insts.insert(scope.start_idx, Inst::RegionStart(region));
+    }
+}
+
 // ── Region rewriting ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn emit_region_for_alloc(
     mut ir_func: IrFunction,
     alloc_var: VarId,
     alloc_block: BlockId,
+    chain: &HashSet<VarId>,
     use_blocks: HashSet<BlockId>,
     doms: &HashMap<BlockId, HashSet<BlockId>>,
     postdoms: &HashMap<BlockId, HashSet<BlockId>>,
@@ -406,6 +608,18 @@ fn emit_region_for_alloc(
     if region_contains_throw(&ir_func, &region) {
         return ir_func;
     }
+    let Some(scope) = plan_region_scope(
+        &ir_func,
+        alloc_var,
+        alloc_block,
+        chain,
+        start,
+        end,
+        &region,
+        postdoms,
+    ) else {
+        return ir_func;
+    };
 
     let region_var = VarId(*next_var);
 
@@ -432,21 +646,7 @@ fn emit_region_for_alloc(
     }
     *next_var += 1;
 
-    // Insert RegionStart at head of `start` block
-    for block in &mut ir_func.blocks {
-        if block.id == start {
-            block.insts.insert(0, Inst::RegionStart(region_var));
-            break;
-        }
-    }
-
-    // Append RegionEnd to `end` block (before terminator)
-    for block in &mut ir_func.blocks {
-        if block.id == end {
-            block.insts.push(Inst::RegionEnd(region_var));
-            break;
-        }
-    }
+    apply_region_scope(&mut ir_func, scope, region_var);
 
     ir_func
 }
@@ -472,11 +672,12 @@ fn optimize_regions(ir_func: IrFunction, ctx: Option<&EscapeContext>) -> IrFunct
     let mut result = ir_func;
 
     for (alloc_var, alloc_block) in no_escape_allocs {
-        let use_blocks = collect_use_blocks(alloc_var, &analysis.uses, &result);
+        let (chain, use_blocks) = collect_use_chain(alloc_var, &analysis.uses, &result);
         result = emit_region_for_alloc(
             result,
             alloc_var,
             alloc_block,
+            &chain,
             use_blocks,
             &doms,
             &postdoms,
@@ -599,9 +800,9 @@ fn inst_dst(inst: &Inst) -> Option<VarId> {
     }
 }
 
-/// Returns true when all `Return` terminators in `ir_func` return provably
-/// scalar (non-collection) values, making a function-scoped region safe.
-fn is_scalar_returning(ir_func: &IrFunction) -> bool {
+/// The vars of `ir_func` that provably hold scalar (non-collection) values,
+/// which can never point into a region.
+fn provably_scalar_vars(ir_func: &IrFunction) -> HashSet<VarId> {
     let mut scalar: HashSet<VarId> = HashSet::new();
     let mut changed = true;
     while changed {
@@ -618,7 +819,13 @@ fn is_scalar_returning(ir_func: &IrFunction) -> bool {
             }
         }
     }
+    scalar
+}
 
+/// Returns true when all `Return` terminators in `ir_func` return provably
+/// scalar (non-collection) values, making a function-scoped region safe.
+fn is_scalar_returning(ir_func: &IrFunction) -> bool {
+    let scalar = provably_scalar_vars(ir_func);
     ir_func.blocks.iter().all(|block| match &block.terminator {
         Terminator::Return(var) => scalar.contains(var),
         _ => true,

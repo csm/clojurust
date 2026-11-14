@@ -32,8 +32,8 @@ use super::escape::{
     build_var_defs, classify_escape_with_ctx, collect_allocs, known_fn_arg_escapes, lookup_defn,
 };
 use super::optimize::{
-    blocks_on_path, collect_use_blocks, dominators, has_back_edge, lca_of_many, post_dominators,
-    region_contains_throw,
+    apply_region_scope, blocks_on_path, collect_use_chain, dominators, has_back_edge, lca_of_many,
+    plan_region_scope, post_dominators, region_contains_throw,
 };
 
 // ── Per-call-site candidate ──────────────────────────────────────────────────
@@ -432,9 +432,10 @@ fn find_call_by_dst(func: &IrFunction, dst: VarId) -> Option<(usize, usize)> {
 /// `Call` site in place.  Returns `true` if the rewrite succeeded.
 ///
 /// On success: replaces the `Call` with `CallWithRegion(dst, target_name,
-/// args, rv)`, prepends `RegionStart(rv)` to the LCA-block's prologue, and
-/// appends `RegionEnd(rv)` to the LCA-postdom's instruction list (before
-/// the terminator).  Bails out without mutation if back-edges or `throw`
+/// args, rv)` and brackets it with `RegionStart(rv)`/`RegionEnd(rv)` placed
+/// by [`plan_region_scope`]: from the call itself (or the head of the
+/// LCA-dominator block) to the last use of the result in the
+/// LCA-postdominator block.  Bails out without mutation if back-edges or `throw`
 /// instructions cross the candidate region — matching the safety
 /// constraints of the local region-promotion pass.
 fn rewrite_call_with_region_scope(
@@ -449,7 +450,7 @@ fn rewrite_call_with_region_scope(
     let alloc_block = func.blocks[block_idx].id;
 
     let uses = build_use_chains(func);
-    let mut use_blocks = collect_use_blocks(dst, &uses, func);
+    let (chain, mut use_blocks) = collect_use_chain(dst, &uses, func);
     use_blocks.insert(alloc_block);
 
     let doms = dominators(func);
@@ -488,6 +489,20 @@ fn rewrite_call_with_region_scope(
     if region_contains_throw(func, &region_blocks) {
         return false;
     }
+    // Place the scope tightly around the call and its result's last use, and
+    // refuse it if any other value produced while it is open outlives it.
+    let Some(scope) = plan_region_scope(
+        func,
+        dst,
+        alloc_block,
+        &chain,
+        start_block,
+        end_block,
+        &region_blocks,
+        &postdoms,
+    ) else {
+        return false;
+    };
 
     // All checks pass — perform the rewrite.
     let region_var = VarId(func.next_var);
@@ -513,15 +528,7 @@ fn rewrite_call_with_region_scope(
     func.blocks[block_idx].insts[inst_idx] =
         Inst::CallWithRegion(dst, target_name, full_args, region_var);
 
-    // Insert RegionStart at the head of `start_block`.
-    if let Some(b) = func.blocks.iter_mut().find(|b| b.id == start_block) {
-        b.insts.insert(0, Inst::RegionStart(region_var));
-    }
-
-    // Append RegionEnd before the terminator of `end_block`.
-    if let Some(b) = func.blocks.iter_mut().find(|b| b.id == end_block) {
-        b.insts.push(Inst::RegionEnd(region_var));
-    }
+    apply_region_scope(func, scope, region_var);
 
     true
 }

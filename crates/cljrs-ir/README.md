@@ -407,7 +407,16 @@ much larger set of call shapes.
    `AnalysisResult::cross_fn_no_escape`, keyed by callee arity-fn-name.
 3. **Region promotion** (`lower::optimize`) — rewrites `NoEscape` allocations
    to `RegionStart` / `RegionAlloc` / `RegionEnd` over the minimal CFG
-   subgraph that covers the allocation and all its uses.
+   subgraph that covers the allocation and all its uses.  The scope is
+   placed by `plan_region_scope` (shared with stage 4): `RegionStart` goes
+   immediately before the defining instruction (when it is in the dominator
+   LCA block) and `RegionEnd` right after the last instruction of the
+   post-dominator LCA block that touches the value.  Because compiled code
+   boxes every collection produced while a region is open into that region
+   (`box_coll_val` in `cljrs-compiler`'s rt_abi), the scope is refused when
+   any non-scalar value produced inside it is used after it closes, when it
+   would interleave with another region, or when an exit path would skip
+   its `RegionEnd` (#501).
 4. **Cross-function region promotion** (`lower::regionalize`) — for `Call`
    sites whose result is `NoEscape` and whose callee has `Returns`-tagged
    allocations, clones a region-parameterised variant of the callee
@@ -415,7 +424,8 @@ much larger set of call shapes.
    block carries a `RegionParam` binding.  The call site is rewritten to
    `CallWithRegion(dst, target_name, args, region)` — carrying the handle of
    the `RegionStart` the rewrite inserts — and bracketed by
-   `RegionStart`/`RegionEnd` over the dom/postdom-LCA scope of `dst`'s uses.
+   `RegionStart`/`RegionEnd` over the dom/postdom-LCA scope of `dst`'s uses,
+   placed and validated by the same `plan_region_scope` as stage 3.
    In compiled code the region travels as a **hidden trailing argument**
    (`IrFunction::abi_param_count` = `params.len() + 1` for such variants;
    `takes_region_param()` detects them), so the callee bump-allocates
