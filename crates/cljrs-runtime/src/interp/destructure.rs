@@ -144,7 +144,7 @@ pub fn value_to_seq_vec(val: &Value) -> ValueResult<Vec<Value>> {
 /// `pattern` is a flat `[key val key val ...]` slice from `FormKind::Map`.
 ///
 /// Supports:
-/// - `:keys [a b c]`   — bind symbols from keyword keys `:a`, `:b`, `:c`
+/// - `:keys [a :b c]`  — bind locals from keyword keys `:a`, `:b`, `:c`
 /// - `:strs [a b]`     — bind symbols from string keys `"a"`, `"b"`
 /// - `:syms [a b]`     — bind symbols from symbol keys `'a`, `'b`
 /// - `:as name`        — bind the whole value to `name`
@@ -194,7 +194,7 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
 
         // A `:keys`/`:strs`/`:syms` keyword may itself be namespace-qualified
         // (`:person/keys [a b]`), supplying a default namespace for every
-        // unqualified symbol in its vector; an individual symbol's own
+        // unqualified entry in its vector; an individual entry's own
         // namespace (`ui/dest`) takes precedence over that default.
         let directive_ns = if let FormKind::Keyword(kw) = &k.kind {
             Keyword::parse(kw).namespace
@@ -211,28 +211,33 @@ pub fn bind_associative(pattern: &[Form], val: &Value, env: &mut Env) -> EvalRes
             FormKind::Keyword(_) if directive_name == "keys" => {
                 if let FormKind::Vector(syms) = &v.kind {
                     for sym_form in syms {
-                        if let FormKind::Symbol(sym) = &sym_form.kind {
-                            let parsed = Symbol::parse(sym);
-                            let key =
-                                match parsed.namespace.clone().or_else(|| directive_ns.clone()) {
-                                    Some(ns) => {
-                                        Value::keyword(Keyword::qualified(ns, parsed.name.clone()))
-                                    }
-                                    None => Value::keyword(Keyword::simple(parsed.name.clone())),
-                                };
-                            let mut bound_val = get_val(&key);
-                            if let Some(d) = defaults.get(parsed.name.as_ref()) {
-                                // Evaluated whether or not the key was present:
-                                // Clojure's `(get m :k default)` evaluates its
-                                // third argument eagerly, so a throwing or
-                                // side-effecting default must still fire here.
-                                let dv = crate::interp::eval::eval_unscoped(&d.clone(), env)?;
-                                if matches!(bound_val, Value::Nil) {
-                                    bound_val = dv;
-                                }
+                        let parsed = match &sym_form.kind {
+                            FormKind::Symbol(sym) | FormKind::Keyword(sym) => Symbol::parse(sym),
+                            FormKind::AutoKeyword(sym) => {
+                                let resolved = env
+                                    .globals
+                                    .resolve_auto_keyword(&env.current_ns, sym)
+                                    .map_err(EvalError::Runtime)?;
+                                Symbol::parse(&resolved)
                             }
-                            env.bind(parsed.name.clone(), bound_val);
+                            _ => continue,
+                        };
+                        let key = match parsed.namespace.clone().or_else(|| directive_ns.clone()) {
+                            Some(ns) => Value::keyword(Keyword::qualified(ns, parsed.name.clone())),
+                            None => Value::keyword(Keyword::simple(parsed.name.clone())),
+                        };
+                        let mut bound_val = get_val(&key);
+                        if let Some(d) = defaults.get(parsed.name.as_ref()) {
+                            // Evaluated whether or not the key was present:
+                            // Clojure's `(get m :k default)` evaluates its
+                            // third argument eagerly, so a throwing or
+                            // side-effecting default must still fire here.
+                            let dv = crate::interp::eval::eval_unscoped(&d.clone(), env)?;
+                            if matches!(bound_val, Value::Nil) {
+                                bound_val = dv;
+                            }
                         }
+                        env.bind(parsed.name.clone(), bound_val);
                     }
                 }
             }

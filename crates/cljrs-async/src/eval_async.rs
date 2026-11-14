@@ -119,11 +119,14 @@ async fn eval_async_inner(form: &Form, env: &mut Env) -> EvalResult {
     // return value of a ^:async fn is `[(await x) (await y)]`). Evaluate
     // each element with eval_async so awaits yield cooperatively instead of
     // blocking the LocalSet thread via the sync condvar path.
+    // Root accumulated values while evaluating later elements, including
+    // across awaits: a returned value's function alloc frame may have closed.
     match &form.kind {
         FormKind::Vector(elems) => {
             let elems = expand_reader_conds_cow(elems).into_owned();
             let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
+                let _root = cljrs_runtime::env::gc_roots::root_values(&vals);
                 vals.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             return Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(vals))));
@@ -136,6 +139,7 @@ async fn eval_async_inner(form: &Form, env: &mut Env) -> EvalResult {
                 .into_owned();
             let mut pairs: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
+                let _root = cljrs_runtime::env::gc_roots::root_values(&pairs);
                 pairs.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             let kv_pairs: Vec<(Value, Value)> = pairs
@@ -148,6 +152,7 @@ async fn eval_async_inner(form: &Form, env: &mut Env) -> EvalResult {
             let elems = expand_reader_conds_cow(elems).into_owned();
             let mut vals: Vec<Value> = Vec::with_capacity(elems.len());
             for f in &elems {
+                let _root = cljrs_runtime::env::gc_roots::root_values(&vals);
                 vals.push(Box::pin(eval_async_inner(f, env)).await?);
             }
             return Ok(Value::Set(SetValue::Hash(GcPtr::new(
