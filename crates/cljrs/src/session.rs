@@ -111,6 +111,8 @@ pub fn setup_globals(
     gc_config: Arc<GcConfig>,
     versioning: VersioningFlags,
 ) -> Arc<GlobalEnv> {
+    // Kept for the isolate factory below, which rebuilds this session.
+    let isolate_inputs = (src_paths.clone(), gc_config.clone());
     let runtime = cljrs_runtime::Runtime::builder()
         .execution_mode(cljrs_runtime::ExecutionMode::Tiered)
         .source_paths(src_paths)
@@ -163,6 +165,17 @@ pub fn setup_globals(
     });
     #[cfg(feature = "base64")]
     cljrs_base64::init(&globals);
+    // Let Clojure code start isolates (`spawn-isolate`).  Each one runs on its
+    // own thread with a session built from the same inputs as this one, so it
+    // resolves the same namespaces and can start isolates in turn.
+    let (src_paths, gc_config) = isolate_inputs;
+    globals.set_isolate_factory(Arc::new(move || {
+        Ok(setup_globals(
+            src_paths.clone(),
+            gc_config.clone(),
+            versioning,
+        ))
+    }));
     globals
 }
 

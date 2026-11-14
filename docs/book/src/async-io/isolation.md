@@ -39,6 +39,7 @@ reproduce them bit-for-bit.
 |---|---|
 | `future` runs the body on **another OS thread**, sharing the heap | `future` runs in a **fiber** on the same isolate — concurrent, not parallel. Cross-core parallelism is a separate, explicit step. |
 | `atom`, `ref`, and var roots are **globally shared** mutable cells any thread can see | `atom` is **isolate-local** and fast. Genuinely shared mutable state is a distinct primitive, [`shared-atom`](#shared-atom-cross-isolate-mutable-state). |
+| `(thread ...)` / `(future ...)` capture local variables and run them on another thread | A new isolate is started by **name**: `(spawn-isolate 'my.ns/f arg ...)`. It loads its own copy of the code; nothing is captured. |
 | Passing a value to another thread shares a **pointer** — zero copy, but also zero isolation | Passing a value to another isolate **deep-copies** it. The two sides are fully independent afterward. |
 | Any value (closures, refs, mutable objects) can be handed to another thread | Only **plain, immutable, acyclic data** can cross an isolate boundary; everything else is rejected at the send site. |
 
@@ -93,6 +94,10 @@ and sometimes an expensive deep copy, decided by scheduling you cannot see. The
 explicit boundary trades a little ceremony for the property that cost and failure
 are always attached to something you wrote.
 
+Isolates are started from Clojure with
+[`spawn-isolate`](#spawning-an-isolate), described after the channels it relies
+on.
+
 ## Isolate channels — the copy boundary
 
 An **isolate channel** is the sanctioned way to move a value between isolates. It
@@ -124,13 +129,97 @@ The receiver deserializes into the heap of whichever isolate holds it, so keep
 `rx` on the isolate that will consume from it. The sender can be cloned and used
 from anywhere.
 
-> **Current scope.** The Clojure-level primitive that *spawns* a worker isolate
-> (`pfuture` / `spawn`) is deferred — it needs the shared code arena so a worker
-> can see the running program without copying it. Today, isolate spawning is a
-> Rust-level facility (`cljrs_async::isolate::Isolate`), and from Clojure both
-> ends of an `isolate-chan` usually live on one isolate. The channel still pays —
-> and still meters — the honest deep copy, so the boundary is observable now and
-> your code is already written against the API it will keep.
+## Spawning an isolate
+
+`spawn-isolate` starts a new isolate on its own OS thread and returns a `Future`
+of its result. It is the parallel primitive, and it is deliberately not
+`future` or `thread`.
+
+```clojure
+(ns my.app
+  (:require [clojure.core.async :refer [spawn-isolate]]))
+
+;; four cores, four isolates
+(let [jobs (mapv #(spawn-isolate 'my.work/crunch %) [chunk-a chunk-b chunk-c chunk-d])]
+  (mapv deref jobs))
+```
+
+The entry point is a **namespace-qualified symbol**, not a function. An isolate
+shares no heap with its parent, and that includes loaded code: a closure is a
+heap object that points at its captured values, so it cannot be handed over. A
+name can. The new isolate builds a fresh runtime, `require`s `my.work`, looks up
+`crunch`, and calls it with copies of the arguments. This is the model of
+Erlang's `spawn(Module, Function, Args)` and of a Web Worker, not of a JVM
+thread.
+
+What follows from that:
+
+- **The namespace must be loadable.** `my.work` has to be on the source path (or
+  embedded in the binary). A function defined at the REPL, or in a script file
+  that `require` cannot find, exists only in the isolate that defined it and
+  cannot be an entry point.
+- **Loading runs top-level forms again.** Each isolate evaluates the namespaces
+  it requires. Keep side effects out of the top level of a worker namespace, as
+  you would for any namespace that is loaded more than once.
+- **Nothing is captured.** Everything the worker needs arrives as an argument.
+  Arguments and the result are deep-copied with the rules in
+  [What can and cannot cross](#what-can-and-cannot-cross), and metered. An
+  argument that cannot cross throws at the `spawn-isolate` call.
+- **State is per isolate.** A `def`'d atom in `my.work` is a different atom in
+  each isolate. Share state with a `shared-atom` passed as an argument.
+- **Dynamic bindings are not conveyed.** The worker starts with root bindings.
+
+`deref` (or `await`) on the returned future parks the calling fiber, so the
+parent isolate keeps running its other fibers. If the entry function throws, the
+future fails; an `ex-info` arrives with its message and data.
+
+### Talking to a running isolate
+
+Pass isolate-channel ends as arguments. A channel end given as a **direct
+argument** crosses as itself rather than as a copy: a sender is cloned, and a
+receiver *moves* to the new isolate.
+
+```clojure
+(ns my.work
+  (:require [clojure.core.async :refer [isolate-put! isolate-take!]]))
+
+(defn serve [jobs results]
+  (loop []
+    (when-let [job @(isolate-take! jobs)]   ; nil when the parent drops its sender
+      (isolate-put! results (handle job))
+      (recur))))
+```
+
+```clojure
+(let [[jobs-tx jobs-rx]       (isolate-chan)
+      [results-tx results-rx] (isolate-chan)
+      worker (spawn-isolate 'my.work/serve jobs-rx results-tx)]
+  (isolate-put! jobs-tx {:id 1})
+  @(isolate-take! results-rx))
+```
+
+After the spawn, `jobs-rx` belongs to the worker. Using it in the parent throws.
+A channel end nested inside a collection is not moved; it is rejected like any
+other native object.
+
+### Limits
+
+- **No `thread` with captured variables.** There is no form that runs an
+  arbitrary closure on another core. That would need closures whose code and
+  captures are both shareable, which the runtime does not have.
+- **Startup cost.** Each isolate bootstraps `clojure.core` and loads its
+  namespaces. Expect tens of milliseconds, and memory for a second copy of the
+  loaded code. Spawn a few long-lived workers, not one isolate per small task.
+- **Detached.** An isolate ends when its entry function returns. The process
+  does not wait for running isolates at exit, and interrupting the parent's
+  evaluation does not stop them. Close the channel a worker reads from to ask it
+  to finish, and `deref` its future to wait.
+- **Gas and interrupts are not inherited.** For that reason a runtime can spawn
+  only if its host allows it. The `cljrs` CLI does. An embedded runtime must
+  install an isolate factory (`GlobalEnv::set_isolate_factory`); without one
+  `spawn-isolate` throws, so a sandboxed guest cannot leave its metered isolate.
+- **Not in AOT binaries or on wasm.** A binary from `cljrs compile` and the
+  wasm build do not install a factory yet.
 
 ### What can and cannot cross
 
@@ -225,8 +314,9 @@ while Clojure logic stays on its isolate.
 - **Default to local.** Plain `atom`, `future`, channels, and collections are
   bump-allocated and fast. Reach for isolates and `shared-atom` only when you
   need real multicore execution or cross-isolate sharing.
-- **Send data, not behavior.** A closure cannot cross. Pass a tag plus arguments
-  and let the receiving isolate dispatch to code it already holds.
+- **Send data, not behavior.** A closure cannot cross. Name the entry point
+  (`spawn-isolate 'my.ns/f`), or pass a tag plus arguments and let the receiving
+  isolate dispatch to code it has loaded.
 - **Keep the receiver pinned.** An isolate-channel `rx` deserializes into its own
   heap; consume from it on the isolate that owns it.
 - **Make crossings coarse.** Each crossing is a deep copy. Prefer sending one

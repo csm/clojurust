@@ -707,6 +707,13 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 - `with_eval_context(f)` — run a closure with a temporary `Env` built from the innermost context
 - `eval_error_to_value_error(error: EvalError) -> ValueError` — preserve thrown values and resource errors; confirm memory faults for compiled entry points
 
+### Isolate factory
+
+`IsolateFactory = Arc<dyn Fn() -> Result<Arc<GlobalEnv>, String> + Send + Sync>` builds the runtime of a new isolate.  A `GlobalEnv` holds heap pointers and never crosses threads, so an isolate spawned from Clojure (`spawn-isolate` in `cljrs-async`) gets a runtime of its own; the factory runs on the new isolate's thread, inside its `LocalSet`, and returns a fully initialised environment.
+
+- `GlobalEnv::set_isolate_factory(&self, factory: IsolateFactory)` — install it (the `cljrs` CLI does); replaces any earlier factory
+- `GlobalEnv::isolate_factory(&self) -> Option<IsolateFactory>` — `None` means this runtime may not spawn isolates, which keeps a sandboxed guest on one metered isolate
+
 ### `async_hook` submodule
 
 The optional async-runtime seam (`AsyncRuntime` trait, installed by `cljrs-async`).  `^:async` bodies are never compiled to state machines: on native targets each call runs its body on a fiber, and on wasm32 through `eval_async` (virtual-threads plan Phase 5; TODO.md Phase H is closed).
