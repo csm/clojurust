@@ -62,6 +62,13 @@ pub(crate) struct LowerRequest {
     /// What `ns` binds that would otherwise be lowered as `clojure.core`,
     /// sampled on the mutator thread (the worker has no `GlobalEnv`).
     pub core_shadows: cljrs_ir::lower::CoreShadows,
+    /// `Some(generation)` when, at enqueue time, this fn was the current root
+    /// binding of `ns/name` (sampled via `defn_registry::binding_generation`).
+    /// Only then may the result be published to the cross-defn registry, and
+    /// only if no rebind has happened since.  `None` for a retained old fn
+    /// whose var has been rebound (issue #505): its own IR is still valid,
+    /// but it must never stand in for the current global binding.
+    pub registration_generation: Option<u64>,
     pub arities: Vec<LowerArityRequest>,
 }
 
@@ -219,11 +226,16 @@ fn process_request(req: &LowerRequest) {
     // Publish this defn so later lowerings of *other* functions can
     // region-promote calls into it (stage 4) — mirrors eager lowering.
     // Anonymous or async fns are not callable cross-defn by name.
+    // Only the var's current binding may be published, and only if it was
+    // not rebound while this request was queued or lowering (#505).
     if !req.is_async
         && !registered.is_empty()
         && let Some(name) = &req.name
+        && let Some(generation) = req.registration_generation
     {
-        crate::tiered::defn_registry::register_defn(globals_id, &req.ns, name, registered);
+        crate::tiered::defn_registry::register_defn_if_current(
+            globals_id, &req.ns, name, generation, registered,
+        );
     }
 }
 
@@ -252,6 +264,9 @@ mod tests {
             ns: Arc::from(ns),
             is_async: false,
             core_shadows: cljrs_ir::lower::CoreShadows::none(),
+            registration_generation: Some(crate::tiered::defn_registry::binding_generation(
+                ns, fn_name,
+            )),
             arities: vec![LowerArityRequest {
                 arity_id,
                 params: vec![Arc::from("x")],
@@ -330,5 +345,50 @@ mod tests {
         let fresh = ir_cache.get(id).expect("re-lowered IR");
         assert!(!Arc::ptr_eq(&fresh, &stale));
         assert!(!crate::tiered::defn_registry::relower_marked(id));
+    }
+
+    fn registered(gid: u64, ns: &str, name: &str) -> bool {
+        let mut referenced = std::collections::HashSet::new();
+        referenced.insert((Arc::<str>::from(ns), Arc::<str>::from(name)));
+        !crate::tiered::defn_registry::externals_for(gid, &referenced).is_empty()
+    }
+
+    #[test]
+    fn retained_old_fn_is_lowered_but_not_registered() {
+        // Issue #505: a retained fn whose var was rebound (no registration
+        // generation) still gets its own IR, but must not be published as
+        // the implementation of the current global name.
+        let _sweep_guard = crate::tiered::tiers::SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let id = 0xC500_0021u64;
+        let gid = 0xC500_0021u64;
+        let ns = "test.worker-retained-ns";
+        let tiers = crate::tiered::tiers::Tiers::new(gid);
+        let mut req = identity_request(id, "leaf", ns, &tiers);
+        req.registration_generation = None;
+
+        process_request(&req);
+        assert!(tiers.ir_cache().get(id).is_some());
+        assert!(!registered(gid, ns, "leaf"));
+    }
+
+    #[test]
+    fn rebind_while_queued_blocks_registration() {
+        // The fn was current when enqueued, but its var was rebound before
+        // the worker published: the sampled generation is stale.
+        let _sweep_guard = crate::tiered::tiers::SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let id = 0xC500_0031u64;
+        let gid = 0xC500_0031u64;
+        let ns = "test.worker-queued-rebind-ns";
+        let tiers = crate::tiered::tiers::Tiers::new(gid);
+        let req = identity_request(id, "leaf", ns, &tiers);
+        crate::tiered::defn_registry::on_redefined(ns, "leaf");
+
+        process_request(&req);
+        assert!(tiers.ir_cache().get(id).is_some());
+        assert!(!registered(gid, ns, "leaf"));
     }
 }

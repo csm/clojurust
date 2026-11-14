@@ -59,6 +59,17 @@ type DefnKey = (u64, Arc<str>, Arc<str>);
 static REGISTRY: LazyLock<RwLock<HashMap<DefnKey, RegisteredDefn>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+/// Per-`(ns, name)` binding generation, bumped by [`on_redefined`] (under the
+/// `REGISTRY` write lock) every time a var holding a fn named `ns/name` is
+/// rebound.  Background registration samples it on the mutator thread after
+/// confirming the lowered fn *is* the var's current binding, and
+/// [`register_defn_if_current`] publishes only if it is unchanged — so a
+/// retained old fn (`(def old f)` then `(defn f …)`) that warms up later can
+/// never be published as the implementation of the current `ns/name`
+/// (issue #505).  Lock order: `REGISTRY` → `BINDING_GENERATIONS`.
+static BINDING_GENERATIONS: LazyLock<RwLock<HashMap<(Arc<str>, Arc<str>), u64>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
 /// Inverse dependency edges: `(ns, name)` → arities whose lowering consumed
 /// it.  Deliberately *not* keyed by GlobalEnv identity — the rebind hook only
 /// sees the function value, so invalidation is over-approximated across
@@ -88,7 +99,20 @@ pub fn register_defn(
     name: &Arc<str>,
     arities: Vec<(usize, bool, Arc<IrFunction>)>,
 ) {
-    let entry = RegisteredDefn {
+    let entry = make_entry(globals_id, ns, name, arities);
+    REGISTRY
+        .write()
+        .unwrap()
+        .insert((globals_id, ns.clone(), name.clone()), entry);
+}
+
+fn make_entry(
+    globals_id: u64,
+    ns: &Arc<str>,
+    name: &Arc<str>,
+    arities: Vec<(usize, bool, Arc<IrFunction>)>,
+) -> RegisteredDefn {
+    RegisteredDefn {
         arities: arities
             .into_iter()
             .map(|(param_count, is_variadic, ir)| RegisteredArity {
@@ -98,11 +122,54 @@ pub fn register_defn(
                 ir,
             })
             .collect(),
-    };
-    REGISTRY
-        .write()
+    }
+}
+
+/// Sample the binding generation of `ns/name` (see [`BINDING_GENERATIONS`]).
+///
+/// Callers must sample this *before* checking that the fn they intend to
+/// register is the var's current root binding: a rebind landing after the
+/// sample bumps the generation (rejecting the later registration), and one
+/// landing before it is visible to the binding check.
+pub fn binding_generation(ns: &str, name: &str) -> u64 {
+    BINDING_GENERATIONS
+        .read()
         .unwrap()
-        .insert((globals_id, ns.clone(), name.clone()), entry);
+        .get(&(Arc::from(ns), Arc::from(name)))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Like [`register_defn`], but only if no rebind of `ns/name` has happened
+/// since `generation` was sampled with [`binding_generation`].  Returns
+/// whether the registration was published.
+///
+/// The check and the insert happen under the `REGISTRY` write lock, which
+/// [`on_redefined`] also holds while bumping the generation, so a rebind is
+/// ordered entirely before (rejecting us) or entirely after (dropping our
+/// registration) this call.
+pub fn register_defn_if_current(
+    globals_id: u64,
+    ns: &Arc<str>,
+    name: &Arc<str>,
+    generation: u64,
+    arities: Vec<(usize, bool, Arc<IrFunction>)>,
+) -> bool {
+    let mut registry = REGISTRY.write().unwrap();
+    let current = BINDING_GENERATIONS
+        .read()
+        .unwrap()
+        .get(&(ns.clone(), name.clone()))
+        .copied()
+        .unwrap_or(0);
+    if current != generation {
+        return false;
+    }
+    registry.insert(
+        (globals_id, ns.clone(), name.clone()),
+        make_entry(globals_id, ns, name, arities),
+    );
+    true
 }
 
 /// Build the externals list for lowering a function: every registered defn in
@@ -191,10 +258,17 @@ pub fn snapshot_externals(
 /// Returns the dependent arity ids so the caller can also stale their
 /// published native code.
 pub fn on_redefined(ns: &str, name: &str) -> Vec<u64> {
-    REGISTRY
-        .write()
-        .unwrap()
-        .retain(|(_, k_ns, k_name), _| !(k_ns.as_ref() == ns && k_name.as_ref() == name));
+    {
+        let mut registry = REGISTRY.write().unwrap();
+        registry.retain(|(_, k_ns, k_name), _| !(k_ns.as_ref() == ns && k_name.as_ref() == name));
+        // Bump while still holding the REGISTRY write lock so a concurrent
+        // `register_defn_if_current` is ordered entirely before or after.
+        *BINDING_GENERATIONS
+            .write()
+            .unwrap()
+            .entry((Arc::from(ns), Arc::from(name)))
+            .or_insert(0) += 1;
+    }
 
     let drained = DEPENDENTS
         .write()
@@ -326,5 +400,39 @@ mod tests {
         // The registration itself is gone.
         let externals = snapshot_externals(gid, dep_id, &referenced);
         assert!(externals.is_empty());
+    }
+
+    #[test]
+    fn register_if_current_rejects_after_rebind() {
+        // Issue #505: a registration sampled before a rebind of `ns/name`
+        // must not be published afterwards.
+        let gid = 0xD500_0101u64;
+        let ns: Arc<str> = Arc::from("test.gen-ns");
+        let name: Arc<str> = Arc::from("leaf");
+        let mut referenced = HashSet::new();
+        referenced.insert((ns.clone(), name.clone()));
+
+        let stale = binding_generation(&ns, &name);
+        on_redefined(&ns, &name);
+        assert!(!register_defn_if_current(
+            gid,
+            &ns,
+            &name,
+            stale,
+            vec![(1, false, dummy_ir())]
+        ));
+        assert!(externals_for(gid, &referenced).is_empty());
+
+        // A freshly-sampled generation is accepted.
+        let current = binding_generation(&ns, &name);
+        assert_ne!(stale, current);
+        assert!(register_defn_if_current(
+            gid,
+            &ns,
+            &name,
+            current,
+            vec![(1, false, dummy_ir())]
+        ));
+        assert_eq!(externals_for(gid, &referenced).len(), 1);
     }
 }
