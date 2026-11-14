@@ -1016,6 +1016,47 @@ fn test_next_returns_nil_when_exhausted() {
 }
 
 #[test]
+fn test_next_on_lazy_sequences() {
+    // Issue #500: an exhausted lazy tail printed as nil but remained truthy,
+    // adding a spurious nil element to loops that terminate on `next`.
+    assert_output(
+        "next_lazy_sequences",
+        r#"
+(defn walk [xs]
+  (loop [remaining (seq xs) result []]
+    (if remaining
+      (recur (next remaining) (conj result (first remaining)))
+      result)))
+(println (nil? (next (take 1 [:a]))))
+(println (nil? (next (take 2 [:a]))))
+(println (nil? (seq (rest (take 2 [:a])))))
+(println (nil? (seq (next (take 2 [:a])))))
+(println (nil? (next (take 2 (list :a)))))
+(println (nil? (next (take 2 (range 1)))))
+(println (nil? (next (take-while any? [:a]))))
+(println (nil? (next (map identity [:a]))))
+(println (if (next (take 2 [:a])) :extra :done))
+(println (walk (take 3 [:a :b])))
+(println (walk (take 0 [:a])))
+(println (nil? (seq (lazy-seq nil))))
+(println (nil? (seq (lazy-seq (list)))))
+(println (nil? (seq (lazy-seq (lazy-seq nil)))))
+(println (nil? (next (cons :a (lazy-seq nil)))))
+(println (walk (lazy-seq (lazy-seq [:a :b]))))
+(def forced (atom 0))
+(def xs (lazy-seq (do (swap! forced inc)
+                     (cons :a (lazy-seq (do (swap! forced inc) (list :b)))))))
+(println @forced)
+(println (first (seq xs)) @forced)
+(println (first (seq xs)) @forced)
+(println (first (next xs)) @forced)
+(println (nil? (next (next xs))) @forced)
+"#,
+        "true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n:done\n[:a :b]\n[]\ntrue\ntrue\ntrue\ntrue\n[:a :b]\n0\n:a 1\n:a 1\n:b 2\ntrue 2",
+    );
+}
+
+#[test]
 #[cfg(feature = "aot_full_test")]
 fn test_first_rest_on_string() {
     // `first`/`rest`/`next` must work on seqable values that aren't already
@@ -3017,13 +3058,15 @@ fn test_lazy_realization_errors() {
   [(try (count (broken)) (catch Exception _ :count))
    (try (first (broken)) (catch Exception _ :first))
    (try (rest (broken)) (catch Exception _ :rest))
+   (try (seq (broken)) (catch Exception _ :seq))
+   (try (next (cons :a (broken))) (catch Exception _ :next))
    (try (apply vector (broken)) (catch Exception _ :apply))
    (try (into [] (map identity (broken))) (catch Exception _ :into))
    (try (= (broken) '(1)) (catch Exception _ :equal))
    (try (hash (broken)) (catch Exception _ :hash))
    (try (pr-str (broken)) (catch Exception _ :print))])
 "#,
-        "[:count :first :rest :apply :into :equal :hash :print]",
+        "[:count :first :rest :seq :next :apply :into :equal :hash :print]",
     );
 }
 

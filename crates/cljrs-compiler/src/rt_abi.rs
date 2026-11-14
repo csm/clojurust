@@ -3185,6 +3185,18 @@ pub unsafe extern "C" fn rt_contains(coll: *const Value, key: *const Value) -> *
 #[unsafe(no_mangle)]
 #[cljrs_export_macro::catch_realization(throw_str, signal_error)]
 pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
+    // A lazy seq can realize to nil, an empty collection, or another lazy
+    // seq. Unwrap iteratively before testing emptiness, without forcing a
+    // non-empty cons's tail. In particular, `next` relies on this to return
+    // actual nil rather than a truthy lazy wrapper at the end of a sequence.
+    let mut coll = coll;
+    while let Value::LazySeq(ls) = unsafe { val_ref(coll) }.unwrap_meta() {
+        let _root = cljrs_runtime::env::gc_roots::root_value(unsafe { val_ref(coll) });
+        coll = match ls.get().try_realize() {
+            Ok(value) => box_val(value),
+            Err(error) => return signal_error(error),
+        };
+    }
     let coll_ref = unsafe { val_ref(coll) }.unwrap_meta();
     match coll_ref {
         Value::Nil => rt_const_nil(),
@@ -3235,7 +3247,7 @@ pub unsafe extern "C" fn rt_seq(coll: *const Value) -> *const Value {
             }
         }
         // Already a seq — return same pointer.
-        Value::Cons(_) | Value::LazySeq(_) => coll,
+        Value::Cons(_) => coll,
         _ => rt_const_nil(),
     }
 }
@@ -5524,7 +5536,7 @@ mod tests {
                     let _fn_root = cljrs_runtime::env::gc_roots::root_value(&f);
                     let to = Value::Vector(GcPtr::new(PersistentVector::empty()));
                     let _to_root = cljrs_runtime::env::gc_roots::root_value(&to);
-                    for op in 0..9 {
+                    for op in 0..11 {
                         assert!(take_pending_exception_value().is_none());
                         let result = unsafe {
                             match op {
@@ -5543,6 +5555,8 @@ mod tests {
                                         .unwrap();
                                     rt_call(&hash, [&lazy as *const Value].as_ptr(), 1)
                                 }
+                                9 => rt_seq(&lazy),
+                                10 => rt_next(&lazy),
                                 _ => unreachable!(),
                             }
                         };
