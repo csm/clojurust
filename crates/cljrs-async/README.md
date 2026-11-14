@@ -95,9 +95,14 @@ Done (Phases A–H, A2, B1):
   (returns `true`, or `false` if the receiver is gone) and raises a **located**
   error at the put site if `v` cannot cross. `(isolate-poll! rx)` is a
   non-blocking take; `(isolate-take! rx)` returns a `Future` for use with
-  `await`. The *distinct parallel primitive* (`pfuture`/`spawn`) that would run
-  Clojure on another isolate is deferred — it needs B3's shared code arena so a
-  worker can see the running program's code without copying the world.
+  `await`; an idle take sleeps until a send (`IsolateReceiver::signal`).
+- Isolate spawn (Clojure surface): `(spawn-isolate 'my.ns/entry arg*)` is the
+  *distinct parallel primitive*. It starts an isolate on a new OS thread and
+  returns a `Future` of the entry function's result. The isolate does not
+  share the caller's code: the host's `IsolateFactory`
+  (`GlobalEnv::set_isolate_factory`) builds it a fresh runtime, which
+  `require`s the entry namespace. The entry point is therefore a qualified
+  symbol, never a closure. See [Spawning an isolate](#spawning-an-isolate).
 - Phase H: `<!!` (blocking take) and `>!!` (blocking put) support synchronous callers.
   Native fibers park on channel futures. Outside fibers, callers block with a thread waker.
   Colored async callers receive an error unless they run inside a fiber.
@@ -152,11 +157,51 @@ send.
 atom, native resource, …) that cannot cross. Every accepted send is metered
 into `--gc-stats` (bytes copied + time). The sender is multi-producer
 (value-copyable); the receiver is single-consumer and deserializes into the
-heap of whichever isolate holds it. Until the parallel primitive lands, both
-ends usually live on one isolate, so this behaves as a byte-bounded queue that
-still pays — and meters — the honest deep copy. `(isolate-chan limit-bytes)`
-sets the channel's byte limit; `isolate-put!` throws when a message does not
-fit.
+heap of whichever isolate holds it. `(isolate-chan limit-bytes)` sets the
+channel's byte limit; `isolate-put!` throws when a message does not fit.
+
+### Spawning an isolate
+
+```clojure
+(require '[clojure.core.async :refer [spawn-isolate isolate-chan isolate-put! isolate-take!]])
+
+;; my.work must be loadable with `require` (on the source path or embedded).
+@(spawn-isolate 'my.work/crunch {:rows 1000})   ; => crunch's result, copied back
+
+;; A long-lived worker: give it a receiver and a sender.
+(let [[to-worker worker-rx]   (isolate-chan)
+      [worker-tx from-worker] (isolate-chan)
+      done (spawn-isolate 'my.work/serve worker-rx worker-tx)]
+  (isolate-put! to-worker {:job 1})
+  @(isolate-take! from-worker))
+```
+
+`spawn-isolate` returns a `Future` at once; `deref`/`await` parks the calling
+fiber until the entry function returns.
+
+- **Entry point.** A namespace-qualified symbol. The new isolate builds its own
+  runtime, `require`s the namespace, and calls the var's value. A function
+  value is rejected, and so is a function that exists only in the caller's
+  runtime (defined at the REPL, or in a script that `require` cannot find).
+  Loading the namespace runs its top-level forms again in the new isolate.
+- **Arguments and result.** Deep-copied with the rules of `isolate-put!`, and
+  metered the same way. A `shared-atom` crosses by reference. An unshareable
+  argument throws at the `spawn-isolate` call, before a thread starts.
+- **Channel ends.** An isolate-channel end passed as a direct argument (not
+  nested in a collection) crosses as itself. A sender is cloned. A receiver
+  *moves*: it works in the new isolate, and using it afterwards in the
+  spawning isolate throws.
+- **Failures.** A throw in the entry function fails the future; an `ex-info`
+  keeps its message and data. A namespace that cannot be loaded, a missing
+  var, and a result that cannot cross fail the future with a message.
+- **Not conveyed.** Dynamic bindings, gas meters, and interrupts stay with the
+  spawning isolate. The isolate starts with root bindings and no meter.
+- **Lifetime.** The isolate ends when its entry function returns; fibers it
+  left running are dropped. It is detached: the process does not wait for it
+  at exit, and interrupting the spawning eval does not stop it.
+- **Availability.** A host must install an `IsolateFactory`. The `cljrs` CLI
+  does (`run`, `repl`, `eval`, `test`, `nrepl`). An embedded runtime without
+  one, an AOT-compiled binary, and wasm32 cannot spawn; the call throws.
 
 ### Error propagation: the `<?` family
 
@@ -415,13 +460,14 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `src/core_async_wasm.cljrs` | (wasm32 only) `<!`, `>!`, and `alts!` macros over `await` for colored `go` bodies |
 | `src/core_async.cljrs` | Clojure source for `clojure.core.async`: `go` (a result channel, via `thread-call`), `alt`, `async-pmap`, `thread`, `merge`, `reduce`, `into`, and the `<?` family (`<?`, `<??`, `go-try`) |
 | `src/clojure_rust_error.cljrs` | Clojure source for `clojure.rust.error`: in-band error helpers `error?`, `ok?`, `throw-err` |
-| `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future |
+| `src/isolate.rs` | `Isolate` — per-isolate execution context: dedicated OS thread, `current_thread` Tokio runtime + `LocalSet`, and independent GC heap (thread-local). `Isolate::spawn` initializes GC state and runs the entry-point future. `Isolate::stack_size` sets the thread's stack size |
 | `src/isolate_channel.rs` | `IsolateSender` / `IsolateReceiver` / `isolate_channel()` — cross-isolate copy boundary (Phase B2): structured-clone of `Value` through a `SerializedValue` wire form over a byte-bounded queue whose messages hold governor `MessageQueue` charges; `isolate_channel_with_limit`, `try_send`/`send_async`, `IsolateReceiver::close`; `IsolateRecv`/`try_recv_status` distinguish empty from disconnected for the Clojure builtins |
-| `src/isolate_builtins.rs` | Clojure-level surface for the copy boundary: `CljIsolateTx`/`CljIsolateRx` native objects and the `isolate-chan` (optional byte limit) / `isolate-put!` / `isolate-poll!` / `isolate-take!` builtins |
+| `src/isolate_builtins.rs` | Clojure-level surface for the copy boundary: `CljIsolateTx`/`CljIsolateRx` native objects, the `isolate-chan` (optional byte limit) / `isolate-put!` / `isolate-poll!` / `isolate-take!` builtins, and `spawn-isolate` (start an isolate from Clojure through the host's `IsolateFactory`) |
 | `src/worker_pool.rs` | `WorkerPool` singleton: multi-thread Tokio runtime (`new_multi_thread`) for `Send` pool tasks; wasm32 stub; `offload` bridges pool results to LocalSet via oneshot; `handle` for direct multi-task spawning |
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
+| `tests/spawn_isolate.rs` | Clojure-level `spawn-isolate` tests: result copy-back, parallel spawns, `^:async` entry points, nested spawns, thrown `ex-info`, moved channel ends, spawn-site argument errors, in-isolate failures, refusal without a factory |
 | `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!`, byte-limited channel reports `Full` at the put site |
 | `tests/no_gc_lifetimes.rs` | No-GC lifetime tests for task results, lazy sequences, top-level accumulators, and replacement of cell contents |
 | `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report once at destruction or teardown |
@@ -454,6 +500,9 @@ pub mod isolate {
     impl Isolate {
         /// Create a new isolate with the given debug name.
         pub fn new(name: impl Into<String>) -> Self;
+
+        /// Stack size of the isolate's OS thread, in bytes.
+        pub fn stack_size(self, bytes: usize) -> Self;
 
         /// Spawn on a dedicated OS thread; `f()` is the entry-point future.
         /// The thread registers with the GC, configures per-isolate limits, and
@@ -537,11 +586,21 @@ pub mod isolate_channel {
         /// Non-blocking receive that distinguishes `Empty` (keep waiting) from
         /// `Disconnected` (all senders gone). Backs the Clojure builtins.
         pub fn try_recv_status(&mut self) -> IsolateRecv;
+        /// A wakeup handle that does not borrow the receiver across an await.
+        pub fn signal(&self) -> RecvSignal;
         /// Close the channel and release every queued message's charge.
         /// Dropping the receiver does the same.
         pub fn close(&mut self);
         pub fn limit(&self) -> usize;
         pub fn queued_bytes(&self) -> usize;
+    }
+
+    /// Wakeup handle for a receiver. `wait` resolves on a send or when the
+    /// last sender goes away; `pass_on` wakes one more waiter.
+    pub struct RecvSignal;
+    impl RecvSignal {
+        pub async fn wait(&self);
+        pub fn pass_on(&self);
     }
 
     /// Outcome of `try_recv_status`: `Value(v)`, `Empty`, or `Disconnected`.

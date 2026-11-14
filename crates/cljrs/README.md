@@ -18,7 +18,8 @@ src/
                       subscriber, the large-stack worker thread, and the
                       subcommand dispatcher
   session.rs        — everything more than one subcommand needs: `setup_globals`
-                      (runtime + stdlib + `cljrs.edn` wiring + JIT policy),
+                      (runtime + stdlib + `cljrs.edn` wiring + JIT policy +
+                      the isolate factory behind `spawn-isolate`),
                       source-path helpers, `eval_in` / `eval_form`, the async
                       driver, and error formatting
   native/           — loading native (Rust) code into a running environment
@@ -52,6 +53,9 @@ build.rs            — captures `rustc -V` for the pinned-package ABI fingerpri
     lsp.rs          — `lsp`: run the language server over stdio
     nrepl.rs        — `nrepl`: serve an nREPL session
 tests/
+  spawn_isolate_cli.rs — `spawn-isolate` under `cljrs run`: isolates load their
+                      entry namespace from `--src-path`, can spawn in turn, and
+                      reject an entry point `require` cannot find
   native_trust.rs   — the native-code trust gate end to end, against the real
                       binary: an untrusted project loads no library and starts
                       no `cargo`; `--native`, `cljrs trust`, `build-native` and

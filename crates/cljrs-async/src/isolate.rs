@@ -44,12 +44,32 @@ impl From<cljrs_runtime::env::error::EvalError> for RootError {
 /// compile error. Values cross via a copy/structured-clone (Phase B2).
 pub struct Isolate {
     name: String,
+    stack_size: Option<usize>,
 }
 
 impl Isolate {
     /// Create a new isolate with the given debug name.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            stack_size: None,
+        }
+    }
+
+    /// Set the stack size of the isolate's OS thread, in bytes.  The default
+    /// is the platform's thread default.
+    pub fn stack_size(mut self, bytes: usize) -> Self {
+        self.stack_size = Some(bytes);
+        self
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn thread_builder(&self) -> std::thread::Builder {
+        let builder = std::thread::Builder::new().name(self.name.clone());
+        match self.stack_size {
+            Some(bytes) => builder.stack_size(bytes),
+            None => builder,
+        }
     }
 
     /// Spawn this isolate on a dedicated OS thread and run `f()` as its
@@ -71,8 +91,7 @@ impl Isolate {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        std::thread::Builder::new()
-            .name(self.name.clone())
+        self.thread_builder()
             .spawn(move || {
                 // Register with the process memory governor before the first
                 // `GcPtr` allocation on this thread.
@@ -98,8 +117,7 @@ impl Isolate {
     where
         F: FnOnce() -> cljrs_runtime::env::error::EvalResult + Send + 'static,
     {
-        std::thread::Builder::new()
-            .name(self.name.clone())
+        self.thread_builder()
             .spawn(move || {
                 cljrs_gc::register_current_isolate(&self.name);
                 let _mutator = cljrs_gc::register_mutator();
