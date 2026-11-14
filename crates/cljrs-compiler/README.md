@@ -279,7 +279,13 @@ walk directly, preserving full semantics.
   name_len, slot)` is the fast path emitted by codegen (`emit_load_global_versioned_ic`):
   versioned bindings are immutable, so the per-call-site slot is filled once with a permanently
   rooted boxed value (the `VERSIONED_IC` table, traced by the same IC root tracer) and never
-  invalidated.
+  invalidated.  The table is **thread-local, one per isolate**: a versioned value is usually a
+  function that points into the heap of the isolate that loaded its namespace, so each isolate
+  resolves its own.  A slot is valid only in code that one isolate runs.  JIT code qualifies
+  (each runtime compiles its own).  AOT object code does not (every isolate shares it), so the
+  AOT compiler (`Compiler::shared_code`) emits no slot: the site calls the bridge every time
+  with a null `slot`, and the bridge answers from the isolate's table, keyed by the addresses
+  of the site's `ns`/`name` constants (no string is built on a hit).
   `jit_stats` module — relaxed diagnostic counters (`BOXED_ARITH_CALLS`, `GUARD_DEOPTS`,
   `KW_IC_FILLS`, `PROTO_IC_HITS`, `PROTO_IC_MISSES`) and `jit_stats::snapshot() -> String`
   (written by `cljrs --jit-stats`).
@@ -625,6 +631,31 @@ mode; `cljrs_gc::resolve_runtime_fault`) prints the fault and exits 1.
 `rt_try` does not catch `ValueError::MemoryLimitExceeded`, like
 `GasExhausted`; the fault stays in its slot for the entry seam.
 
+**Isolates (`spawn-isolate`).** Both harnesses build their runtime in a
+generated `build_globals` function and install it as the runtime's
+`IsolateFactory` (`GlobalEnv::set_isolate_factory`), so a compiled program can
+start isolates.  Each isolate gets its own `GlobalEnv` with the same
+extensions, bundled sources, compiled-namespace loaders, and `:rust :init`
+registrations (the init hook therefore runs once per isolate); the object code
+is shared.  A spawned isolate finds its entry point with `require`, which a
+required namespace already answers through its compiled loader.  The program's
+**entry** namespace has no such loader on the main isolate, where the harness
+runs it directly, so `entry_ns_loader_code` emits one that only spawned
+isolates register: it establishes the namespace, evaluates the interpreted
+preamble, and runs `__cljrs_main`, but does not call `-main`.  The entry
+file's top-level forms therefore run again in an isolate that names its
+namespace, as they do when the interpreter loads a namespace from the source
+path.  A file with no `ns` form (namespace `user`) gets no loader, which also
+matches the interpreter.  `tests/aot_e2e.rs` covers both harnesses.
+
+Compiled call sites keep their inline-cache slots in the object's data
+section, and every isolate in the process shares them.  Keyword slots hold
+immutable interned keywords and protocol slots are validated against the
+callee's identity, so both are safe to share.  A **versioned** load
+(`ns/name@sha`) has no slot in AOT code for this reason; see *Versioned
+symbols* under `rt_abi`.  `aot_versioned_symbols_resolve_per_isolate` in
+`tests/aot_e2e.rs` runs one such call site on several isolates.
+
 The generated harness `main()` (and the `compile_test_harness` test runner)
 calls `cljrs_gc::dump_stats_from_env()` once at exit, so AOT binaries honor
 the `CLJRS_GC_STATS` env var (empty/`"-"` → stdout, otherwise a file path).
@@ -795,6 +826,7 @@ preamble evaluation, native initializers, compiled entry code, and `-main`.
 The test harness registers `clojure.core.async` and drives test bodies in the root fiber.
 Synchronous functions can dereference futures and use blocking channel operations.
 `tests/aot_e2e.rs` covers nested future waits, `io-thread`, and dynamic binding conveyance in a native binary.
+An isolate started by `spawn-isolate` runs in a root fiber of its own, on its own thread, with a runtime from the harness's `build_globals`.
 
 Compiled closure adapters propagate their pending exception into the normal
 call result. `rt_deref` records future dereference errors in the pending-exception slot.

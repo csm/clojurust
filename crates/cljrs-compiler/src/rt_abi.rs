@@ -4867,18 +4867,32 @@ use std::sync::RwLock;
 
 static KW_INTERN: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> = OnceLock::new();
 static PROTO_ICS: OnceLock<RwLock<Vec<Arc<ProtoIcCell>>>> = OnceLock::new();
-/// Resolved versioned values cached by compiled call sites, keyed by
-/// `"<ns>/<name@commit>"`.  Versioned bindings are immutable, so entries are
-/// never invalidated; the table permanently roots each boxed value.
-static VERSIONED_IC: OnceLock<RwLock<std::collections::HashMap<String, SharedVal>>> =
-    OnceLock::new();
+/// One isolate's resolved versioned values.
+#[derive(Default)]
+struct VersionedIc {
+    /// Boxed values keyed by `"<ns>/<name@commit>"`.  Versioned bindings are
+    /// immutable, so entries are never invalidated; the table permanently
+    /// roots each boxed value on this isolate's heap.
+    by_key: std::collections::HashMap<String, GcPtr<Value>>,
+    /// The same pointers keyed by a call site in **shared** (AOT) code: the
+    /// addresses of the site's `ns` and `name` string constants, which live
+    /// in the binary's data and are never reused.  It lets such a site find
+    /// its value without building the string key.
+    by_site: std::collections::HashMap<(usize, usize), usize>,
+}
+
+thread_local! {
+    /// Versioned values resolved by compiled call sites of this isolate.
+    ///
+    /// Per isolate, not per process: a versioned value is usually a function,
+    /// which holds pointers into the heap of the isolate that loaded its
+    /// namespace.  Every isolate resolves its own.
+    static VERSIONED_IC: std::cell::RefCell<VersionedIc> =
+        std::cell::RefCell::new(VersionedIc::default());
+}
 
 fn kw_intern_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
     KW_INTERN.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
-}
-
-fn versioned_ic_table() -> &'static RwLock<std::collections::HashMap<String, SharedVal>> {
-    VERSIONED_IC.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
 }
 
 fn proto_ic_table() -> &'static RwLock<Vec<Arc<ProtoIcCell>>> {
@@ -4906,11 +4920,15 @@ fn ensure_ic_tracer_registered() {
                     visitor.visit(&v.0);
                 }
             }
-            if let Some(table) = VERSIONED_IC.get() {
-                for v in table.read().unwrap().values() {
-                    visitor.visit(&v.0);
+            // The tracer runs on the thread that owns this heap, so this is
+            // the table of the isolate being collected.
+            let _ = VERSIONED_IC.try_with(|table| {
+                if let Ok(table) = table.try_borrow() {
+                    for v in table.by_key.values() {
+                        visitor.visit(v);
+                    }
                 }
-            }
+            });
             if let Some(ics) = PROTO_ICS.get() {
                 for cell in ics.read().unwrap().iter() {
                     if let Some(entry) = cell.0.lock().unwrap().as_ref() {
@@ -4983,21 +5001,30 @@ pub unsafe extern "C" fn rt_kw_ic_fill(ptr: *const u8, len: u64, slot: *mut usiz
 
 /// Versioned-load inline-cache fill (slow path, once per call site).
 ///
-/// Compiled code keeps an 8-byte writable slot per versioned `LoadGlobal`
-/// site (`ns/name@sha`).  Versioned bindings are immutable for the lifetime
-/// of the process, so the slot is filled once and never invalidated — no
-/// epoch or rebind machinery is needed.  On the first execution this bridge
-/// resolves the symbol through the shared versioned resolver (which may
-/// lazily load the `ns@sha` namespace from embedded source or git), interns
-/// the boxed value in a permanently rooted table, and stores the stable
+/// JIT code keeps an 8-byte writable slot per versioned `LoadGlobal` site
+/// (`ns/name@sha`).  Versioned bindings are immutable for the lifetime of the
+/// process, so the slot is filled once and never invalidated — no epoch or
+/// rebind machinery is needed.  On the first execution this bridge resolves
+/// the symbol through the shared versioned resolver (which may lazily load
+/// the `ns@sha` namespace from embedded source or git), interns the boxed
+/// value in the isolate's permanently rooted table, and stores the stable
 /// pointer into the slot.
 ///
-/// Resolution failure leaves the slot empty (so a later execution retries)
+/// The cached value belongs to the calling isolate.  A slot is therefore
+/// valid only in code that one isolate runs, which holds for JIT code (each
+/// runtime compiles its own) and not for AOT code, which every isolate in the
+/// process shares.  AOT call sites pass a **null** `slot` and call this
+/// bridge every time; it then answers from the isolate's table, keyed by the
+/// addresses of the site's `ns` and `name` constants.
+///
+/// Resolution failure leaves the caches empty (so a later execution retries)
 /// and surfaces a pending exception.
 ///
 /// # Safety
-/// `ns_ptr`/`name_ptr` must describe valid UTF-8; `slot` must point to the
-/// call site's 8-byte data slot.
+/// `ns_ptr`/`name_ptr` must describe valid UTF-8, and when `slot` is null
+/// they must stay valid and unmoved for the life of the process; a non-null
+/// `slot` must point to the call site's 8-byte data slot, in code that only
+/// the calling isolate runs.
 #[unsafe(no_mangle)]
 #[cljrs_export_macro::catch_realization(throw_str, signal_error)]
 pub unsafe extern "C" fn rt_load_global_versioned_ic(
@@ -5007,6 +5034,20 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
     name_len: u64,
     slot: *mut usize,
 ) -> *const Value {
+    let site = (ns_ptr as usize, name_ptr as usize);
+    if slot.is_null()
+        && let Some(raw) = VERSIONED_IC.with(|table| table.borrow().by_site.get(&site).copied())
+    {
+        return raw as *const Value;
+    }
+    // Record a resolved pointer where this call site will find it next time.
+    let remember = |raw: *const Value| {
+        if slot.is_null() {
+            VERSIONED_IC.with(|table| table.borrow_mut().by_site.insert(site, raw as usize));
+        } else {
+            unsafe { *slot = raw as usize };
+        }
+    };
     let ns = unsafe {
         std::str::from_utf8_unchecked(std::slice::from_raw_parts(ns_ptr, ns_len as usize))
     };
@@ -5022,9 +5063,15 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
     };
 
     let key = format!("{ns}/{name}");
-    if let Some(v) = versioned_ic_table().read().unwrap().get(&key) {
-        let raw = v.0.get() as *const Value;
-        unsafe { *slot = raw as usize };
+    let cached = VERSIONED_IC.with(|table| {
+        table
+            .borrow()
+            .by_key
+            .get(&key)
+            .map(|v| v.get() as *const Value)
+    });
+    if let Some(raw) = cached {
+        remember(raw);
         return raw;
     }
 
@@ -5052,21 +5099,27 @@ pub unsafe extern "C" fn rt_load_global_versioned_ic(
             #[cfg(feature = "no-gc")]
             let val = cljrs_value::publish::publish_value(val);
             ensure_ic_tracer_registered();
-            let mut table = versioned_ic_table().write().unwrap();
-            // Re-check under the write lock so a racing resolution of the
-            // same symbol cannot replace (and un-root) a pointer already
-            // handed out.
-            if let Some(v) = table.get(&key) {
-                let raw = v.0.get() as *const Value;
-                unsafe { *slot = raw as usize };
+            // Resolving may have loaded the namespace, and loading runs code
+            // that can reach this same symbol.  Re-check so that resolution
+            // cannot replace (and un-root) a pointer already handed out.
+            let cached = VERSIONED_IC.with(|table| {
+                table
+                    .borrow()
+                    .by_key
+                    .get(&key)
+                    .map(|v| v.get() as *const Value)
+            });
+            if let Some(raw) = cached {
+                remember(raw);
                 return raw;
             }
             #[cfg(feature = "no-gc")]
             let _storage = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+            // Allocate before borrowing the table: the root tracer reads it.
             let ptr = GcPtr::new(val);
             let raw = ptr.get() as *const Value;
-            table.insert(key, SharedVal(ptr));
-            unsafe { *slot = raw as usize };
+            VERSIONED_IC.with(|table| table.borrow_mut().by_key.insert(key, ptr));
+            remember(raw);
             raw
         }
         Err(e) => {
@@ -5898,10 +5951,8 @@ mod resource_review_tests {
             assert_eq!(bytes, invocation.accounted_bytes());
             assert_eq!(slot, 0);
             assert!(
-                !versioned_ic_table()
-                    .read()
-                    .unwrap()
-                    .contains_key(&format!("{ns}/{name}"))
+                !VERSIONED_IC
+                    .with(|table| table.borrow().by_key.contains_key(&format!("{ns}/{name}")))
             );
         }
         let invocation = cljrs_gc::alloc_ctx::InvocationGuard::new(4096);

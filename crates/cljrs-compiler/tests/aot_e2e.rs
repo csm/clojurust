@@ -2606,7 +2606,7 @@ fn test_clojure_test_with_failure() {
 
 /// Build a two-commit git fixture and return `(dir, src_dir, sha_v1)`.
 /// `src/mylib.cljrs` — v1: `the-answer` = 1; v2 (HEAD): `the-answer` = 2.
-#[cfg(feature = "aot_full_test")]
+/// Both versions have `bump`, a counter over an atom in the namespace.
 fn make_versioned_lib_repo() -> (tempfile::TempDir, std::path::PathBuf, String) {
     use std::path::Path;
 
@@ -2642,7 +2642,8 @@ fn make_versioned_lib_repo() -> (tempfile::TempDir, std::path::PathBuf, String) 
     let lib_file = src_dir.join("mylib.cljrs");
     std::fs::write(
         &lib_file,
-        "(def the-answer 1)\n(defn describe [] (str \"v\" the-answer))\n",
+        "(def the-answer 1)\n(defn describe [] (str \"v\" the-answer))\n\
+         (def state (atom 0))\n(defn bump [] (swap! state inc))\n",
     )
     .unwrap();
     git_ok(&root, &["add", "."]);
@@ -2660,7 +2661,8 @@ fn make_versioned_lib_repo() -> (tempfile::TempDir, std::path::PathBuf, String) 
 
     std::fs::write(
         &lib_file,
-        "(def the-answer 2)\n(defn describe [] (str \"v\" the-answer))\n",
+        "(def the-answer 2)\n(defn describe [] (str \"v\" the-answer))\n\
+         (def state (atom 0))\n(defn bump [] (swap! state inc))\n",
     )
     .unwrap();
     git_ok(&root, &["add", "."]);
@@ -3239,4 +3241,176 @@ fn aot_uncaught_top_level_throw_stops_before_main() {
     assert!(!stdout.contains(":main-must-not-run"), "{stdout}");
     assert!(!stderr.contains("panicked"), "{stderr}");
     assert!(!std::fs::read_to_string(stats).unwrap().is_empty());
+}
+
+// ── spawn-isolate ───────────────────────────────────────────────────────────
+
+/// `spawn-isolate` in an AOT binary: every isolate builds its own runtime in
+/// the harness and loads its entry point from code compiled into the binary.
+///
+/// One program covers an entry point in a compiled dependency, an isolate that
+/// spawns another, a thrown `ex-info`, channel ends moved to the new isolate,
+/// an entry point in the program's own (entry) namespace, and a namespace that
+/// is not in the binary. The expected output is what `cljrs run` prints for
+/// the same sources.
+#[test]
+fn aot_spawn_isolate_loads_compiled_namespaces_in_each_isolate() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    let src_dir = project.path().join("src");
+    std::fs::create_dir_all(src_dir.join("demo")).unwrap();
+    std::fs::write(
+        src_dir.join("demo/work.cljrs"),
+        r#"
+(ns demo.work
+  (:require [clojure.core.async :refer [spawn-isolate isolate-put! isolate-take!]]))
+(defn square [n] (* n n))
+(defn nested [n] @(spawn-isolate 'demo.work/square n))
+(defn boom [n] (throw (ex-info "boom" {:n n})))
+(defn echo [rx tx] (isolate-put! tx (update @(isolate-take! rx) :n inc)) :done)
+"#,
+    )
+    .unwrap();
+    let source = src_dir.join("demo/main.cljrs");
+    std::fs::write(
+        &source,
+        r#"
+(ns demo.main
+  (:require [clojure.core.async :refer [spawn-isolate isolate-chan isolate-put! isolate-take!]]
+            [demo.work :as work]))
+(println :top-level)
+(defn local [m] (assoc m :via :entry-ns (:k m) (count (:xs m))))
+(defn -main [& args]
+  (println (mapv deref (mapv #(spawn-isolate 'demo.work/square %) [2 3 4])))
+  (println @(spawn-isolate 'demo.work/nested 5))
+  (println (try @(spawn-isolate 'demo.work/boom 7) (catch Exception e (ex-data e))))
+  (let [[to-tx to-rx] (isolate-chan)
+        [from-tx from-rx] (isolate-chan)
+        done (spawn-isolate 'demo.work/echo to-rx from-tx)]
+    (isolate-put! to-tx {:n 1})
+    (println @(isolate-take! from-rx) @done))
+  (println @(spawn-isolate 'demo.main/local {:k :len :xs [1 2 3]}))
+  (println (try @(spawn-isolate 'demo.missing/f) (catch Exception _ :not-loadable))))
+"#,
+    )
+    .unwrap();
+    let binary = project.path().join("spawn-isolate");
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let source = source.clone();
+            let binary = binary.clone();
+            move || {
+                cljrs_compiler::aot::compile_file(&source, &binary, &common::session(vec![src_dir]))
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let stdout = run_binary("spawn-isolate", &binary);
+    assert_eq!(
+        stdout.trim(),
+        // The second `:top-level` is the isolate that loads `demo.main`: its
+        // top-level forms run again there, and `-main` does not.
+        ":top-level\n\
+         [4 9 16]\n\
+         25\n\
+         {:n 7}\n\
+         {:n 2} :done\n\
+         :top-level\n\
+         {:k :len, :xs [1 2 3], :via :entry-ns, :len 3}\n\
+         :not-loadable",
+        "{stdout}"
+    );
+}
+
+/// `spawn-isolate` in a compiled test binary (`cljrs test` AOT): the harness
+/// installs an isolate factory too, and a test namespace is loadable in the
+/// new isolate from the source bundled into the binary.
+#[test]
+fn aot_test_harness_spawns_isolates() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    let dir = project.path().join("tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("isolate_test.cljrs"),
+        r#"
+(ns isolate-test
+  (:require [clojure.test :refer [deftest is]]
+            [clojure.core.async :refer [spawn-isolate]]))
+(defn add [a b] (+ a b))
+(deftest spawns
+  (is (= 42 @(spawn-isolate 'isolate-test/add 40 2))))
+"#,
+    )
+    .unwrap();
+    let bin = project.path().join("isolate_tests");
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let dir = dir.clone();
+            let bin = bin.clone();
+            move || cljrs_compiler::aot::compile_test_harness(&dir, &bin, &[])
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let stdout = run_binary("isolate_tests", &bin);
+    assert!(stdout.contains("1 passed, 0 failed, 0 errors"), "{stdout}");
+}
+
+/// A versioned symbol resolves once per isolate, not once per process.
+///
+/// AOT object code is shared by every isolate, so one call site
+/// (`mylib/bump@sha` inside `tick`) runs on the main isolate and on a spawned
+/// one. Each must get the function from its own copy of the pinned namespace:
+/// the spawned isolate counts from 1 and leaves the main isolate's counter
+/// alone. A value cached in the call site itself would hand the main
+/// isolate's function, with its atom, to the other thread.
+#[test]
+fn aot_versioned_symbols_resolve_per_isolate() {
+    let _guard = AOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_repo_dir, lib_src_dir, sha) = make_versioned_lib_repo();
+    let project = tempfile::tempdir().unwrap();
+    let src_dir = project.path().join("src");
+    std::fs::create_dir_all(src_dir.join("app")).unwrap();
+    let source = src_dir.join("app/main.cljrs");
+    std::fs::write(
+        &source,
+        format!(
+            r#"
+(ns app.main
+  (:require [clojure.core.async :refer [spawn-isolate]]))
+(defn tick [] (mylib/bump@{sha}))
+(defn -main [& _]
+  (println (tick) (tick))
+  (println (mapv deref (mapv (fn [_] (spawn-isolate 'app.main/tick)) (range 3))))
+  (println (tick)))
+"#
+        ),
+    )
+    .unwrap();
+    let binary = project.path().join("versioned-isolates");
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn({
+            let source = source.clone();
+            let binary = binary.clone();
+            move || {
+                cljrs_compiler::aot::compile_file(
+                    &source,
+                    &binary,
+                    &common::session(vec![src_dir, lib_src_dir]),
+                )
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    let stdout = run_binary("versioned-isolates", &binary);
+    assert_eq!(stdout.trim(), "1 2\n[1 1 1]\n3", "{stdout}");
 }
