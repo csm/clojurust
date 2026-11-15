@@ -6203,8 +6203,8 @@ fn builtin_queue(args: &[Value]) -> ValueResult<Value> {
 // ── Atoms ─────────────────────────────────────────────────────────────────────
 
 fn builtin_atom(args: &[Value]) -> ValueResult<Value> {
-    // Actual option parsing (meta/validator) is handled in apply.rs handle_atom_call.
-    // This fallback is only hit by direct Value-level calls (e.g. tests via apply).
+    // Option parsing (meta/validator) lives in `interp::apply::eval_atom`;
+    // `apply_value` routes calls with options there, so this only sees `(atom x)`.
     Ok(Value::Atom(GcPtr::new_isolated(Atom::new(args[0].clone()))))
 }
 
@@ -8232,7 +8232,7 @@ fn builtin_prefers(args: &[Value]) -> ValueResult<Value> {
 
 // ── Phase 7 — Concurrency primitives ─────────────────────────────────────────
 
-fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
+pub(crate) fn builtin_compare_and_set(args: &[Value]) -> ValueResult<Value> {
     match &args[0] {
         Value::Atom(a) => Ok(Value::Bool(
             a.get().compare_and_set(&args[1], args[2].clone()),

@@ -1836,6 +1836,37 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_and_set_honors_validator_and_watches() {
+        // Issue #515: CAS must validate the candidate, notify watches on a
+        // committed change, and stay silent on a failed comparison.
+        let result = eval_str(
+            r#"
+            (let [a (atom 1 :validator pos?)
+                  hits (atom [])]
+              (add-watch a :w (fn [_ _ old new] (swap! hits conj [old new])))
+              [(try (compare-and-set! a 1 -1) (catch Exception e :rejected))
+               @a
+               (compare-and-set! a 5 2)
+               (compare-and-set! a 1 2)
+               @a
+               (apply compare-and-set! [a 2 3])
+               ((fn [f] (f a 3 4)) compare-and-set!)
+               (try (apply compare-and-set! [a 4 0]) (catch Exception e :rejected))
+               (try (apply reset! [a -1]) (catch Exception e :rejected))
+               @a
+               @hits
+               (let [b (apply atom [1 :validator pos?])]
+                 (try (compare-and-set! b 1 -1) (catch Exception e :rejected)))])
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{result}"),
+            "[:rejected 1 false true 2 true true :rejected :rejected 4 [[1 2] [2 3] [3 4]] :rejected]"
+        );
+    }
+
+    #[test]
     fn test_volatile() {
         let result = eval_str(
             r#"
