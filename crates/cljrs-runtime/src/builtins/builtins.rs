@@ -3674,15 +3674,15 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                 Value::List(GcPtr::new(PersistentList::cons(v.clone(), tail_clone)))
             }
             Value::Vector(vec) => Value::Vector(GcPtr::new(vec.get().conj(v.clone()))),
-            Value::Set(s) => Value::Set(s.conj(v.clone())),
+            Value::Set(s) => Value::Set(s.try_conj(v.clone())?),
             Value::Map(m) => {
                 // v can be a [key val] pair or another map.
                 match v.unwrap_meta() {
                     Value::Map(other) => {
                         let mut merged = m;
-                        other.for_each(|k, val| {
-                            merged = merged.assoc(k.clone(), val.clone());
-                        });
+                        for (k, val) in other.iter() {
+                            merged = merged.try_assoc(k.clone(), val.clone())?;
+                        }
                         Value::Map(merged)
                     }
                     Value::Vector(_) => {
@@ -3707,7 +3707,7 @@ fn builtin_conj(args: &[Value]) -> ValueResult<Value> {
                                 "conj on map requires [key val] pairs".into(),
                             ));
                         }
-                        Value::Map(m.assoc(k, val))
+                        Value::Map(m.try_assoc(k, val)?)
                     }
                     _ => {
                         return Err(ValueError::WrongType {
@@ -3794,7 +3794,7 @@ fn builtin_assoc(args: &[Value]) -> ValueResult<Value> {
         }
     };
     for pair in args[1..].chunks(2) {
-        result = result.assoc(pair[0].clone(), pair[1].clone());
+        result = result.try_assoc(pair[0].clone(), pair[1].clone())?;
     }
     Ok(apply_meta(Value::Map(result)))
 }
@@ -4851,13 +4851,13 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
                 Value::List(GcPtr::new(PersistentList::cons(item, tail)))
             }
             Value::Vector(v) => Value::Vector(GcPtr::new(v.get().conj(item))),
-            Value::Set(s) => Value::Set(s.conj(item)),
+            Value::Set(s) => Value::Set(s.try_conj(item)?),
             Value::Map(m) => {
                 let pair = value_to_seq(&item)?;
                 if pair.len() != 2 {
                     return Err(ValueError::Other("into map requires [k v] pairs".into()));
                 }
-                Value::Map(m.assoc(pair[0].clone(), pair[1].clone()))
+                Value::Map(m.try_assoc(pair[0].clone(), pair[1].clone())?)
             }
             Value::LazySeq(_) | Value::Cons(_) => Value::Cons(GcPtr::new(CljxCons {
                 head: item,
@@ -5798,7 +5798,7 @@ fn assoc_in_impl(m: Value, keys: &[Value], val: Value) -> ValueResult<Value> {
     };
     let updated = assoc_in_impl(inner, &keys[1..], val)?;
     let result = match base {
-        Value::Map(map) => Value::Map(map.assoc(k.clone(), updated)),
+        Value::Map(map) => Value::Map(map.try_assoc(k.clone(), updated)?),
         Value::TypeInstance(ti) => Value::TypeInstance(GcPtr::new(TypeInstance {
             type_tag: ti.get().type_tag.clone(),
             fields: ti.get().fields.assoc(k.clone(), updated),
@@ -7703,73 +7703,8 @@ fn builtin_random_sample(args: &[Value]) -> ValueResult<Value> {
 }
 
 fn value_compare_result(a: &Value, b: &Value) -> ValueResult<std::cmp::Ordering> {
-    // Recurses through nested collections without reaching a safepoint.
-    cljrs_value::realization::check_stack();
-    match (a, b) {
-        (Value::Nil, Value::Nil) => Ok(std::cmp::Ordering::Equal),
-        (Value::Nil, _) => Ok(std::cmp::Ordering::Less),
-        (_, Value::Nil) => Ok(std::cmp::Ordering::Greater),
-        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
-        // All numeric types: cross-type comparison
-        (
-            Value::Long(_)
-            | Value::Double(_)
-            | Value::BigInt(_)
-            | Value::BigDecimal(_)
-            | Value::Ratio(_),
-            Value::Long(_)
-            | Value::Double(_)
-            | Value::BigInt(_)
-            | Value::BigDecimal(_)
-            | Value::Ratio(_),
-        ) => num_compare(a, b),
-        (Value::Str(x), Value::Str(y)) => Ok(x.get().cmp(y.get())),
-        (Value::Char(x), Value::Char(y)) => Ok(x.cmp(y)),
-        (Value::Keyword(x), Value::Keyword(y)) => {
-            // Compare namespace first, then name (matching Clojure)
-            let ns_cmp = match (&x.get().namespace, &y.get().namespace) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(a), Some(b)) => a.cmp(b),
-            };
-            Ok(ns_cmp.then_with(|| x.get().name.cmp(&y.get().name)))
-        }
-        (Value::Symbol(x), Value::Symbol(y)) => {
-            let ns_cmp = match (&x.get().namespace, &y.get().namespace) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(a), Some(b)) => a.cmp(b),
-            };
-            Ok(ns_cmp.then_with(|| x.get().name.cmp(&y.get().name)))
-        }
-        (Value::Vector(x), Value::Vector(y)) => {
-            // Lexicographic comparison
-            let x = x.get();
-            let y = y.get();
-            let mut xi = x.iter();
-            let mut yi = y.iter();
-            loop {
-                match (xi.next(), yi.next()) {
-                    (None, None) => return Ok(std::cmp::Ordering::Equal),
-                    (None, Some(_)) => return Ok(std::cmp::Ordering::Less),
-                    (Some(_), None) => return Ok(std::cmp::Ordering::Greater),
-                    (Some(a), Some(b)) => {
-                        let cmp = value_compare_result(a, b)?;
-                        if cmp != std::cmp::Ordering::Equal {
-                            return Ok(cmp);
-                        }
-                    }
-                }
-            }
-        }
-        _ => Err(ValueError::Other(format!(
-            "cannot compare {} to {}",
-            a.type_name(),
-            b.type_name()
-        ))),
-    }
+    // One policy for `compare`, `sort` and sorted-collection keys.
+    cljrs_value::try_compare(a, b)
 }
 
 /// Fallible merge sort — propagates errors from the comparator.
@@ -7868,7 +7803,7 @@ fn invoke_compare(comp: &Value, a: &Value, b: &Value) -> ValueResult<std::cmp::O
 }
 
 fn builtin_sorted_set(args: &[Value]) -> ValueResult<Value> {
-    let set = SortedSet::from_iter(args.iter().cloned());
+    let set = SortedSet::try_from_iter(args.iter().cloned())?;
     Ok(Value::Set(SetValue::Sorted(GcPtr::new(set))))
 }
 
@@ -7883,10 +7818,10 @@ fn builtin_sorted_map(args: &[Value]) -> ValueResult<Value> {
     if !args.len().is_multiple_of(2) {
         return Err(ValueError::OddMap { count: args.len() });
     }
-    let sm = cljrs_value::SortedMap::from_pairs(
+    let sm = cljrs_value::SortedMap::try_from_pairs(
         args.chunks(2)
             .map(|pair| (pair[0].clone(), pair[1].clone())),
-    );
+    )?;
     Ok(Value::Map(MapValue::Sorted(GcPtr::new(sm))))
 }
 

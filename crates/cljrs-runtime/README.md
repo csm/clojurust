@@ -132,6 +132,9 @@ tests/
                                      decides against `:default`; deftype field
                                      vector from a conditional (malli shape)
   refer_clojure.rs                 — `(:refer-clojure ...)` narrowing of the core refer
+  sorted_key_compare.rs            — sorted-map/sorted-set keys use `compare`'s policy:
+                                     incomparable keys error on build and update,
+                                     the old collection survives (issue #514)
   core_shadows.rs                  — core_shadowed_names: what a namespace binds
                                      instead of clojure.core (issue #337)
   declare_macro.rs, doc.rs, gas_meter.rs, into_seq_target.rs, map_entry.rs,

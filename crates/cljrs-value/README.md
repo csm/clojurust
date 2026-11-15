@@ -20,6 +20,7 @@ plus all persistent (immutable, structurally shared) collection types.  The
 ```
 src/
   lib.rs                         — module declarations and re-exports
+  compare.rs                     — try_compare: the fallible language comparison policy shared by `compare`, `sort` and sorted-collection keys; crate-private SortKey wrapper + checked() error capture used by SortedMap/SortedSet
   clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
   error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)` and `Cancelled`, uncatchable like `GasExhausted`), ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
@@ -43,6 +44,8 @@ src/
     hash_set.rs                  — PersistentHashSet (same index+ordering-log technique as PersistentHashMap)
     list.rs                      — PersistentList (singly-linked cons list)
     queue.rs                     — PersistentQueue (front-list + rear-vector)
+    sorted_map.rs                — SortedMap (rpds red-black tree keyed by try_compare order)
+    sorted_set.rs                — SortedSet (rpds red-black tree ordered by try_compare)
     share_charge.rs              — (crate-private) ShareCharge: per-version gc_size_extra charge for structurally shared collections (full size, or path-copied nodes when derived from a GC-allocated version); vector/HAMT/red-black path-size estimates
     vector.rs                    — PersistentVector (32-way trie + tail buffer)
     hamt/
@@ -380,10 +383,40 @@ Whole-number doubles hash like their `Long` equivalent.
 | `PersistentHashMap` | 32-way HAMT index (key→seq) + red-black ordering log (seq→(key,val)); iterates in insertion order | `assoc`, `get`, `dissoc`, `merge`, `iter`, `keys`, `vals` |
 | `PersistentHashSet` | Same index+ordering-log technique; iterates in insertion order | `conj`, `disj`, `contains`, `iter` |
 | `PersistentQueue` | Front-list + rear-vector | `enqueue`, `dequeue`, `peek` |
+| `SortedMap` | Red-black tree, keys ordered by `try_compare` | `try_assoc`, `assoc`, `get`, `dissoc`, `try_from_pairs`, `from_pairs`, `iter`, `keys`, `vals` |
+| `SortedSet` | Red-black tree, elements ordered by `try_compare` | `try_conj`, `conj`, `try_conj_mut`, `conj_mut`, `disj`, `contains`, `try_from_iter`, `iter` |
 
 `PersistentArrayMap::assoc` returns `AssocResult::Array(Self)` while under the
 threshold, or `AssocResult::Promote(Vec<(Value, Value)>)` when the map is full.
 `MapValue::assoc` handles the transparent promotion to `PersistentHashMap`.
+
+#### Sorted-key comparison (`compare`)
+
+```rust
+pub fn try_compare(a: &Value, b: &Value) -> ValueResult<Ordering>;
+```
+
+`try_compare` (re-exported at the crate root) is the one comparison policy for
+`clojure.core/compare`, default `sort`, and the key order of `SortedMap` /
+`SortedSet`. It orders `nil` first, then within a family: booleans, numbers
+(any mix of numeric types, by value — `1` and `1.0` are equivalent), strings,
+characters, keywords and symbols (namespace then name), UUIDs, and vectors
+(element-wise). Metadata is ignored. Every other pair — maps, sets, lists,
+functions, reference types, or values of unrelated families — is an error, so
+a sorted collection never merges two distinct keys (issue #514).
+
+`SortedMap::try_assoc`, `SortedSet::try_conj` / `try_conj_mut`,
+`try_from_pairs` / `try_from_iter`, and `MapValue::try_assoc` /
+`SetValue::try_conj` / `try_conj_mut` report such a key as an error and leave
+the original collection unchanged; user-facing paths (`sorted-map`,
+`sorted-set`, `conj`, `assoc`, `assoc-in`, `into`, compiled `rt_assoc` /
+`rt_conj`) use them. The infallible `assoc` / `conj` / `from_pairs` /
+`FromIterator` forms are for keys known to be comparable and ignore an
+incomparable one. Lookups (`get`, `contains_key`, `contains`) and removals
+(`dissoc`, `disj`) of an incomparable key find nothing.
+
+`Value`'s Rust `Ord` impl is a separate infallible ordering for internal use;
+it is not used for sorted keys.
 
 ### Keyword-argument rest normalization
 

@@ -1,14 +1,21 @@
 use crate::Value;
 use crate::collections::share_charge::{ShareCharge, rb_path_bytes};
+use crate::compare::{SortKey, checked};
+use crate::error::ValueResult;
 
 /// An immutable sorted set backed by `rpds::RedBlackTreeSet`.
+///
+/// Elements are ordered by [`crate::compare::try_compare`], the same policy
+/// as `clojure.core/compare`.  Adding an element that cannot be compared with
+/// the elements on its search path is an error ([`SortedSet::try_conj`]);
+/// membership tests and removals of such an element simply find nothing.
 ///
 /// A set derived by `conj` or `disj` from a GC-allocated set reports only its
 /// path-copied nodes from `gc_size_extra`; see `collections::share_charge`
 /// for the full rule.
 #[derive(Debug, Clone)]
 pub struct SortedSet {
-    inner: rpds::RedBlackTreeSetSync<Value>,
+    inner: rpds::RedBlackTreeSetSync<SortKey>,
     charge: ShareCharge,
 }
 
@@ -28,28 +35,51 @@ impl SortedSet {
         self.inner.is_empty()
     }
 
+    /// Membership test; `false` also when `value` is not comparable with the
+    /// elements.
     pub fn contains(&self, value: &Value) -> bool {
-        self.inner.contains(value)
+        checked(|| self.inner.contains(SortKey::from_ref(value))).unwrap_or(false)
     }
 
-    /// Return a new set with `val` added.
+    /// Return a new set with `value` added, or an error if `value` cannot be
+    /// compared with the existing elements (`self` is unchanged).
+    pub fn try_conj(&self, value: Value) -> ValueResult<Self> {
+        let inner = checked(|| self.inner.insert(SortKey(value)))?;
+        Ok(self.derived(inner))
+    }
+
+    /// Infallible [`SortedSet::try_conj`] for elements known to be
+    /// comparable; an incomparable element leaves the set unchanged.
     pub fn conj(&self, value: Value) -> Self {
-        self.derived(self.inner.insert(value))
+        self.try_conj(value).unwrap_or_else(|_| self.clone())
     }
 
-    pub fn conj_mut(&mut self, value: Value) -> &mut Self {
-        self.inner.insert_mut(value);
+    /// In-place [`SortedSet::try_conj`]; on error `self` is unchanged.
+    pub fn try_conj_mut(&mut self, value: Value) -> ValueResult<&mut Self> {
+        let mut inner = self.inner.clone();
+        checked(|| inner.insert_mut(SortKey(value)))?;
+        self.inner = inner;
         self.charge = ShareCharge::full();
+        Ok(self)
+    }
+
+    /// Infallible [`SortedSet::try_conj_mut`]; an incomparable element leaves
+    /// the set unchanged.
+    pub fn conj_mut(&mut self, value: Value) -> &mut Self {
+        let _ = self.try_conj_mut(value);
         self
     }
 
-    /// Return a new set with `val` removed.
+    /// Return a new set with `value` removed.
     pub fn disj(&self, value: &Value) -> Self {
-        self.derived(self.inner.remove(value))
+        match checked(|| self.inner.remove(SortKey::from_ref(value))) {
+            Ok(inner) => self.derived(inner),
+            Err(_) => self.clone(),
+        }
     }
 
     /// Wrap `inner`, produced by one path-copying update of `self.inner`.
-    fn derived(&self, inner: rpds::RedBlackTreeSetSync<Value>) -> Self {
+    fn derived(&self, inner: rpds::RedBlackTreeSetSync<SortKey>) -> Self {
         let n = inner.size().max(self.inner.size());
         Self {
             charge: self
@@ -73,20 +103,32 @@ impl SortedSet {
 
     /// Iterate over all elements in sorted order
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
-        self.inner.iter()
+        self.inner.iter().map(|k| &k.0)
+    }
+
+    /// Build a set, failing on the first element that cannot be compared
+    /// with the elements before it.
+    pub fn try_from_iter<I: IntoIterator<Item = Value>>(iter: I) -> ValueResult<Self> {
+        let mut inner = rpds::RedBlackTreeSetSync::new_sync();
+        for v in iter {
+            checked(|| inner.insert_mut(SortKey(v)))?;
+        }
+        Ok(SortedSet {
+            inner,
+            charge: ShareCharge::full(),
+        })
     }
 }
 
+/// Infallible [`SortedSet::try_from_iter`] for elements known to be
+/// comparable; incomparable elements are skipped.
 impl FromIterator<Value> for SortedSet {
     fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
-        let mut inner = rpds::RedBlackTreeSetSync::new_sync();
+        let mut s = SortedSet::empty();
         for v in iter {
-            inner.insert_mut(v);
+            s.conj_mut(v);
         }
-        SortedSet {
-            inner,
-            charge: ShareCharge::full(),
-        }
+        s
     }
 }
 
@@ -95,7 +137,8 @@ impl PartialEq for SortedSet {
         if self.count() != other.count() {
             return false;
         }
-        self.inner.iter().all(|v| other.contains(v))
+        // Same comparator on both sides, so equal sets iterate in step.
+        self.iter().zip(other.iter()).all(|(a, b)| a == b)
     }
 }
 
@@ -106,7 +149,7 @@ impl cljrs_gc::Trace for SortedSet {
     }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for v in self.inner.iter() {
-            v.trace(visitor);
+            v.0.trace(visitor);
         }
     }
 

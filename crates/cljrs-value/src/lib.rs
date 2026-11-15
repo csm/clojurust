@@ -1,6 +1,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 pub mod clone;
 pub mod collections;
+pub mod compare;
 pub mod error;
 pub mod hash;
 pub mod intern;
@@ -22,6 +23,7 @@ pub use collections::{
     PersistentArrayMap, PersistentHashMap, PersistentHashSet, PersistentList, PersistentQueue,
     PersistentVector, SortedMap, SortedSet,
 };
+pub use compare::try_compare;
 pub use error::{ExceptionInfo, ValueError, ValueResult};
 pub use hash::ClojureHash;
 pub use intern::{intern_keyword, intern_symbol};
