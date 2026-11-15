@@ -118,6 +118,8 @@ tests/
                                      seqable?/record? as a table, against Clojure's
                                      answers, over record, deftype, reify and the
                                      built-in kinds
+  bigdecimal_hash.rs               — `1M`/`1.0M`: equal decimals hash equally; map/set
+                                     lookup, assoc, dissoc before and after growth (#512)
   no_gc_eval.rs                    — (no-gc) arithmetic, def provenance, region stack
   mutator_state.rs                 — virtual threads Phase 0: MutatorState save/restore
                                      between two live evaluations on one thread keeps
