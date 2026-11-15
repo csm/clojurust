@@ -239,6 +239,11 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
     caller_env.current_ns = saved_ns;
     let arity_ids: Vec<u64> = arities.iter().map(|a| a.arity_id).collect();
 
+    let registration_generation = f
+        .name
+        .as_deref()
+        .and_then(|name| current_binding_generation(f, name, caller_env));
+
     let accepted =
         crate::tiered::lower_worker::enqueue(crate::tiered::lower_worker::LowerRequest {
             tiers: caller_env.globals.tiers().handle(),
@@ -246,6 +251,7 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
             ns: f.defining_ns.clone(),
             is_async: f.is_async,
             core_shadows,
+            registration_generation,
             arities,
         });
     if accepted {
@@ -253,6 +259,39 @@ fn request_background_lower(f: &CljxFn, caller_env: &mut Env) {
             caller_env.globals.jit().mark_lower_queued(id);
         }
     }
+}
+
+/// If `f` is the current root binding of its var `defining_ns/name`, return
+/// the cross-defn registry's binding generation for that name; otherwise
+/// `None`.
+///
+/// A retained old fn (`(def old leaf)` then `(defn leaf …)`) keeps its name
+/// and namespace, so without this check warming it up would publish the old
+/// body as the implementation of the *current* `leaf`, and later consumers
+/// would inline it (issue #505).
+///
+/// The generation is sampled *before* the binding is checked: a rebind
+/// landing in between bumps it, so the worker's
+/// `register_defn_if_current` rejects the stale registration.
+fn current_binding_generation(f: &CljxFn, name: &str, caller_env: &Env) -> Option<u64> {
+    // The rebind hook is what bumps generations; it must be live before we
+    // sample one, or a rebind racing this call would go unnoticed.
+    crate::tiered::defn_registry::install_invalidation_hook();
+    let generation = crate::tiered::defn_registry::binding_generation(&f.defining_ns, name);
+    let var = caller_env.globals.lookup_var(&f.defining_ns, name)?;
+    let Some(Value::Fn(bound)) = var.get().deref() else {
+        return None;
+    };
+    let bound = bound.get();
+    // Arity ids are process-unique per `fn*` evaluation, so they identify the
+    // function (copies such as `with-meta` share them, and share the body).
+    let same = bound.arities.len() == f.arities.len()
+        && bound
+            .arities
+            .iter()
+            .zip(f.arities.iter())
+            .all(|(a, b)| a.ir_arity_id == b.ir_arity_id);
+    same.then_some(generation)
 }
 
 /// Execute an IR function with the given arguments.

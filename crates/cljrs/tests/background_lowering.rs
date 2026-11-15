@@ -367,3 +367,34 @@ fn interpreter_only_forms_stay_at_tier0() {
         "program did not complete:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+/// Issue #505: warming a retained old fn after its var was rebound must not
+/// publish the old body as the implementation of the current binding, in
+/// either warm-up order.  The retained fn itself keeps its original result.
+#[test]
+fn retained_old_fn_never_stands_in_for_current_binding() {
+    for (first, second) in [("leaf", "old-leaf"), ("old-leaf", "leaf")] {
+        let src = format!(
+            r#"
+            (defn leaf [x] [x])
+            (def old-leaf leaf)
+            (defn leaf [x] [x x])
+            (dotimes [_ 200] ({first} 7))
+            (Thread/sleep 200)
+            (dotimes [_ 200] ({second} 7))
+            (Thread/sleep 200)
+            (defn consumer [x] (count (leaf x)))
+            (println "cold:" (consumer 7))
+            (dotimes [_ 200] (consumer 7))
+            (Thread/sleep 200)
+            (println "warm:" (consumer 7))
+            (println "old:" (old-leaf 7))
+        "#
+        );
+        let (stdout, stderr) = run_warm(&src, &["--jit-threshold", "0"], &[]);
+        assert!(
+            stdout.contains("cold: 2") && stdout.contains("warm: 2") && stdout.contains("old: [7]"),
+            "order {first} then {second}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
