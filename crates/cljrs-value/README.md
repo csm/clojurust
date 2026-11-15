@@ -361,6 +361,15 @@ pub trait ClojureHash { fn clojure_hash(&self) -> u32; }
 Implemented for `Value` using Murmur3 + JVM `String.hashCode` semantics.
 Whole-number doubles hash like their `Long` equivalent.
 
+`hash.rs` also exports the building blocks:
+
+- `hash_i64(i64) -> u32` — Clojure's `Murmur3.hashLong`: Murmur3 over the low
+  then high 32-bit word (`0` hashes to `0`), so `(hash 1)` is `1392991556` as
+  on the JVM. The words are mixed separately, never XOR-folded first.
+- `hash_u128(u128) -> u32` — the same Murmur3 construction over four words (UUIDs).
+- `hash_string(&str) -> u32`, `murmur3_mix(u32) -> u32` (the `fmix32` finalizer),
+  `hash_combine_ordered`, `hash_combine_unordered`.
+
 ### Collections
 
 | Type | Description | Key operations |
