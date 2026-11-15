@@ -239,6 +239,10 @@ pub struct Compiler<M: Module = ObjectModule> {
     /// captured before `ctx` is cleared.  Used by the JIT to account for the
     /// executable memory backing each compiled arity.
     last_code_size: u32,
+    /// Whether every isolate in the process runs this code (AOT object code)
+    /// rather than one runtime (JIT code).  Shared code cannot cache a value
+    /// that belongs to one isolate in its own data.
+    shared_code: bool,
 }
 
 // ── Generic methods (work with any Module backend) ──────────────────────────
@@ -371,6 +375,7 @@ impl<M: Module> Compiler<M> {
                     sm_param: None,
                     frame_depth: None,
                     error_flag: None,
+                    shared_code: self.shared_code,
                 };
                 translator.translate(ir_func)?;
             }
@@ -423,6 +428,7 @@ impl Compiler<ObjectModule> {
             ptr_type,
             user_funcs: HashMap::new(),
             last_code_size: 0,
+            shared_code: true,
         })
     }
 
@@ -452,6 +458,7 @@ pub(crate) fn new_compiler_from_module<M: Module>(
         ptr_type,
         user_funcs: HashMap::new(),
         last_code_size: 0,
+        shared_code: false,
     })
 }
 
@@ -490,6 +497,8 @@ struct FunctionTranslator<'a, 'b, M: Module> {
     sm_param: Option<cranelift_codegen::ir::Value>,
     frame_depth: Option<cranelift_codegen::ir::Value>,
     error_flag: Option<cranelift_codegen::ir::Value>,
+    /// See [`Compiler::shared_code`].
+    shared_code: bool,
 }
 
 impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
@@ -1767,6 +1776,21 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
         Ok(self.builder.inst_results(call)[0])
     }
 
+    /// Emit `text` as read-only data; return its address and byte length.
+    fn emit_str_const(
+        &mut self,
+        text: &str,
+    ) -> CodegenResult<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)> {
+        let data = self.module.declare_anonymous_data(false, false)?;
+        let mut desc = cranelift_module::DataDescription::new();
+        desc.define(text.as_bytes().to_vec().into_boxed_slice());
+        self.module.define_data(data, &desc)?;
+        let gv = self.module.declare_data_in_func(data, self.builder.func);
+        let ptr = self.builder.ins().global_value(self.ptr_type, gv);
+        let len = self.builder.ins().iconst(types::I64, text.len() as i64);
+        Ok((ptr, len))
+    }
+
     /// Emit a versioned LoadGlobal (`ns/name@sha`) through a per-call-site
     /// inline cache.
     ///
@@ -1777,11 +1801,28 @@ impl<'a, 'b, M: Module> FunctionTranslator<'a, 'b, M> {
     /// namespace), permanently roots the boxed value, and stores it into the
     /// slot.  Versioned bindings are immutable, so the slot never needs
     /// invalidation.
+    ///
+    /// The resolved value belongs to one isolate, so the slot exists only in
+    /// code that one isolate runs (JIT).  Shared (AOT) code has no slot: it
+    /// calls the bridge every time with a null slot, and the bridge answers
+    /// from the calling isolate's own table.
     fn emit_load_global_versioned_ic(
         &mut self,
         ns: &str,
         name: &str,
     ) -> CodegenResult<cranelift_codegen::ir::Value> {
+        if self.shared_code {
+            let (ns_ptr, ns_len) = self.emit_str_const(ns)?;
+            let (name_ptr, name_len) = self.emit_str_const(name)?;
+            let no_slot = self.builder.ins().iconst(self.ptr_type, 0);
+            let fill_ref = self.import_func(self.rt.rt_load_global_versioned_ic);
+            let call = self
+                .builder
+                .ins()
+                .call(fill_ref, &[ns_ptr, ns_len, name_ptr, name_len, no_slot]);
+            self.emit_error_check()?;
+            return Ok(self.builder.inst_results(call)[0]);
+        }
         // Writable zero-initialised slot for this call site.
         let slot_data = self.module.declare_anonymous_data(true, false)?;
         let mut slot_desc = cranelift_module::DataDescription::new();

@@ -977,6 +977,7 @@ pub fn compile_file(src_path: &Path, out_path: &Path, session: &CompileSession) 
             obj_bytes: &obj_bytes,
             interpreted_source: &interpreted_source,
             structural_ns: structural_ns.as_ref(),
+            entry_ns: &current_ns,
             compiled_namespaces: &compiled_namespaces,
             versioned_bundled: &versioned_bundled,
         },
@@ -1859,8 +1860,100 @@ struct HarnessInputs<'a> {
     interpreted_source: &'a str,
     /// The entry namespace, when it can be established without embedding text.
     structural_ns: Option<&'a (String, Vec<cljrs_runtime::env::env::RequireSpec>)>,
+    /// The namespace the entry file's compiled forms were lowered in (`user`
+    /// when the file has no `ns` form).
+    entry_ns: &'a str,
     compiled_namespaces: &'a [CompiledNamespace],
     versioned_bundled: &'a [(Arc<str>, String)],
+}
+
+/// The harness source that lets an isolate started by `spawn-isolate` load
+/// the program's **entry** namespace, or nothing when that namespace is
+/// `user`.
+///
+/// A spawned isolate has its own runtime and finds its entry point by
+/// requiring the function's namespace. Required namespaces already have a
+/// loader (see [`write_compiled_ns_wiring`]); the entry namespace does not,
+/// because on the main isolate the harness runs it directly. This registers
+/// one that does what the harness's `run()` does up to, but not including,
+/// the call to `-main`: establish the namespace, evaluate the interpreted
+/// preamble, and run the compiled `__cljrs_main`. A `-main` belongs to the
+/// program, not to an isolate that only wants one of its functions.
+///
+/// The top-level forms of the entry namespace therefore run again in each
+/// isolate that names it, as they do when the interpreter loads a namespace
+/// from the source path.
+///
+/// `user` is skipped to match the interpreter, where a file with no `ns` form
+/// defines vars that `require` cannot reach from another isolate.
+///
+/// The emitted code runs only in a spawned isolate (`spawned` in the
+/// generated `build_globals`). The main isolate must not have this loader: a
+/// `(require '<entry-ns>)` there would run the program's top level twice.
+fn entry_ns_loader_code(
+    entry_ns: &str,
+    structural_ns: Option<&(String, Vec<cljrs_runtime::env::env::RequireSpec>)>,
+    has_preamble: bool,
+) -> String {
+    if entry_ns == "user" {
+        return String::new();
+    }
+    let setup = match structural_ns {
+        Some((ns, requires)) => {
+            // `load_ns` has already created the namespace and referred
+            // `clojure.core` into it before it calls this loader.
+            let mut code = format!(
+                "            let mut env = cljrs_runtime::tiered::Env::new(globals.clone(), {ns:?});\n\
+                 \x20           cljrs_runtime::interp::special::sync_star_ns(&mut env);\n"
+            );
+            for req in requires {
+                let spec_src = render_require_spec(req);
+                code.push_str(&format!(
+                    "            cljrs_runtime::env::loader::load_ns(globals.clone(), &{spec_src}, {ns:?})?;\n"
+                ));
+            }
+            code
+        }
+        None => "            let mut env = cljrs_runtime::tiered::Env::new(globals.clone(), \"user\");\n"
+            .to_string(),
+    };
+    let preamble = if has_preamble {
+        r#"            let preamble = include_str!("preamble.cljrs");
+            let forms = cljrs_reader::Parser::new(preamble.to_string(), "<preamble>".to_string())
+                .parse_all()
+                .map_err(cljrs_runtime::env::error::EvalError::Read)?;
+            for form in &forms {
+                cljrs_runtime::tiered::eval(form, &mut env)?;
+            }
+            // Re-push the eval context with the namespace the preamble's `ns` form set.
+            cljrs_runtime::env::callback::pop_eval_context();
+            cljrs_runtime::env::callback::push_eval_context(&env);
+"#
+    } else {
+        ""
+    };
+    format!(
+        r#"    if spawned {{
+        // Let this isolate `require` the entry namespace: run its top-level
+        // forms, but not `-main`.
+        globals.register_compiled_ns_loader({entry_ns:?}, std::sync::Arc::new(
+            |globals: &std::sync::Arc<cljrs_runtime::env::env::GlobalEnv>| -> cljrs_runtime::env::error::EvalResult<()> {{
+{setup}            let _context = cljrs_runtime::env::callback::install_eval_context_guard(env.globals.clone(), env.current_ns.clone());
+{preamble}            let _result = unsafe {{ __cljrs_main() }};
+            if let Some(error) = cljrs_compiler::rt_abi::take_pending_resource_error() {{
+                return Err(cljrs_runtime::env::error::value_error_to_eval_error(error));
+            }}
+            if let Some(thrown) = cljrs_compiler::rt_abi::take_pending_exception_value() {{
+                return Err(cljrs_runtime::env::error::EvalError::Thrown(thrown));
+            }}
+            if let Some(fault) = cljrs_gc::resolve_runtime_fault() {{
+                return Err(cljrs_runtime::env::error::EvalError::MemoryLimitExceeded(fault));
+            }}
+            Ok(())
+        }}));
+    }}
+"#
+    )
 }
 
 /// The harness source that calls an extension's `:rust :init` hook, or nothing
@@ -1910,6 +2003,7 @@ fn build_harness(
         obj_bytes,
         interpreted_source,
         structural_ns,
+        entry_ns,
         compiled_namespaces,
         versioned_bundled,
     } = inputs;
@@ -2135,6 +2229,7 @@ edition = "2024"
     };
 
     let native_init_code = native_init_code(rust_config.and_then(|rc| rc.init_fn.as_deref()));
+    let entry_ns_loader = entry_ns_loader_code(entry_ns, structural_ns, has_preamble);
 
     let main_rs = format!(
         r#"//! Auto-generated AOT harness for clojurust.
@@ -2149,19 +2244,14 @@ unsafe extern "C" {{
     fn __cljrs_main() -> *const Value;
 {ns_init_externs}}}
 
-fn run() -> cljrs_runtime::env::error::EvalResult {{
-    let outcome = (|| -> cljrs_runtime::env::error::EvalResult {{
-    // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
-    // cannot parse is a hard error, matching `cljrs -X`: someone asked for
-    // diagnostics and must not be left silently without them.
-    if let Err(e) = cljrs_runtime::logging::init_from_env() {{
-        eprintln!("error: {{e}}");
-        std::process::exit(2);
-    }}
-
-    // Ensure all rt_* symbols are linked into the binary.
-    cljrs_compiler::rt_abi::anchor_rt_symbols();
-
+/// Build the runtime of one isolate: the main one (`spawned == false`) or one
+/// started by `spawn-isolate`.
+///
+/// An isolate shares no heap with its parent, so each one gets a runtime of
+/// its own with the same extensions, bundled sources, compiled-namespace
+/// loaders, and native functions.  The compiled code itself is shared: it is
+/// the same object code in the same process.
+fn build_globals(spawned: bool) -> std::sync::Arc<cljrs_runtime::env::env::GlobalEnv> {{
     // Initialize the standard environment so that rt_call and other
     // runtime bridge functions can look up builtins.
     let runtime = cljrs_runtime::Runtime::builder()
@@ -2183,6 +2273,29 @@ fn run() -> cljrs_runtime::env::error::EvalResult {{
     // Register AOT-compiled namespace loaders so `require` runs their native
     // initializers instead of interpreting source.
 {compiled_ns}{native_init}
+{entry_ns_loader}
+    // Let Clojure code start isolates (`spawn-isolate`).  Each one builds its
+    // runtime here too, so it can start isolates in turn.
+    globals.set_isolate_factory(std::sync::Arc::new(|| Ok(build_globals(true))));
+    let _ = spawned;
+    globals
+}}
+
+fn run() -> cljrs_runtime::env::error::EvalResult {{
+    let outcome = (|| -> cljrs_runtime::env::error::EvalResult {{
+    // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
+    // cannot parse is a hard error, matching `cljrs -X`: someone asked for
+    // diagnostics and must not be left silently without them.
+    if let Err(e) = cljrs_runtime::logging::init_from_env() {{
+        eprintln!("error: {{e}}");
+        std::process::exit(2);
+    }}
+
+    // Ensure all rt_* symbols are linked into the binary.
+    cljrs_compiler::rt_abi::anchor_rt_symbols();
+
+    let globals = build_globals(false);
+
 {ns_setup}    // Push an eval context so rt_call can dispatch through the interpreter.
     let _context = cljrs_runtime::env::callback::install_eval_context_guard(env.globals.clone(), env.current_ns.clone());
 {preamble}
@@ -2238,6 +2351,7 @@ fn main() {{
         compiled_ns = compiled_ns_registration,
         ns_init_externs = ns_init_externs,
         native_init = native_init_code,
+        entry_ns_loader = entry_ns_loader,
         main_call = main_call_code,
         extension_init = extensions.harness_init_code(),
     );
@@ -2636,19 +2750,11 @@ use cljrs_value::Value;
     }
 
     code.push_str(
-        r#"fn run() -> cljrs_runtime::env::error::EvalResult {
-    // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
-    // cannot parse is a hard error, matching `cljrs -X`: someone asked for
-    // diagnostics and must not be left silently without them.
-    if let Err(e) = cljrs_runtime::logging::init_from_env() {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
-
-    // Ensure all rt_* symbols are linked into the binary (the compiled
-    // namespace initializers call them).
-    cljrs_compiler::rt_abi::anchor_rt_symbols();
-
+        r#"/// Build the runtime of one isolate: the main one, or one started by
+/// `spawn-isolate`.  An isolate shares no heap with its parent, so each gets a
+/// runtime of its own with the same bundled sources and compiled-namespace
+/// loaders.
+fn build_globals() -> std::sync::Arc<cljrs_runtime::env::env::GlobalEnv> {
     // Initialize the standard environment without IR lowering.
     // The test harness interprets Clojure at runtime; there is no benefit to
     // eagerly compiling test functions to IR, and doing so fills IR_CACHE with
@@ -2699,7 +2805,28 @@ use cljrs_value::Value;
         code.push_str(compiled_ns_registration);
     }
     code.push_str(
-        r#"    let mut env = cljrs_runtime::tiered::Env::new(globals, "user");
+        r#"
+    // Let Clojure code start isolates (`spawn-isolate`).  Each one builds its
+    // runtime here too, so it can start isolates in turn.
+    globals.set_isolate_factory(std::sync::Arc::new(|| Ok(build_globals())));
+    globals
+}
+
+fn run() -> cljrs_runtime::env::error::EvalResult {
+    // Diagnostics: enabled only by CLJRS_X_FLAG / RUST_LOG.  A CLJRS_X_FLAG we
+    // cannot parse is a hard error, matching `cljrs -X`: someone asked for
+    // diagnostics and must not be left silently without them.
+    if let Err(e) = cljrs_runtime::logging::init_from_env() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+
+    // Ensure all rt_* symbols are linked into the binary (the compiled
+    // namespace initializers call them).
+    cljrs_compiler::rt_abi::anchor_rt_symbols();
+
+    let globals = build_globals();
+    let mut env = cljrs_runtime::tiered::Env::new(globals, "user");
 
     // Push an eval context so rt_call can dispatch through the interpreter.
     cljrs_runtime::env::callback::push_eval_context(&env);
@@ -3186,6 +3313,50 @@ mod tests {
         assert!(!expanded_needs_interpreter(&parse_one(
             "(def f ^:a (fn [] 1))"
         )));
+    }
+
+    /// A file with no `ns` form defines its vars in `user`, which another
+    /// isolate cannot `require` in any tier, so no loader is emitted for it.
+    #[test]
+    fn the_user_namespace_gets_no_isolate_loader() {
+        assert_eq!(entry_ns_loader_code("user", None, false), "");
+        assert_eq!(entry_ns_loader_code("user", None, true), "");
+    }
+
+    /// The loader exists only in spawned isolates, re-establishes the entry
+    /// namespace with its requires, and runs the compiled top level.
+    #[test]
+    fn the_entry_namespace_loader_is_for_spawned_isolates_only() {
+        use cljrs_runtime::env::env::{RequireRefer, RequireSpec};
+        let decl = (
+            "my.app".to_string(),
+            vec![RequireSpec {
+                ns: Arc::from("my.lib"),
+                version: None,
+                alias: Some(Arc::from("lib")),
+                refer: RequireRefer::None,
+            }],
+        );
+        let emitted = entry_ns_loader_code("my.app", Some(&decl), false);
+        assert!(emitted.starts_with("    if spawned {"), "{emitted}");
+        assert!(
+            emitted.contains("globals.register_compiled_ns_loader(\"my.app\""),
+            "{emitted}"
+        );
+        assert!(
+            emitted.contains("ns: std::sync::Arc::from(\"my.lib\")"),
+            "{emitted}"
+        );
+        assert!(emitted.contains("unsafe { __cljrs_main() }"), "{emitted}");
+        assert!(!emitted.contains("(-main"), "{emitted}");
+        assert!(!emitted.contains("preamble.cljrs"), "{emitted}");
+
+        // An interpreted preamble carries the `ns` form itself.
+        let emitted = entry_ns_loader_code("my.app", None, true);
+        assert!(
+            emitted.contains("include_str!(\"preamble.cljrs\")"),
+            "{emitted}"
+        );
     }
 
     #[test]

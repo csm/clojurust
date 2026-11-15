@@ -218,8 +218,14 @@ other native object.
   only if its host allows it. The `cljrs` CLI does. An embedded runtime must
   install an isolate factory (`GlobalEnv::set_isolate_factory`); without one
   `spawn-isolate` throws, so a sandboxed guest cannot leave its metered isolate.
-- **Not in AOT binaries or on wasm.** A binary from `cljrs compile` and the
-  wasm build do not install a factory yet.
+- **AOT binaries can spawn.** A binary from `cljrs compile` starts isolates
+  the same way. The new isolate loads the entry point's namespace from the
+  code compiled into the binary; it reads no source files. To name a function
+  in the program's own main namespace, give that file an `ns` form: the new
+  isolate then runs the file's top-level forms again, as `require` does, but
+  it does not call `-main`.
+- **Not on wasm.** The wasm build has no threads and does not install a
+  factory.
 
 ### What can and cannot cross
 
