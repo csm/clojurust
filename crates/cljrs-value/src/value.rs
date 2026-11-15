@@ -439,8 +439,17 @@ impl PartialEq for Value {
             (Value::BigInt(a), Value::Long(b)) => *a.get() == BigInt::from(*b),
             (Value::BigInt(a), Value::BigInt(b)) => a.get() == b.get(),
             (Value::Double(a), Value::Double(b)) => a == b, // NaN != NaN
+            // Integer-valued representations (Long, BigInt, whole Double) are
+            // compared by *exact* mathematical value, so `=` stays transitive
+            // across all three (issue #511). No float rounding is involved.
             (Value::Long(a), Value::Double(b)) => b.fract() == 0.0 && b.to_i64() == Some(*a),
             (Value::Double(a), Value::Long(b)) => a.fract() == 0.0 && a.to_i64() == Some(*b),
+            (Value::BigInt(a), Value::Double(b)) => {
+                whole_f64_to_bigint(*b).as_ref() == Some(a.get())
+            }
+            (Value::Double(a), Value::BigInt(b)) => {
+                whole_f64_to_bigint(*a).as_ref() == Some(b.get())
+            }
             (Value::BigDecimal(a), Value::BigDecimal(b)) => a.get() == b.get(),
             (Value::Ratio(a), Value::Ratio(b)) => a.get() == b.get(),
             (Value::Char(a), Value::Char(b)) => a == b,
@@ -529,6 +538,26 @@ impl PartialEq for Value {
     }
 }
 
+/// Exact conversion of a finite, whole-number `f64` to a `BigInt`.
+/// Returns `None` for NaN, infinities, and values with a fractional part.
+fn whole_f64_to_bigint(f: f64) -> Option<BigInt> {
+    if f.is_finite() && f.fract() == 0.0 {
+        // Exact for every finite whole f64 (no rounding).
+        num_traits::FromPrimitive::from_f64(f)
+    } else {
+        None
+    }
+}
+
+/// Hash shared by every integer-valued numeric representation, so that
+/// values equal under `=` (Long / BigInt / whole Double) hash identically.
+fn hash_integer(n: &BigInt) -> u32 {
+    match n.to_i64() {
+        Some(l) => hash_i64(l),
+        None => hash_string(&n.to_string()),
+    }
+}
+
 fn maps_equal(a: &MapValue, b: &MapValue) -> bool {
     if a.count() != b.count() {
         return false;
@@ -613,23 +642,21 @@ impl ClojureHash for Value {
             }
             Value::Long(n) => hash_i64(*n),
             Value::Double(f) => {
-                // Whole-number doubles hash like their Long equivalent.
-                if f.fract() == 0.0
-                    && f.is_finite()
-                    && let Some(n) = num_traits::ToPrimitive::to_i64(f)
-                {
-                    return hash_i64(n);
+                // Whole-number doubles hash like their Long equivalent; those
+                // outside the i64 range hash like the equal BigInt.
+                if f.is_finite() && f.fract() == 0.0 {
+                    if let Some(n) = f.to_i64() {
+                        return hash_i64(n);
+                    }
+                    if let Some(n) = whole_f64_to_bigint(*f) {
+                        return hash_integer(&n);
+                    }
                 }
                 hash_i64(f.to_bits() as i64)
             }
-            Value::BigInt(n) => {
-                // Hash like Long if it fits.
-                if let Some(l) = n.get().to_i64() {
-                    return hash_i64(l);
-                }
-                // Otherwise hash the decimal string (simplified).
-                hash_string(&n.get().to_string())
-            }
+            // Hash like Long if it fits, otherwise by decimal string; whole
+            // Doubles use the same scheme so `=` values hash identically.
+            Value::BigInt(n) => hash_integer(n.get()),
             Value::Char(c) => *c as u32,
             Value::Str(s) => hash_string(s.get()),
             Value::Pattern(r) => hash_string(r.get().as_str()),
@@ -1567,6 +1594,139 @@ mod tests {
         assert_eq!(int(1), Value::Double(1.0));
         // 1.5 != 1
         assert_ne!(Value::Double(1.5), int(1));
+    }
+
+    // ── Numeric equivalence: transitivity + hash coherence (issue #511) ──────
+
+    fn big(n: BigInt) -> Value {
+        Value::BigInt(GcPtr::new(n))
+    }
+
+    /// Every integer-valued representation of `n` that can represent it exactly.
+    fn reprs(n: &BigInt) -> Vec<Value> {
+        let mut out = vec![big(n.clone())];
+        if let Some(l) = n.to_i64() {
+            out.push(int(l));
+        }
+        if let Some(f) = n.to_f64()
+            && whole_f64_to_bigint(f).as_ref() == Some(n)
+        {
+            out.push(Value::Double(f));
+        }
+        out
+    }
+
+    fn numeric_samples() -> Vec<Value> {
+        let two53 = BigInt::from(1i64 << 53);
+        let two63 = BigInt::from(i64::MAX) + 1i32;
+        let mut ints: Vec<BigInt> = vec![
+            BigInt::from(0),
+            BigInt::from(1),
+            BigInt::from(-1),
+            BigInt::from(42),
+            two53.clone() - 1i32,
+            two53.clone(),
+            two53.clone() + 1i32, // not exactly representable as f64
+            -two53.clone(),
+            -(two53.clone() + 1i32),
+            BigInt::from(i64::MAX),
+            BigInt::from(i64::MIN),
+            two63.clone(),
+            -two63.clone() - 1i32,
+            BigInt::from(1u128 << 70),
+            BigInt::from(1u128 << 70) + 1i32,
+            -BigInt::from(1u128 << 70),
+        ];
+        ints.dedup();
+        let mut vals: Vec<Value> = ints.iter().flat_map(reprs).collect();
+        // Values that round to a neighbouring integer when converted to f64.
+        vals.push(Value::Double((1i64 << 53) as f64));
+        vals.push(Value::Double(i64::MAX as f64));
+        vals.push(Value::Double(1.5));
+        vals.push(Value::Double(-0.0));
+        vals
+    }
+
+    #[test]
+    fn test_numeric_bigint_double_eq() {
+        let one_n = big(BigInt::from(1));
+        assert_eq!(Value::Double(1.0), one_n);
+        assert_eq!(one_n, Value::Double(1.0));
+        assert_ne!(Value::Double(1.5), one_n);
+        // 2^53 + 1 is not representable as a double; must not compare equal
+        // to the nearest double (2^53).
+        let p = big(BigInt::from((1i64 << 53) + 1));
+        assert_ne!(p, Value::Double((1i64 << 53) as f64));
+        // Large whole doubles beyond i64 compare exactly with BigInt.
+        let huge = BigInt::from(1u128 << 70);
+        assert_eq!(big(huge.clone()), Value::Double((1u128 << 70) as f64));
+        assert_ne!(big(huge + 1i32), Value::Double((1u128 << 70) as f64));
+        assert_ne!(Value::Double(f64::NAN), one_n);
+        assert_ne!(Value::Double(f64::INFINITY), one_n);
+    }
+
+    #[test]
+    fn test_numeric_eq_transitive_and_hash_coherent() {
+        let vals = numeric_samples();
+        for a in &vals {
+            for b in &vals {
+                if a == b {
+                    assert_eq!(b, a, "symmetry: {a:?} {b:?}");
+                    assert_eq!(
+                        a.clojure_hash(),
+                        b.clojure_hash(),
+                        "equal values must hash equally: {a:?} {b:?}"
+                    );
+                    for c in &vals {
+                        if b == c {
+                            assert_eq!(a, c, "transitivity: {a:?} = {b:?} = {c:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hash_set_cardinality_independent_of_order() {
+        use crate::collections::PersistentHashSet;
+        let groups: Vec<Vec<Value>> = vec![
+            vec![int(1), Value::Double(1.0), big(BigInt::from(1))],
+            vec![int(-7), Value::Double(-7.0), big(BigInt::from(-7))],
+            vec![
+                int(1i64 << 53),
+                Value::Double((1i64 << 53) as f64),
+                big(BigInt::from(1i64 << 53)),
+                big(BigInt::from((1i64 << 53) + 1)),
+            ],
+            vec![
+                Value::Double((1u128 << 70) as f64),
+                big(BigInt::from(1u128 << 70)),
+                big(BigInt::from(1u128 << 70) + 1i32),
+            ],
+        ];
+        for g in groups {
+            let n = g.len();
+            let mut counts = Vec::new();
+            // All rotations and their reversals.
+            for r in 0..n {
+                for rev in [false, true] {
+                    let mut perm: Vec<Value> = g[r..].iter().chain(&g[..r]).cloned().collect();
+                    if rev {
+                        perm.reverse();
+                    }
+                    let mut set = PersistentHashSet::empty();
+                    for v in &perm {
+                        set = set.conj(v.clone());
+                    }
+                    for v in &g {
+                        assert!(set.contains(v), "membership of {v:?} in {perm:?}");
+                    }
+                    counts.push(set.count());
+                }
+            }
+            assert!(counts.windows(2).all(|w| w[0] == w[1]), "{g:?}: {counts:?}");
+        }
     }
 
     #[test]
