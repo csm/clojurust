@@ -1386,6 +1386,13 @@ pub mod lower {
 /// never leaks its registrations to the next one built.
 pub mod defn_registry {
     pub fn register_defn(globals_id: u64, ns, name, arities: Vec<(usize, bool, Arc<IrFunction>)>);
+    /// Per-(ns, name) generation, bumped by on_redefined.  Sample it *before*
+    /// checking that a fn is its var's current binding (#505).
+    pub fn binding_generation(ns, name) -> u64;
+    /// register_defn only if `generation` is still current; the background
+    /// worker uses this so a retained old fn (var since rebound) is never
+    /// published as the current binding's implementation.
+    pub fn register_defn_if_current(globals_id, ns, name, generation: u64, arities) -> bool;
     pub fn externals_for(globals_id: u64, referenced) -> Vec<ExternalDefn>;
     pub fn record_dependents(arity_id, used);
     /// Phase 10.7: externals_for + record_dependents in one step, atomic with
