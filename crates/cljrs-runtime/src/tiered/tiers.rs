@@ -12,8 +12,11 @@
 //! each other's IR or native code.  Dropping a runtime drops its IR outright
 //! and hands every epoch it still has published to the code cache for
 //! reclamation (see [`JitState`]'s `Drop`), so its compiled modules are freed
-//! at the next safepoint at which no thread is executing them.  The one
-//! exception is `^:async` poll functions, which are registered outside the
+//! at the next safepoint at which no thread is executing them.  The
+//! cross-defn registry (`defn_registry`) is process-global, but `Tiers`
+//! retires this runtime's registrations, dependent edges and relower marks
+//! on drop, and the registrations of evicted arities on [`Tiers::sweep`].
+//! The one exception is `^:async` poll functions, which are registered outside the
 //! epoch-tagged cache and live for the process — see
 //! `cljrs_compiler::jit::async_jit`.
 //!
@@ -100,12 +103,24 @@ impl Tiers {
         let evicted = self
             .ir_cache
             .sweep(now, ttl_secs, |id| self.jit.pins_ir(id));
+        // The cross-defn registry must not keep evicted IR alive (#508).
+        crate::tiered::defn_registry::retire_arities(self.globals_id, &evicted);
         for &id in &evicted {
             self.jit.evict_entry_if_cold(id);
             self.jit.stale_osr_code(id);
             tracing::debug!(target: "ir", "evicted idle IR arity_id={}", id);
         }
         evicted
+    }
+}
+
+impl Drop for Tiers {
+    /// Release everything the process-global cross-defn registry holds on
+    /// this runtime's behalf (#508).  Runs when the last strong handle goes,
+    /// so a background worker that upgraded [`Tiers::handle`] finishes (and
+    /// registers) first, and its registration is retired here.
+    fn drop(&mut self) {
+        crate::tiered::defn_registry::retire_runtime(self.globals_id);
     }
 }
 
@@ -269,5 +284,129 @@ mod tests {
         let evicted = sweep_idle(touched_at + 599, 600);
         assert!(!evicted.contains(&id));
         assert!(tiers.ir_cache().get(id).is_some());
+    }
+
+    // ── Issue #508: registry ownership follows the runtime ───────────────
+
+    fn referenced(ns: &str, name: &str) -> std::collections::HashSet<(Arc<str>, Arc<str>)> {
+        let mut r = std::collections::HashSet::new();
+        r.insert((Arc::from(ns), Arc::from(name)));
+        r
+    }
+
+    /// Dropping a runtime releases the registry's strong IR references and
+    /// all of its dependent/relower bookkeeping; an in-flight snapshot taken
+    /// before the drop stays usable until it is released.
+    #[test]
+    fn dropping_runtime_releases_registry_ir() {
+        use crate::tiered::defn_registry as reg;
+        let _g = sweep_guard();
+        let gid = 0xE5AB_0001u64;
+        let (ns, name) = ("test.retire-ns", "callee");
+        let (callee_id, caller_id) = (0xE5AB_0101u64, 0xE5AB_0102u64);
+        let tiers = Tiers::new(gid);
+
+        let ir = dummy_ir();
+        let weak = Arc::downgrade(&ir);
+        tiers.ir_cache().store(callee_id, ir.clone());
+        reg::register_defn(
+            gid,
+            &Arc::from(ns),
+            &Arc::from(name),
+            vec![(callee_id, 1, false, ir)],
+        );
+        // A caller consumes the callee (in-flight snapshot + edge), and a
+        // relower mark is pending for another arity of this runtime.
+        let snapshot = reg::snapshot_externals(gid, caller_id, &referenced(ns, name));
+        assert_eq!(snapshot.len(), 1);
+        reg::record_dependents(gid, 0xE5AB_0103, vec![(Arc::from(ns), Arc::from("other"))]);
+        reg::on_redefined(ns, "other");
+        assert!(reg::relower_marked(0xE5AB_0103));
+        assert_eq!(reg::counts_for(gid), (1, 1, 2, 1));
+
+        drop(tiers);
+        assert_eq!(reg::counts_for(gid), (0, 0, 0, 0));
+        assert!(!reg::relower_marked(0xE5AB_0103));
+        assert!(reg::externals_for(gid, &referenced(ns, name)).is_empty());
+
+        // The in-flight consumer still holds a valid strong snapshot...
+        assert!(weak.upgrade().is_some());
+        assert_eq!(snapshot[0].arity_irs.len(), 1);
+        // ...and once it finishes, nothing keeps the IR alive.
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+    }
+
+    /// Evicting a cold registered arity retires its registration, so the
+    /// IR is actually freed; other runtimes' registrations are untouched.
+    #[test]
+    fn sweep_retires_evicted_registration() {
+        use crate::tiered::defn_registry as reg;
+        let _g = sweep_guard();
+        let (gid, other_gid) = (0xE5AB_0002u64, 0xE5AB_0003u64);
+        let (ns, name) = ("test.evict-ns", "cold");
+        let id = 0xE5AB_0201u64;
+        let tiers = Tiers::new(gid);
+
+        let ir = dummy_ir();
+        let weak = Arc::downgrade(&ir);
+        tiers.ir_cache().store(id, ir.clone());
+        reg::register_defn(
+            gid,
+            &Arc::from(ns),
+            &Arc::from(name),
+            vec![(id, 1, false, ir)],
+        );
+        reg::register_defn(
+            other_gid,
+            &Arc::from(ns),
+            &Arc::from(name),
+            vec![(id, 1, false, dummy_ir())],
+        );
+        reg::record_dependents(gid, id, vec![(Arc::from(ns), Arc::from("dep"))]);
+
+        let evicted = tiers.sweep(now_secs() + 10_000, 600);
+        assert!(evicted.contains(&id));
+        assert!(reg::externals_for(gid, &referenced(ns, name)).is_empty());
+        assert!(weak.upgrade().is_none(), "evicted IR must be released");
+        // The evicted arity's outgoing edge is gone too.
+        assert!(!reg::on_redefined(ns, "dep").contains(&id));
+        // Scoped by runtime identity.
+        assert_eq!(
+            reg::externals_for(other_gid, &referenced(ns, name)).len(),
+            1
+        );
+        reg::retire_runtime(other_gid);
+    }
+
+    /// Creating and destroying runtimes with unique names returns the
+    /// registry to baseline for each of them.
+    #[test]
+    fn runtime_churn_returns_registry_to_baseline() {
+        use crate::tiered::defn_registry as reg;
+        let _g = sweep_guard();
+        let mut weaks = Vec::new();
+        for i in 0..32u64 {
+            let gid = 0xE5AC_0000 + i;
+            let id = 0xE5AC_1000 + i;
+            let tiers = Tiers::new(gid);
+            let name: Arc<str> = Arc::from(format!("churn-{i}").as_str());
+            let ir = dummy_ir();
+            weaks.push((gid, Arc::downgrade(&ir)));
+            tiers.ir_cache().store(id, ir.clone());
+            reg::register_defn(
+                gid,
+                &Arc::from("test.churn-ns"),
+                &name,
+                vec![(id, 1, false, ir)],
+            );
+            reg::record_dependents(gid, id + 0x100, vec![(Arc::from("test.churn-ns"), name)]);
+            assert_eq!(reg::counts_for(gid).0, 1);
+        }
+        for (gid, weak) in weaks {
+            assert_eq!(reg::counts_for(gid), (0, 0, 0, 0));
+            assert!(reg::registered_irs(gid).is_empty());
+            assert!(weak.upgrade().is_none());
+        }
     }
 }

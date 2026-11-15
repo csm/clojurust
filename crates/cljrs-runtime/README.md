@@ -118,6 +118,8 @@ tests/
                                      seqable?/record? as a table, against Clojure's
                                      answers, over record, deftype, reify and the
                                      built-in kinds
+  bigdecimal_hash.rs               — `1M`/`1.0M`: equal decimals hash equally; map/set
+                                     lookup, assoc, dissoc before and after growth (#512)
   no_gc_eval.rs                    — (no-gc) arithmetic, def provenance, region stack
   mutator_state.rs                 — virtual threads Phase 0: MutatorState save/restore
                                      between two live evaluations on one thread keeps
@@ -1383,9 +1385,14 @@ pub mod lower {
 
 /// Cross-defn IR registry (in submodule `defn_registry`, Phase 10.5):
 /// `globals_id` is `GlobalEnv::id` — a counter value, so a dropped runtime
-/// never leaks its registrations to the next one built.
+/// never leaks its registrations to the next one built.  The tables are
+/// process-global but runtime-owned (#508): `Tiers`' `Drop` calls
+/// retire_runtime and `Tiers::sweep` calls retire_arities, so neither a dead
+/// runtime nor an evicted arity keeps its IR alive through the registry.
 pub mod defn_registry {
-    pub fn register_defn(globals_id: u64, ns, name, arities: Vec<(usize, bool, Arc<IrFunction>)>);
+    /// (arity_id, param_count, is_variadic, ir)
+    pub type ArityRegistration = (u64, usize, bool, Arc<IrFunction>);
+    pub fn register_defn(globals_id: u64, ns, name, arities: Vec<ArityRegistration>);
     /// Per-(ns, name) generation, bumped by on_redefined.  Sample it *before*
     /// checking that a fn is its var's current binding (#505).
     pub fn binding_generation(ns, name) -> u64;
@@ -1394,7 +1401,7 @@ pub mod defn_registry {
     /// published as the current binding's implementation.
     pub fn register_defn_if_current(globals_id, ns, name, generation: u64, arities) -> bool;
     pub fn externals_for(globals_id: u64, referenced) -> Vec<ExternalDefn>;
-    pub fn record_dependents(arity_id, used);
+    pub fn record_dependents(globals_id, arity_id, used);
     /// Phase 10.7: externals_for + record_dependents in one step, atomic with
     /// respect to on_redefined (holds the registry lock across the edge write).
     /// The background worker must use this — see lower_worker.rs.
@@ -1404,6 +1411,10 @@ pub mod defn_registry {
     pub fn relower_marked(arity_id) -> bool;     // peek without consuming (dispatch)
     pub fn take_relower(arity_id) -> bool;       // consume (lowering worker only)
     pub fn install_invalidation_hook();          // idempotent; var-rebind hook
+    /// Drop a dead runtime's registrations, dependent edges and relower marks.
+    pub fn retire_runtime(globals_id);
+    /// Drop registrations containing evicted arities + their outgoing edges.
+    pub fn retire_arities(globals_id, arity_ids: &[u64]);
 }
 ```
 
@@ -1494,7 +1505,10 @@ impl Tiers {
     pub fn jit(&self) -> &JitState;                // Tier-2 counters + native code
     pub fn handle(&self) -> Weak<Tiers>;           // for a background worker's request
     pub fn sweep(&self, now, ttl_secs) -> Vec<u64>;// TTL evict IR + drop its JIT bookkeeping
+                                                   // and its defn_registry registrations
 }
+
+impl Drop for Tiers { /* defn_registry::retire_runtime(globals_id) */ }
 
 pub fn live() -> Vec<Arc<Tiers>>;                  // every live runtime's tier state
 pub fn sweep_idle(now, ttl_secs) -> Vec<u64>;      // STW reclaim hook: sweep them all

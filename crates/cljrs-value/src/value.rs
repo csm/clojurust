@@ -414,19 +414,21 @@ impl PartialEq for Value {
             return true;
         }
         // Realize lazy sequences before comparing.
-        // A lazy-seq that realizes to nil is an empty sequence, which is equal
-        // to both nil and any empty sequential collection (matching Clojure).
+        // A lazy-seq that realizes to nil is an *empty sequence*: it equals any
+        // empty sequential collection, but never `nil` itself (matching Clojure,
+        // where `(= (lazy-seq nil) nil)` is false). Keeping it unequal to nil
+        // preserves transitivity, since `(= nil [])` is false.
         if let Value::LazySeq(ls) = self {
             let realized = crate::realization::for_trait(ls.get());
-            if realized == Value::Nil && other.is_sequential() {
-                return value_to_seq_vec(other).is_empty();
+            if realized == Value::Nil {
+                return other.is_sequential() && value_to_seq_vec(other).is_empty();
             }
             return realized == *other;
         }
         if let Value::LazySeq(ls) = other {
             let realized = crate::realization::for_trait(ls.get());
-            if realized == Value::Nil && self.is_sequential() {
-                return value_to_seq_vec(self).is_empty();
+            if realized == Value::Nil {
+                return self.is_sequential() && value_to_seq_vec(self).is_empty();
             }
             return *self == realized;
         }
@@ -816,9 +818,14 @@ impl ClojureHash for Value {
                 h
             }
             Value::Macro(f) => f.get() as *const _ as u32,
-            Value::BigDecimal(d) => hash_string(&d.get().to_string()),
+            Value::BigDecimal(d) => hash_bigdecimal(d.get()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
-            Value::LazySeq(ls) => crate::realization::for_trait(ls.get()).clojure_hash(),
+            Value::LazySeq(ls) => match crate::realization::for_trait(ls.get()) {
+                // An empty lazy seq hashes like any other empty sequential
+                // collection (`()`, `[]`), not like nil, so equal keys hash equally.
+                Value::Nil => 1,
+                realized => realized.clojure_hash(),
+            },
             Value::Protocol(p) => p.get() as *const _ as u32,
             Value::ProtocolFn(pf) => pf.get() as *const _ as u32,
             Value::MultiFn(mf) => mf.get() as *const _ as u32,
@@ -1576,12 +1583,79 @@ mod tests {
         Value::string(v)
     }
 
+    #[test]
+    fn bigdecimal_hash_ignores_scale() {
+        use std::str::FromStr;
+        let dec =
+            |t: &str| Value::BigDecimal(GcPtr::new(bigdecimal::BigDecimal::from_str(t).unwrap()));
+        for group in [
+            &["1", "1.0", "1.000", "10E-1", "0.1E1"][..],
+            &["0", "0.0", "0.000", "-0.0", "0E3"][..],
+            &["100", "1E2", "100.00", "10E1"][..],
+            &["-1.5", "-1.50", "-15E-1"][..],
+            &["0.001", "1E-3", "0.00100"][..],
+        ] {
+            let h = dec(group[0]).clojure_hash();
+            for t in group {
+                assert_eq!(dec(group[0]), dec(t), "{t} should equal {}", group[0]);
+                assert_eq!(dec(t).clojure_hash(), h, "{t} vs {}", group[0]);
+            }
+        }
+        // Numerically distinct values keep distinct hashes.
+        assert_ne!(dec("1").clojure_hash(), dec("10").clojure_hash());
+        assert_ne!(dec("1").clojure_hash(), dec("0.1").clojure_hash());
+        assert_ne!(dec("1").clojure_hash(), dec("-1").clojure_hash());
+    }
+
     // ── Equality ──────────────────────────────────────────────────────────────
 
     #[test]
     fn test_nil_eq() {
         assert_eq!(Value::Nil, Value::Nil);
         assert_ne!(Value::Nil, int(0));
+    }
+
+    fn empty_lazy_seq() -> Value {
+        #[derive(Debug)]
+        struct NilThunk;
+        impl cljrs_gc::Trace for NilThunk {
+            fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+        }
+        impl crate::types::Thunk for NilThunk {
+            fn force(&self) -> crate::ValueResult<Value> {
+                Ok(Value::Nil)
+            }
+        }
+        Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(NilThunk))))
+    }
+
+    /// Regression test for issue #513: an empty lazy seq is an empty
+    /// sequential collection, not nil, and hashes like `[]` / `()`.
+    #[test]
+    fn test_empty_lazy_seq_eq_and_hash() {
+        let e = empty_lazy_seq();
+        let empty_vec = Value::Vector(GcPtr::new(PersistentVector::empty()));
+        let empty_list = Value::List(GcPtr::new(PersistentList::empty()));
+
+        // Not equal to nil, in either order.
+        assert_ne!(e, Value::Nil);
+        assert_ne!(Value::Nil, e);
+        // Equal to empty sequential collections, in either order.
+        assert_eq!(e, empty_vec);
+        assert_eq!(empty_vec, e);
+        assert_eq!(e, empty_list);
+        assert_eq!(empty_list, e);
+        // Equal to another empty lazy seq, including a nested one.
+        assert_eq!(e, empty_lazy_seq());
+        // Not equal to non-empty sequential collections.
+        let one = Value::Vector(GcPtr::new(PersistentVector::from_iter([int(1)])));
+        assert_ne!(e, one);
+        assert_ne!(one, e);
+
+        // Hash agrees with the empty sequential hash, not nil's.
+        assert_eq!(e.clojure_hash(), empty_vec.clojure_hash());
+        assert_eq!(e.clojure_hash(), empty_list.clojure_hash());
+        assert_ne!(e.clojure_hash(), Value::Nil.clojure_hash());
     }
 
     #[test]
@@ -2183,4 +2257,26 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::Matcher(_) => 44,
         Value::Error(_) => 45,
     }
+}
+
+/// Hash a `BigDecimal` consistently with its numeric equality: values that
+/// differ only in scale (`1M`, `1.0M`, `1.00M`, `10E-1M`) must hash equally,
+/// so the hash is computed over the canonical form with trailing zeros
+/// stripped from the unscaled value and the scale adjusted accordingly.
+/// Every zero (any scale, any sign) hashes the same.
+fn hash_bigdecimal(d: &bigdecimal::BigDecimal) -> u32 {
+    use num_traits::Zero;
+    let (mut digits, mut scale) = d.as_bigint_and_exponent();
+    if digits.is_zero() {
+        return hash_string("0M");
+    }
+    let ten = BigInt::from(10);
+    loop {
+        if !(&digits % &ten).is_zero() {
+            break;
+        }
+        digits = &digits / &ten;
+        scale -= 1;
+    }
+    hash_string(&format!("{digits}E{}", -scale))
 }
