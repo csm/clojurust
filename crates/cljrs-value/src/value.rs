@@ -261,6 +261,15 @@ impl MapValue {
         }
     }
 
+    /// Like [`MapValue::assoc`], but a sorted map reports a key that cannot
+    /// be compared with its keys as an error instead of ignoring it.
+    pub fn try_assoc(&self, k: Value, v: Value) -> crate::error::ValueResult<Self> {
+        match self {
+            MapValue::Sorted(m) => Ok(MapValue::Sorted(GcPtr::new(m.get().try_assoc(k, v)?))),
+            _ => Ok(self.assoc(k, v)),
+        }
+    }
+
     pub fn dissoc(&self, key: &Value) -> Self {
         match self {
             MapValue::Array(m) => MapValue::Array(GcPtr::new(m.get().dissoc(key))),
@@ -346,6 +355,24 @@ impl SetValue {
             SetValue::Hash(m) => SetValue::Hash(GcPtr::new(m.get().conj(value))),
             SetValue::Sorted(m) => SetValue::Sorted(GcPtr::new(m.get().conj(value))),
         }
+    }
+
+    /// Like [`SetValue::conj`], but a sorted set reports an element that
+    /// cannot be compared with its elements as an error instead of ignoring it.
+    pub fn try_conj(&self, value: Value) -> crate::error::ValueResult<Self> {
+        match self {
+            SetValue::Sorted(m) => Ok(SetValue::Sorted(GcPtr::new(m.get().try_conj(value)?))),
+            _ => Ok(self.conj(value)),
+        }
+    }
+
+    /// Like [`SetValue::conj_mut`], but fallible for sorted sets.
+    pub fn try_conj_mut(&mut self, value: Value) -> crate::error::ValueResult<&mut Self> {
+        if let SetValue::Sorted(s) = self {
+            s.get_mut().try_conj_mut(value)?;
+            return Ok(self);
+        }
+        Ok(self.conj_mut(value))
     }
 
     pub fn conj_mut(&mut self, value: Value) -> &mut Self {

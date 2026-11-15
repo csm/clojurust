@@ -1,14 +1,21 @@
 use crate::Value;
 use crate::collections::share_charge::{ShareCharge, rb_path_bytes};
+use crate::compare::{SortKey, checked};
+use crate::error::ValueResult;
 
 /// An immutable sorted map backed by `rpds::RedBlackTreeMapSync`.
+///
+/// Keys are ordered by [`crate::compare::try_compare`], the same policy as
+/// `clojure.core/compare`.  Inserting a key that cannot be compared with the
+/// keys on its search path is an error ([`SortedMap::try_assoc`]); lookups
+/// and removals of such a key simply find nothing.
 ///
 /// A map derived by `assoc` or `dissoc` from a GC-allocated map reports only
 /// its path-copied nodes from `gc_size_extra`; see
 /// `collections::share_charge` for the full rule.
 #[derive(Debug, Clone)]
 pub struct SortedMap {
-    inner: rpds::RedBlackTreeMapSync<Value, Value>,
+    inner: rpds::RedBlackTreeMapSync<SortKey, Value>,
     charge: ShareCharge,
 }
 
@@ -28,24 +35,41 @@ impl SortedMap {
         self.inner.is_empty()
     }
 
+    /// Look up `key`; `None` also when `key` is not comparable with the keys.
     pub fn get(&self, key: &Value) -> Option<&Value> {
-        self.inner.get(key)
+        checked(|| self.inner.get(SortKey::from_ref(key)))
+            .ok()
+            .flatten()
     }
 
     pub fn contains_key(&self, key: &Value) -> bool {
-        self.inner.contains_key(key)
+        self.get(key).is_some()
     }
 
+    /// Return a new map with `key` bound to `value`, or an error if `key`
+    /// cannot be compared with the existing keys (`self` is unchanged).
+    pub fn try_assoc(&self, key: Value, value: Value) -> ValueResult<Self> {
+        let inner = checked(|| self.inner.insert(SortKey(key), value))?;
+        Ok(self.derived(inner))
+    }
+
+    /// Infallible [`SortedMap::try_assoc`] for keys known to be comparable;
+    /// an incomparable key leaves the map unchanged.
     pub fn assoc(&self, key: Value, value: Value) -> Self {
-        self.derived(self.inner.insert(key, value))
+        self.try_assoc(key, value).unwrap_or_else(|_| self.clone())
     }
 
+    /// Return a new map without `key`; a key that is not comparable with the
+    /// existing keys is not present, so the result equals `self`.
     pub fn dissoc(&self, key: &Value) -> Self {
-        self.derived(self.inner.remove(key))
+        match checked(|| self.inner.remove(SortKey::from_ref(key))) {
+            Ok(inner) => self.derived(inner),
+            Err(_) => self.clone(),
+        }
     }
 
     /// Wrap `inner`, produced by one path-copying update of `self.inner`.
-    fn derived(&self, inner: rpds::RedBlackTreeMapSync<Value, Value>) -> Self {
+    fn derived(&self, inner: rpds::RedBlackTreeMapSync<SortKey, Value>) -> Self {
         let n = inner.size().max(self.inner.size());
         Self {
             charge: self.charge.derive(
@@ -72,17 +96,32 @@ impl SortedMap {
 
     /// Iterate over all `(key, value)` pairs in sorted key order.
     pub fn iter(&self) -> impl Iterator<Item = (&Value, &Value)> {
-        self.inner.iter()
+        self.inner.iter().map(|(k, v)| (&k.0, v))
     }
 
     pub fn keys(&self) -> Vec<Value> {
-        self.inner.keys().cloned().collect()
+        self.inner.keys().map(|k| k.0.clone()).collect()
     }
 
     pub fn vals(&self) -> Vec<Value> {
         self.inner.values().cloned().collect()
     }
 
+    /// Build a map from pairs (last binding wins), failing on the first key
+    /// that cannot be compared with the keys before it.
+    pub fn try_from_pairs<I: IntoIterator<Item = (Value, Value)>>(iter: I) -> ValueResult<Self> {
+        let mut inner = rpds::RedBlackTreeMapSync::new_sync();
+        for (k, v) in iter {
+            checked(|| inner.insert_mut(SortKey(k), v))?;
+        }
+        Ok(Self {
+            inner,
+            charge: ShareCharge::full(),
+        })
+    }
+
+    /// Infallible [`SortedMap::try_from_pairs`] for keys known to be
+    /// comparable; incomparable keys are skipped.
     pub fn from_pairs<I: IntoIterator<Item = (Value, Value)>>(iter: I) -> Self {
         let mut m = Self::empty();
         for (k, v) in iter {
@@ -97,7 +136,8 @@ impl PartialEq for SortedMap {
         if self.count() != other.count() {
             return false;
         }
-        self.inner.iter().all(|(k, v)| other.get(k) == Some(v))
+        // Same comparator on both sides, so equal maps iterate in step.
+        self.iter().zip(other.iter()).all(|(a, b)| a == b)
     }
 }
 
@@ -108,7 +148,7 @@ impl cljrs_gc::Trace for SortedMap {
     }
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for (k, v) in self.inner.iter() {
-            k.trace(visitor);
+            k.0.trace(visitor);
             v.trace(visitor);
         }
     }

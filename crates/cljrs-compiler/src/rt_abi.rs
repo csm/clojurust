@@ -1990,10 +1990,10 @@ pub unsafe extern "C" fn rt_assoc(
     // `builtin_assoc`) — `unwrap_meta()` above only peels it off to dispatch
     // on the underlying collection kind.
     match m {
-        Value::Map(map) => {
-            let new_map = map.assoc(k, v);
-            box_coll_val(apply_meta(Value::Map(new_map), meta))
-        }
+        Value::Map(map) => match map.try_assoc(k, v) {
+            Ok(new_map) => box_coll_val(apply_meta(Value::Map(new_map), meta)),
+            Err(e) => throw_str(e.to_string()),
+        },
         Value::TypeInstance(ti) => {
             let mut fields = ti.get().fields.clone();
             fields = fields.assoc(k, v);
@@ -2040,9 +2040,11 @@ pub unsafe extern "C" fn rt_conj(coll: *const Value, val: *const Value) -> *cons
             ))
         }
         Value::Set(s) => {
-            // Sorted sets: delegate to interpreter (rare path)
-            let new_set = s.conj(val);
-            box_coll_val(apply_meta(Value::Set(new_set), meta))
+            // Sorted sets: the element must be comparable with the others.
+            match s.try_conj(val) {
+                Ok(new_set) => box_coll_val(apply_meta(Value::Set(new_set), meta)),
+                Err(e) => throw_str(e.to_string()),
+            }
         }
         _ => rt_const_nil(),
     }
@@ -3674,8 +3676,11 @@ pub unsafe extern "C" fn rt_into(to: *const Value, from: *const Value) -> *const
     // `assoc`, and size-optimal) rather than per-element `assoc` so there are
     // no intermediate map boxes; the result is region-boxed when a region is
     // open.  Only taken when every source element is a clean key/value pair
-    // (a 2-element vector/list) or the source is itself a map.
+    // (a 2-element vector/list) or the source is itself a map.  Sorted
+    // targets go through the interpreter so they stay sorted and reject
+    // incomparable keys.
     if let Value::Map(to_map) = to_ref
+        && !matches!(to_map, MapValue::Sorted(_))
         && let Some(new_pairs) = into_map_pairs(from_ref)
     {
         // Existing entries first, then the new pairs so they win on conflict.
