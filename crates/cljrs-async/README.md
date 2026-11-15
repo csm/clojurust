@@ -200,8 +200,11 @@ fiber until the entry function returns.
   left running are dropped. It is detached: the process does not wait for it
   at exit, and interrupting the spawning eval does not stop it.
 - **Availability.** A host must install an `IsolateFactory`. The `cljrs` CLI
-  does (`run`, `repl`, `eval`, `test`, `nrepl`). An embedded runtime without
-  one, an AOT-compiled binary, and wasm32 cannot spawn; the call throws.
+  does (`run`, `repl`, `eval`, `test`, `nrepl`), and so does the harness of an
+  AOT-compiled binary (`cljrs compile`, with or without `--test`), where an
+  isolate loads its entry namespace from the code compiled into the binary.
+  An embedded runtime without a factory and wasm32 cannot spawn; the call
+  throws.
 
 ### Error propagation: the `<?` family
 
