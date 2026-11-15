@@ -789,7 +789,7 @@ impl ClojureHash for Value {
                 h
             }
             Value::Macro(f) => f.get() as *const _ as u32,
-            Value::BigDecimal(d) => hash_string(&d.get().to_string()),
+            Value::BigDecimal(d) => hash_bigdecimal(d.get()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
             Value::LazySeq(ls) => crate::realization::for_trait(ls.get()).clojure_hash(),
             Value::Protocol(p) => p.get() as *const _ as u32,
@@ -1549,6 +1549,30 @@ mod tests {
         Value::string(v)
     }
 
+    #[test]
+    fn bigdecimal_hash_ignores_scale() {
+        use std::str::FromStr;
+        let dec =
+            |t: &str| Value::BigDecimal(GcPtr::new(bigdecimal::BigDecimal::from_str(t).unwrap()));
+        for group in [
+            &["1", "1.0", "1.000", "10E-1", "0.1E1"][..],
+            &["0", "0.0", "0.000", "-0.0", "0E3"][..],
+            &["100", "1E2", "100.00", "10E1"][..],
+            &["-1.5", "-1.50", "-15E-1"][..],
+            &["0.001", "1E-3", "0.00100"][..],
+        ] {
+            let h = dec(group[0]).clojure_hash();
+            for t in group {
+                assert_eq!(dec(group[0]), dec(t), "{t} should equal {}", group[0]);
+                assert_eq!(dec(t).clojure_hash(), h, "{t} vs {}", group[0]);
+            }
+        }
+        // Numerically distinct values keep distinct hashes.
+        assert_ne!(dec("1").clojure_hash(), dec("10").clojure_hash());
+        assert_ne!(dec("1").clojure_hash(), dec("0.1").clojure_hash());
+        assert_ne!(dec("1").clojure_hash(), dec("-1").clojure_hash());
+    }
+
     // ── Equality ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -2023,4 +2047,26 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::Matcher(_) => 44,
         Value::Error(_) => 45,
     }
+}
+
+/// Hash a `BigDecimal` consistently with its numeric equality: values that
+/// differ only in scale (`1M`, `1.0M`, `1.00M`, `10E-1M`) must hash equally,
+/// so the hash is computed over the canonical form with trailing zeros
+/// stripped from the unscaled value and the scale adjusted accordingly.
+/// Every zero (any scale, any sign) hashes the same.
+fn hash_bigdecimal(d: &bigdecimal::BigDecimal) -> u32 {
+    use num_traits::Zero;
+    let (mut digits, mut scale) = d.as_bigint_and_exponent();
+    if digits.is_zero() {
+        return hash_string("0M");
+    }
+    let ten = BigInt::from(10);
+    loop {
+        if !(&digits % &ten).is_zero() {
+            break;
+        }
+        digits = &digits / &ten;
+        scale -= 1;
+    }
+    hash_string(&format!("{digits}E{}", -scale))
 }
