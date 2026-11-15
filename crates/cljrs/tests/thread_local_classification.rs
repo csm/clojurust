@@ -314,6 +314,11 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         "IC_TRACER_REGISTERED",
         Thread("process-wide flag"),
     ),
+    (
+        "cljrs-compiler/src/rt_abi.rs",
+        "VERSIONED_IC",
+        Thread("isolate cache of resolved versioned symbols; never borrowed across a park"),
+    ),
     // ── other crates ────────────────────────────────────────────────────────
     (
         "cljrs/src/session.rs",
