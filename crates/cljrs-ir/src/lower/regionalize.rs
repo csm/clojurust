@@ -308,8 +308,9 @@ fn alloc_operands(inst: &Inst) -> Vec<VarId> {
 }
 
 /// Recursively rename every named subfunction in `func` (and its nested
-/// subfunctions) by appending `suffix`, and rewrite all `AllocClosure`
-/// instructions whose `arity_fn_names` reference one of the renamed names.
+/// subfunctions) by appending `suffix`, and rewrite every by-name reference to
+/// a renamed function: `AllocClosure` `arity_fn_names`, and `CallWithRegion` /
+/// `CallDirect` targets.
 ///
 /// Without this rename the cloned IR tree would contain duplicates of every
 /// inner closure's arity-fn, and codegen's `declare_subfunctions` would call
@@ -337,12 +338,25 @@ fn rename_inner_subfunctions(func: &mut IrFunction, suffix: &str) {
     fn rewrite(f: &mut IrFunction, map: &HashMap<Arc<str>, Arc<str>>) {
         for block in &mut f.blocks {
             for inst in block.phis.iter_mut().chain(block.insts.iter_mut()) {
-                if let Inst::AllocClosure(_, tmpl, _) = inst {
-                    for n in &mut tmpl.arity_fn_names {
-                        if let Some(new_name) = map.get(n) {
-                            *n = new_name.clone();
+                match inst {
+                    Inst::AllocClosure(_, tmpl, _) => {
+                        for n in &mut tmpl.arity_fn_names {
+                            if let Some(new_name) = map.get(n) {
+                                *n = new_name.clone();
+                            }
                         }
                     }
+                    // Direct by-name calls into a renamed subfunction — e.g. a
+                    // `CallWithRegion` to a region-specialised callee that an
+                    // earlier promotion attached to this (now cloned) function.
+                    // Leaving these stale makes the target unresolvable
+                    // (issue #506).
+                    Inst::CallWithRegion(_, target, _, _) | Inst::CallDirect(_, target, _) => {
+                        if let Some(new_name) = map.get(target) {
+                            *target = new_name.clone();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -712,4 +726,86 @@ pub fn promote_cross_fn_allocs(mut root: IrFunction, ctx: &EscapeContext) -> IrF
     }
 
     root
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Block, BlockId, Terminator};
+
+    fn single_block_fn(name: &str, insts: Vec<Inst>, ret: VarId) -> IrFunction {
+        let mut f = IrFunction::new(Some(Arc::from(name)), None);
+        f.blocks.push(Block {
+            id: BlockId(0),
+            phis: Vec::new(),
+            insts,
+            terminator: Terminator::Return(ret),
+        });
+        f.next_block = 1;
+        f.next_var = 10;
+        f
+    }
+
+    /// Collect every subfunction name in the tree.
+    fn all_sub_names(f: &IrFunction, out: &mut HashSet<Arc<str>>) {
+        for sub in &f.subfunctions {
+            if let Some(n) = &sub.name {
+                out.insert(n.clone());
+            }
+            all_sub_names(sub, out);
+        }
+    }
+
+    /// Collect every direct by-name call target in the tree.
+    fn all_call_targets(f: &IrFunction, out: &mut Vec<Arc<str>>) {
+        for block in &f.blocks {
+            for inst in &block.insts {
+                match inst {
+                    Inst::CallWithRegion(_, t, _, _) | Inst::CallDirect(_, t, _) => {
+                        out.push(t.clone())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for sub in &f.subfunctions {
+            all_call_targets(sub, out);
+        }
+    }
+
+    /// Regression for issue #506: cloning a function that already contains a
+    /// region-specialised callee (`leaf__rg1`, reached via `CallWithRegion`)
+    /// must rename the call target together with the subfunction definition.
+    #[test]
+    fn rename_updates_call_with_region_targets() {
+        // `middle` already went through stage 4: it owns `leaf__rg1` and calls
+        // it via CallWithRegion (and, for good measure, via CallDirect).
+        let leaf = single_block_fn("leaf__rg1", vec![Inst::RegionParam(VarId(1))], VarId(0));
+        let mut middle = single_block_fn(
+            "middle",
+            vec![
+                Inst::RegionStart(VarId(2)),
+                Inst::CallWithRegion(VarId(3), Arc::from("leaf__rg1"), vec![VarId(0)], VarId(2)),
+                Inst::CallDirect(VarId(4), Arc::from("leaf__rg1"), vec![VarId(0)]),
+                Inst::RegionEnd(VarId(2)),
+            ],
+            VarId(3),
+        );
+        middle.subfunctions.push(leaf);
+
+        rename_inner_subfunctions(&mut middle, "__rg2");
+
+        let mut names = HashSet::new();
+        all_sub_names(&middle, &mut names);
+        assert!(names.contains("leaf__rg1__rg2"));
+        let mut targets = Vec::new();
+        all_call_targets(&middle, &mut targets);
+        assert_eq!(targets.len(), 2);
+        for t in &targets {
+            assert!(
+                names.contains(t),
+                "call target {t} must resolve to a subfunction"
+            );
+        }
+    }
 }
