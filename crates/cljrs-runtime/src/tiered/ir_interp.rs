@@ -1890,7 +1890,7 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
 
     // Arities lowered in this call, collected for the cross-defn registry
     // (param_count, is_variadic, ir).
-    let mut registered: Vec<(usize, bool, Arc<IrFunction>)> = Vec::new();
+    let mut registered: Vec<crate::tiered::defn_registry::ArityRegistration> = Vec::new();
 
     // Hold the tier state by `Arc` rather than borrowing it out of `env`,
     // which the lowering call below needs mutably.
@@ -1904,7 +1904,7 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
             // Keep already-cached arities in the registration so a partial
             // re-lower doesn't drop them from the cross-defn registry.
             if let Some(ir) = ir_cache.get(arity_id) {
-                registered.push((arity.params.len(), arity.rest_param.is_some(), ir));
+                registered.push((arity_id, arity.params.len(), arity.rest_param.is_some(), ir));
             }
             continue;
         }
@@ -1933,8 +1933,17 @@ pub(crate) fn eager_lower_fn(f: &CljxFn, env: &mut Env) {
                 ir_cache.store(arity_id, ir_func.clone());
                 // The lowering specialized against these defns — invalidate
                 // it (and re-lower lazily) if any of them is rebound.
-                crate::tiered::defn_registry::record_dependents(arity_id, used_externals);
-                registered.push((arity.params.len(), arity.rest_param.is_some(), ir_func));
+                crate::tiered::defn_registry::record_dependents(
+                    env.globals.id(),
+                    arity_id,
+                    used_externals,
+                );
+                registered.push((
+                    arity_id,
+                    arity.params.len(),
+                    arity.rest_param.is_some(),
+                    ir_func,
+                ));
                 lowered += 1;
             }
             Err(_) => {

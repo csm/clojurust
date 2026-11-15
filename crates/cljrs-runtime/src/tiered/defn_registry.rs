@@ -27,6 +27,26 @@
 //! *clones the callee's body* into the caller, so a caller lowered against
 //! the old definition would keep executing it after a redefinition unless
 //! invalidated.
+//!
+//! ## Ownership and retirement (issue #508)
+//!
+//! The tables are process-global, but what they hold belongs to one runtime:
+//!
+//! * [`retire_runtime`] — called from `Tiers`' `Drop` — removes every
+//!   registration of a dead runtime (releasing its `Arc<IrFunction>`s) and
+//!   every dependent edge / relower mark of the arities it owned
+//!   (tracked in `OWNED`).
+//! * [`retire_arities`] — called from `Tiers::sweep` — retires the
+//!   registrations containing an evicted arity, so evicting cold IR from the
+//!   cache really releases it, and drops the evicted arities' outgoing
+//!   dependent edges.  The defn is re-registered when it is next lowered.
+//!
+//! A consumer already holding a snapshot (an [`ExternalDefn`] list taken by
+//! an in-flight optimizer) keeps its own strong references and finishes
+//! safely; retirement only stops the registry from *owning* the IR.
+//! `BINDING_GENERATIONS` is deliberately never pruned: it holds one counter
+//! per rebound name (no IR), and resetting a counter would let a stale
+//! sampled generation match again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,6 +57,9 @@ use cljrs_ir::lower::ExternalDefn;
 
 /// One registered arity of a top-level defn.
 struct RegisteredArity {
+    /// `ir_arity_id` of the arity this IR was lowered for; lets cache
+    /// eviction retire the registration ([`retire_arities`]).
+    arity_id: u64,
     /// Process-unique registry key (mangled; see `arity_key`).
     fn_name: Arc<str>,
     /// Callable parameter count (fixed params only).
@@ -83,6 +106,18 @@ static DEPENDENTS: LazyLock<RwLock<HashMap<(Arc<str>, Arc<str>), HashSet<u64>>>>
 static RELOWER: LazyLock<RwLock<HashSet<u64>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
 static RELOWER_PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// `GlobalEnv::id` → arity ids that runtime recorded dependent edges for.
+/// [`retire_runtime`] uses it to purge the runtime's entries from
+/// `DEPENDENTS` and `RELOWER` (marks are only ever set for ids that have an
+/// edge, so this covers both).  Lock order: `REGISTRY` → `DEPENDENTS` →
+/// `OWNED` → `RELOWER`.
+static OWNED: LazyLock<RwLock<HashMap<u64, HashSet<u64>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// One registered arity, as supplied to [`register_defn`]:
+/// `(arity_id, param_count, is_variadic, ir)`.
+pub type ArityRegistration = (u64, usize, bool, Arc<IrFunction>);
+
 /// Mangle a process-unique registry key for one arity.  Never emitted as a
 /// symbol — stage-4 clones are renamed `…__rgN` before codegen sees them.
 fn arity_key(globals_id: u64, ns: &str, name: &str, param_count: usize) -> Arc<str> {
@@ -91,13 +126,13 @@ fn arity_key(globals_id: u64, ns: &str, name: &str, param_count: usize) -> Arc<s
 
 /// Register (or replace) the lowered arities of a top-level defn.
 ///
-/// `arities` supplies `(param_count, is_variadic, ir)` per arity.  Call after
+/// `arities` supplies `(arity_id, param_count, is_variadic, ir)` per arity.  Call after
 /// every arity of the fn has been lowered and optimized.
 pub fn register_defn(
     globals_id: u64,
     ns: &Arc<str>,
     name: &Arc<str>,
-    arities: Vec<(usize, bool, Arc<IrFunction>)>,
+    arities: Vec<ArityRegistration>,
 ) {
     let entry = make_entry(globals_id, ns, name, arities);
     REGISTRY
@@ -110,12 +145,13 @@ fn make_entry(
     globals_id: u64,
     ns: &Arc<str>,
     name: &Arc<str>,
-    arities: Vec<(usize, bool, Arc<IrFunction>)>,
+    arities: Vec<ArityRegistration>,
 ) -> RegisteredDefn {
     RegisteredDefn {
         arities: arities
             .into_iter()
-            .map(|(param_count, is_variadic, ir)| RegisteredArity {
+            .map(|(arity_id, param_count, is_variadic, ir)| RegisteredArity {
+                arity_id,
                 fn_name: arity_key(globals_id, ns, name, param_count),
                 param_count,
                 is_variadic,
@@ -153,7 +189,7 @@ pub fn register_defn_if_current(
     ns: &Arc<str>,
     name: &Arc<str>,
     generation: u64,
-    arities: Vec<(usize, bool, Arc<IrFunction>)>,
+    arities: Vec<ArityRegistration>,
 ) -> bool {
     let mut registry = REGISTRY.write().unwrap();
     let current = BINDING_GENERATIONS
@@ -200,12 +236,31 @@ pub fn externals_for(
     out
 }
 
-/// Record that `arity_id`'s lowering consumed the given externals.
-pub fn record_dependents(arity_id: u64, used: impl IntoIterator<Item = (Arc<str>, Arc<str>)>) {
+/// Record that `arity_id` (owned by the runtime `globals_id`) consumed the
+/// given externals.
+pub fn record_dependents(
+    globals_id: u64,
+    arity_id: u64,
+    used: impl IntoIterator<Item = (Arc<str>, Arc<str>)>,
+) {
     let mut deps = DEPENDENTS.write().unwrap();
+    let mut any = false;
     for key in used {
         deps.entry(key).or_default().insert(arity_id);
+        any = true;
     }
+    if any {
+        note_owned(globals_id, arity_id);
+    }
+}
+
+fn note_owned(globals_id: u64, arity_id: u64) {
+    OWNED
+        .write()
+        .unwrap()
+        .entry(globals_id)
+        .or_default()
+        .insert(arity_id);
 }
 
 /// Atomically snapshot the externals for lowering `arity_id` *and* record the
@@ -241,6 +296,7 @@ pub fn snapshot_externals(
         deps.entry((ns.clone(), name.clone()))
             .or_default()
             .insert(arity_id);
+        note_owned(globals_id, arity_id);
         out.push(ExternalDefn {
             ns: ns.clone(),
             name: name.clone(),
@@ -286,6 +342,82 @@ pub fn on_redefined(ns: &str, name: &str) -> Vec<u64> {
         }
     }
     deps.into_iter().collect()
+}
+
+/// Retire everything the dead runtime `globals_id` owns: its registrations
+/// (dropping the registry's strong IR references), and the dependent edges
+/// and relower marks of its arities.  Called from `Tiers`' `Drop`.
+pub fn retire_runtime(globals_id: u64) {
+    let mut registry = REGISTRY.write().unwrap();
+    registry.retain(|(gid, _, _), _| *gid != globals_id);
+    let mut deps = DEPENDENTS.write().unwrap();
+    let Some(owned) = OWNED.write().unwrap().remove(&globals_id) else {
+        return;
+    };
+    deps.retain(|_, ids| {
+        ids.retain(|id| !owned.contains(id));
+        !ids.is_empty()
+    });
+    let mut relower = RELOWER.write().unwrap();
+    for id in &owned {
+        if relower.remove(id) {
+            RELOWER_PENDING.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+/// Retire the registrations of runtime `globals_id` that contain any of
+/// `arity_ids` (just evicted from its IR cache), and drop those arities'
+/// outgoing dependent edges — their IR is gone, so there is nothing left to
+/// invalidate.  Relower marks are left for the lowering worker to consume.
+/// Called from `Tiers::sweep`.
+pub fn retire_arities(globals_id: u64, arity_ids: &[u64]) {
+    if arity_ids.is_empty() {
+        return;
+    }
+    let evicted: HashSet<u64> = arity_ids.iter().copied().collect();
+    let mut registry = REGISTRY.write().unwrap();
+    registry.retain(|(gid, _, _), defn| {
+        *gid != globals_id || !defn.arities.iter().any(|a| evicted.contains(&a.arity_id))
+    });
+    let mut deps = DEPENDENTS.write().unwrap();
+    deps.retain(|_, ids| {
+        ids.retain(|id| !evicted.contains(id));
+        !ids.is_empty()
+    });
+    // Leave `OWNED` alone: a relower mark may still be pending for an
+    // evicted id, and `retire_runtime` needs the id to purge it.
+}
+
+/// Bookkeeping sizes `(registrations, dependent keys, owned arity ids,
+/// relower marks)` for runtime `globals_id` — for leak tests.
+#[cfg(test)]
+pub(crate) fn counts_for(globals_id: u64) -> (usize, usize, usize, usize) {
+    let registry = REGISTRY.read().unwrap();
+    let deps = DEPENDENTS.read().unwrap();
+    let owned = OWNED.read().unwrap();
+    let relower = RELOWER.read().unwrap();
+    let ids = owned.get(&globals_id).cloned().unwrap_or_default();
+    (
+        registry.keys().filter(|(g, _, _)| *g == globals_id).count(),
+        deps.values()
+            .filter(|s| s.iter().any(|i| ids.contains(i)))
+            .count(),
+        ids.len(),
+        relower.iter().filter(|i| ids.contains(i)).count(),
+    )
+}
+
+/// Weak handles to every registered IR of runtime `globals_id` — for tests.
+#[cfg(test)]
+pub(crate) fn registered_irs(globals_id: u64) -> Vec<std::sync::Weak<IrFunction>> {
+    REGISTRY
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|((g, _, _), _)| *g == globals_id)
+        .flat_map(|(_, d)| d.arities.iter().map(|a| Arc::downgrade(&a.ir)))
+        .collect()
 }
 
 /// Fast-path check: is any arity awaiting re-lowering?
@@ -373,7 +505,7 @@ mod tests {
         let name: Arc<str> = Arc::from("callee-fn");
         let dep_id = 0xD500_0002u64;
 
-        register_defn(gid, &ns, &name, vec![(1, false, dummy_ir())]);
+        register_defn(gid, &ns, &name, vec![(0xD5FF_0001, 1, false, dummy_ir())]);
 
         let mut referenced = HashSet::new();
         referenced.insert((ns.clone(), name.clone()));
@@ -419,7 +551,7 @@ mod tests {
             &ns,
             &name,
             stale,
-            vec![(1, false, dummy_ir())]
+            vec![(0xD5FF_0001, 1, false, dummy_ir())]
         ));
         assert!(externals_for(gid, &referenced).is_empty());
 
@@ -431,7 +563,7 @@ mod tests {
             &ns,
             &name,
             current,
-            vec![(1, false, dummy_ir())]
+            vec![(0xD5FF_0001, 1, false, dummy_ir())]
         ));
         assert_eq!(externals_for(gid, &referenced).len(), 1);
     }
