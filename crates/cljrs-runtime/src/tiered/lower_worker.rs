@@ -133,8 +133,8 @@ fn process_request(req: &LowerRequest) {
     let globals_id = tiers.globals_id();
 
     // Arities lowered (or already cached), collected for the cross-defn
-    // registry: (param_count, is_variadic, ir).
-    let mut registered: Vec<(usize, bool, Arc<cljrs_ir::IrFunction>)> = Vec::new();
+    // registry: (arity_id, param_count, is_variadic, ir).
+    let mut registered: Vec<crate::tiered::defn_registry::ArityRegistration> = Vec::new();
 
     for arity in &req.arities {
         let id = arity.arity_id;
@@ -144,7 +144,7 @@ fn process_request(req: &LowerRequest) {
         // (rebound external) and must be redone.
         if !ir_cache.should_attempt(id) && !crate::tiered::defn_registry::relower_marked(id) {
             if let Some(ir) = ir_cache.get(id) {
-                registered.push((arity.params.len(), arity.rest_param.is_some(), ir));
+                registered.push((id, arity.params.len(), arity.rest_param.is_some(), ir));
             }
             continue;
         }
@@ -182,7 +182,7 @@ fn process_request(req: &LowerRequest) {
                         continue;
                     }
                     tiers.jit().on_ir_published(id);
-                    registered.push((arity.params.len(), arity.rest_param.is_some(), ir));
+                    registered.push((id, arity.params.len(), arity.rest_param.is_some(), ir));
                     tracing::debug!(
                         target: "ir",
                         "background lower published arity_id={} ({:?})",
@@ -328,6 +328,7 @@ mod tests {
         let stale = Arc::new(cljrs_ir::IrFunction::new(None, None));
         ir_cache.store(id, stale.clone());
         crate::tiered::defn_registry::record_dependents(
+            gid,
             id,
             vec![(callee_ns.clone(), callee.clone())],
         );
