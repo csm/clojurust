@@ -414,19 +414,21 @@ impl PartialEq for Value {
             return true;
         }
         // Realize lazy sequences before comparing.
-        // A lazy-seq that realizes to nil is an empty sequence, which is equal
-        // to both nil and any empty sequential collection (matching Clojure).
+        // A lazy-seq that realizes to nil is an *empty sequence*: it equals any
+        // empty sequential collection, but never `nil` itself (matching Clojure,
+        // where `(= (lazy-seq nil) nil)` is false). Keeping it unequal to nil
+        // preserves transitivity, since `(= nil [])` is false.
         if let Value::LazySeq(ls) = self {
             let realized = crate::realization::for_trait(ls.get());
-            if realized == Value::Nil && other.is_sequential() {
-                return value_to_seq_vec(other).is_empty();
+            if realized == Value::Nil {
+                return other.is_sequential() && value_to_seq_vec(other).is_empty();
             }
             return realized == *other;
         }
         if let Value::LazySeq(ls) = other {
             let realized = crate::realization::for_trait(ls.get());
-            if realized == Value::Nil && self.is_sequential() {
-                return value_to_seq_vec(self).is_empty();
+            if realized == Value::Nil {
+                return self.is_sequential() && value_to_seq_vec(self).is_empty();
             }
             return *self == realized;
         }
@@ -791,7 +793,12 @@ impl ClojureHash for Value {
             Value::Macro(f) => f.get() as *const _ as u32,
             Value::BigDecimal(d) => hash_string(&d.get().to_string()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
-            Value::LazySeq(ls) => crate::realization::for_trait(ls.get()).clojure_hash(),
+            Value::LazySeq(ls) => match crate::realization::for_trait(ls.get()) {
+                // An empty lazy seq hashes like any other empty sequential
+                // collection (`()`, `[]`), not like nil, so equal keys hash equally.
+                Value::Nil => 1,
+                realized => realized.clojure_hash(),
+            },
             Value::Protocol(p) => p.get() as *const _ as u32,
             Value::ProtocolFn(pf) => pf.get() as *const _ as u32,
             Value::MultiFn(mf) => mf.get() as *const _ as u32,
@@ -1555,6 +1562,49 @@ mod tests {
     fn test_nil_eq() {
         assert_eq!(Value::Nil, Value::Nil);
         assert_ne!(Value::Nil, int(0));
+    }
+
+    fn empty_lazy_seq() -> Value {
+        #[derive(Debug)]
+        struct NilThunk;
+        impl cljrs_gc::Trace for NilThunk {
+            fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+        }
+        impl crate::types::Thunk for NilThunk {
+            fn force(&self) -> crate::ValueResult<Value> {
+                Ok(Value::Nil)
+            }
+        }
+        Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(NilThunk))))
+    }
+
+    /// Regression test for issue #513: an empty lazy seq is an empty
+    /// sequential collection, not nil, and hashes like `[]` / `()`.
+    #[test]
+    fn test_empty_lazy_seq_eq_and_hash() {
+        let e = empty_lazy_seq();
+        let empty_vec = Value::Vector(GcPtr::new(PersistentVector::empty()));
+        let empty_list = Value::List(GcPtr::new(PersistentList::empty()));
+
+        // Not equal to nil, in either order.
+        assert_ne!(e, Value::Nil);
+        assert_ne!(Value::Nil, e);
+        // Equal to empty sequential collections, in either order.
+        assert_eq!(e, empty_vec);
+        assert_eq!(empty_vec, e);
+        assert_eq!(e, empty_list);
+        assert_eq!(empty_list, e);
+        // Equal to another empty lazy seq, including a nested one.
+        assert_eq!(e, empty_lazy_seq());
+        // Not equal to non-empty sequential collections.
+        let one = Value::Vector(GcPtr::new(PersistentVector::from_iter([int(1)])));
+        assert_ne!(e, one);
+        assert_ne!(one, e);
+
+        // Hash agrees with the empty sequential hash, not nil's.
+        assert_eq!(e.clojure_hash(), empty_vec.clojure_hash());
+        assert_eq!(e.clojure_hash(), empty_list.clojure_hash());
+        assert_ne!(e.clojure_hash(), Value::Nil.clojure_hash());
     }
 
     #[test]
