@@ -123,8 +123,13 @@ impl Value {
 }
 ```
 
-`PartialEq` implements cross-type numeric equality (`(= 1 1N)`, `(= 1 1.0)`)
-and sequential collection equality between `List` and `Vector`.
+`PartialEq` implements cross-type numeric equality (`(= 1 1N)`, `(= 1 1.0)`,
+`(= 1.0 1N)`) and sequential collection equality between `List` and `Vector`.
+Integral numbers (`Long`, `BigInt`, whole `Double`) are compared by *exact*
+mathematical value — no float rounding, so `(= 9007199254740993N 9007199254740992.0)`
+is false — which keeps `=` transitive; `ClojureHash` hashes all three the same
+way (Long hash when it fits in `i64`, otherwise the decimal-string hash), so
+equal values always hash equally.
 
 `Display` / `pr_str` produce Clojure-readable output.
 

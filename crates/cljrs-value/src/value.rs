@@ -441,19 +441,21 @@ impl PartialEq for Value {
             return true;
         }
         // Realize lazy sequences before comparing.
-        // A lazy-seq that realizes to nil is an empty sequence, which is equal
-        // to both nil and any empty sequential collection (matching Clojure).
+        // A lazy-seq that realizes to nil is an *empty sequence*: it equals any
+        // empty sequential collection, but never `nil` itself (matching Clojure,
+        // where `(= (lazy-seq nil) nil)` is false). Keeping it unequal to nil
+        // preserves transitivity, since `(= nil [])` is false.
         if let Value::LazySeq(ls) = self {
             let realized = crate::realization::for_trait(ls.get());
-            if realized == Value::Nil && other.is_sequential() {
-                return value_to_seq_vec(other).is_empty();
+            if realized == Value::Nil {
+                return other.is_sequential() && value_to_seq_vec(other).is_empty();
             }
             return realized == *other;
         }
         if let Value::LazySeq(ls) = other {
             let realized = crate::realization::for_trait(ls.get());
-            if realized == Value::Nil && self.is_sequential() {
-                return value_to_seq_vec(self).is_empty();
+            if realized == Value::Nil {
+                return self.is_sequential() && value_to_seq_vec(self).is_empty();
             }
             return *self == realized;
         }
@@ -466,8 +468,17 @@ impl PartialEq for Value {
             (Value::BigInt(a), Value::Long(b)) => *a.get() == BigInt::from(*b),
             (Value::BigInt(a), Value::BigInt(b)) => a.get() == b.get(),
             (Value::Double(a), Value::Double(b)) => a == b, // NaN != NaN
+            // Integer-valued representations (Long, BigInt, whole Double) are
+            // compared by *exact* mathematical value, so `=` stays transitive
+            // across all three (issue #511). No float rounding is involved.
             (Value::Long(a), Value::Double(b)) => b.fract() == 0.0 && b.to_i64() == Some(*a),
             (Value::Double(a), Value::Long(b)) => a.fract() == 0.0 && a.to_i64() == Some(*b),
+            (Value::BigInt(a), Value::Double(b)) => {
+                whole_f64_to_bigint(*b).as_ref() == Some(a.get())
+            }
+            (Value::Double(a), Value::BigInt(b)) => {
+                whole_f64_to_bigint(*a).as_ref() == Some(b.get())
+            }
             (Value::BigDecimal(a), Value::BigDecimal(b)) => a.get() == b.get(),
             (Value::Ratio(a), Value::Ratio(b)) => a.get() == b.get(),
             (Value::Char(a), Value::Char(b)) => a == b,
@@ -556,6 +567,26 @@ impl PartialEq for Value {
     }
 }
 
+/// Exact conversion of a finite, whole-number `f64` to a `BigInt`.
+/// Returns `None` for NaN, infinities, and values with a fractional part.
+fn whole_f64_to_bigint(f: f64) -> Option<BigInt> {
+    if f.is_finite() && f.fract() == 0.0 {
+        // Exact for every finite whole f64 (no rounding).
+        num_traits::FromPrimitive::from_f64(f)
+    } else {
+        None
+    }
+}
+
+/// Hash shared by every integer-valued numeric representation, so that
+/// values equal under `=` (Long / BigInt / whole Double) hash identically.
+fn hash_integer(n: &BigInt) -> u32 {
+    match n.to_i64() {
+        Some(l) => hash_i64(l),
+        None => hash_string(&n.to_string()),
+    }
+}
+
 fn maps_equal(a: &MapValue, b: &MapValue) -> bool {
     if a.count() != b.count() {
         return false;
@@ -640,23 +671,21 @@ impl ClojureHash for Value {
             }
             Value::Long(n) => hash_i64(*n),
             Value::Double(f) => {
-                // Whole-number doubles hash like their Long equivalent.
-                if f.fract() == 0.0
-                    && f.is_finite()
-                    && let Some(n) = num_traits::ToPrimitive::to_i64(f)
-                {
-                    return hash_i64(n);
+                // Whole-number doubles hash like their Long equivalent; those
+                // outside the i64 range hash like the equal BigInt.
+                if f.is_finite() && f.fract() == 0.0 {
+                    if let Some(n) = f.to_i64() {
+                        return hash_i64(n);
+                    }
+                    if let Some(n) = whole_f64_to_bigint(*f) {
+                        return hash_integer(&n);
+                    }
                 }
                 hash_i64(f.to_bits() as i64)
             }
-            Value::BigInt(n) => {
-                // Hash like Long if it fits.
-                if let Some(l) = n.get().to_i64() {
-                    return hash_i64(l);
-                }
-                // Otherwise hash the decimal string (simplified).
-                hash_string(&n.get().to_string())
-            }
+            // Hash like Long if it fits, otherwise by decimal string; whole
+            // Doubles use the same scheme so `=` values hash identically.
+            Value::BigInt(n) => hash_integer(n.get()),
             Value::Char(c) => *c as u32,
             Value::Str(s) => hash_string(s.get()),
             Value::Pattern(r) => hash_string(r.get().as_str()),
@@ -816,9 +845,14 @@ impl ClojureHash for Value {
                 h
             }
             Value::Macro(f) => f.get() as *const _ as u32,
-            Value::BigDecimal(d) => hash_string(&d.get().to_string()),
+            Value::BigDecimal(d) => hash_bigdecimal(d.get()),
             Value::Ratio(r) => hash_string(&r.get().to_string()),
-            Value::LazySeq(ls) => crate::realization::for_trait(ls.get()).clojure_hash(),
+            Value::LazySeq(ls) => match crate::realization::for_trait(ls.get()) {
+                // An empty lazy seq hashes like any other empty sequential
+                // collection (`()`, `[]`), not like nil, so equal keys hash equally.
+                Value::Nil => 1,
+                realized => realized.clojure_hash(),
+            },
             Value::Protocol(p) => p.get() as *const _ as u32,
             Value::ProtocolFn(pf) => pf.get() as *const _ as u32,
             Value::MultiFn(mf) => mf.get() as *const _ as u32,
@@ -1576,12 +1610,79 @@ mod tests {
         Value::string(v)
     }
 
+    #[test]
+    fn bigdecimal_hash_ignores_scale() {
+        use std::str::FromStr;
+        let dec =
+            |t: &str| Value::BigDecimal(GcPtr::new(bigdecimal::BigDecimal::from_str(t).unwrap()));
+        for group in [
+            &["1", "1.0", "1.000", "10E-1", "0.1E1"][..],
+            &["0", "0.0", "0.000", "-0.0", "0E3"][..],
+            &["100", "1E2", "100.00", "10E1"][..],
+            &["-1.5", "-1.50", "-15E-1"][..],
+            &["0.001", "1E-3", "0.00100"][..],
+        ] {
+            let h = dec(group[0]).clojure_hash();
+            for t in group {
+                assert_eq!(dec(group[0]), dec(t), "{t} should equal {}", group[0]);
+                assert_eq!(dec(t).clojure_hash(), h, "{t} vs {}", group[0]);
+            }
+        }
+        // Numerically distinct values keep distinct hashes.
+        assert_ne!(dec("1").clojure_hash(), dec("10").clojure_hash());
+        assert_ne!(dec("1").clojure_hash(), dec("0.1").clojure_hash());
+        assert_ne!(dec("1").clojure_hash(), dec("-1").clojure_hash());
+    }
+
     // ── Equality ──────────────────────────────────────────────────────────────
 
     #[test]
     fn test_nil_eq() {
         assert_eq!(Value::Nil, Value::Nil);
         assert_ne!(Value::Nil, int(0));
+    }
+
+    fn empty_lazy_seq() -> Value {
+        #[derive(Debug)]
+        struct NilThunk;
+        impl cljrs_gc::Trace for NilThunk {
+            fn trace(&self, _: &mut cljrs_gc::MarkVisitor) {}
+        }
+        impl crate::types::Thunk for NilThunk {
+            fn force(&self) -> crate::ValueResult<Value> {
+                Ok(Value::Nil)
+            }
+        }
+        Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(NilThunk))))
+    }
+
+    /// Regression test for issue #513: an empty lazy seq is an empty
+    /// sequential collection, not nil, and hashes like `[]` / `()`.
+    #[test]
+    fn test_empty_lazy_seq_eq_and_hash() {
+        let e = empty_lazy_seq();
+        let empty_vec = Value::Vector(GcPtr::new(PersistentVector::empty()));
+        let empty_list = Value::List(GcPtr::new(PersistentList::empty()));
+
+        // Not equal to nil, in either order.
+        assert_ne!(e, Value::Nil);
+        assert_ne!(Value::Nil, e);
+        // Equal to empty sequential collections, in either order.
+        assert_eq!(e, empty_vec);
+        assert_eq!(empty_vec, e);
+        assert_eq!(e, empty_list);
+        assert_eq!(empty_list, e);
+        // Equal to another empty lazy seq, including a nested one.
+        assert_eq!(e, empty_lazy_seq());
+        // Not equal to non-empty sequential collections.
+        let one = Value::Vector(GcPtr::new(PersistentVector::from_iter([int(1)])));
+        assert_ne!(e, one);
+        assert_ne!(one, e);
+
+        // Hash agrees with the empty sequential hash, not nil's.
+        assert_eq!(e.clojure_hash(), empty_vec.clojure_hash());
+        assert_eq!(e.clojure_hash(), empty_list.clojure_hash());
+        assert_ne!(e.clojure_hash(), Value::Nil.clojure_hash());
     }
 
     #[test]
@@ -1594,6 +1695,139 @@ mod tests {
         assert_eq!(int(1), Value::Double(1.0));
         // 1.5 != 1
         assert_ne!(Value::Double(1.5), int(1));
+    }
+
+    // ── Numeric equivalence: transitivity + hash coherence (issue #511) ──────
+
+    fn big(n: BigInt) -> Value {
+        Value::BigInt(GcPtr::new(n))
+    }
+
+    /// Every integer-valued representation of `n` that can represent it exactly.
+    fn reprs(n: &BigInt) -> Vec<Value> {
+        let mut out = vec![big(n.clone())];
+        if let Some(l) = n.to_i64() {
+            out.push(int(l));
+        }
+        if let Some(f) = n.to_f64()
+            && whole_f64_to_bigint(f).as_ref() == Some(n)
+        {
+            out.push(Value::Double(f));
+        }
+        out
+    }
+
+    fn numeric_samples() -> Vec<Value> {
+        let two53 = BigInt::from(1i64 << 53);
+        let two63 = BigInt::from(i64::MAX) + 1i32;
+        let mut ints: Vec<BigInt> = vec![
+            BigInt::from(0),
+            BigInt::from(1),
+            BigInt::from(-1),
+            BigInt::from(42),
+            two53.clone() - 1i32,
+            two53.clone(),
+            two53.clone() + 1i32, // not exactly representable as f64
+            -two53.clone(),
+            -(two53.clone() + 1i32),
+            BigInt::from(i64::MAX),
+            BigInt::from(i64::MIN),
+            two63.clone(),
+            -two63.clone() - 1i32,
+            BigInt::from(1u128 << 70),
+            BigInt::from(1u128 << 70) + 1i32,
+            -BigInt::from(1u128 << 70),
+        ];
+        ints.dedup();
+        let mut vals: Vec<Value> = ints.iter().flat_map(reprs).collect();
+        // Values that round to a neighbouring integer when converted to f64.
+        vals.push(Value::Double((1i64 << 53) as f64));
+        vals.push(Value::Double(i64::MAX as f64));
+        vals.push(Value::Double(1.5));
+        vals.push(Value::Double(-0.0));
+        vals
+    }
+
+    #[test]
+    fn test_numeric_bigint_double_eq() {
+        let one_n = big(BigInt::from(1));
+        assert_eq!(Value::Double(1.0), one_n);
+        assert_eq!(one_n, Value::Double(1.0));
+        assert_ne!(Value::Double(1.5), one_n);
+        // 2^53 + 1 is not representable as a double; must not compare equal
+        // to the nearest double (2^53).
+        let p = big(BigInt::from((1i64 << 53) + 1));
+        assert_ne!(p, Value::Double((1i64 << 53) as f64));
+        // Large whole doubles beyond i64 compare exactly with BigInt.
+        let huge = BigInt::from(1u128 << 70);
+        assert_eq!(big(huge.clone()), Value::Double((1u128 << 70) as f64));
+        assert_ne!(big(huge + 1i32), Value::Double((1u128 << 70) as f64));
+        assert_ne!(Value::Double(f64::NAN), one_n);
+        assert_ne!(Value::Double(f64::INFINITY), one_n);
+    }
+
+    #[test]
+    fn test_numeric_eq_transitive_and_hash_coherent() {
+        let vals = numeric_samples();
+        for a in &vals {
+            for b in &vals {
+                if a == b {
+                    assert_eq!(b, a, "symmetry: {a:?} {b:?}");
+                    assert_eq!(
+                        a.clojure_hash(),
+                        b.clojure_hash(),
+                        "equal values must hash equally: {a:?} {b:?}"
+                    );
+                    for c in &vals {
+                        if b == c {
+                            assert_eq!(a, c, "transitivity: {a:?} = {b:?} = {c:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_hash_set_cardinality_independent_of_order() {
+        use crate::collections::PersistentHashSet;
+        let groups: Vec<Vec<Value>> = vec![
+            vec![int(1), Value::Double(1.0), big(BigInt::from(1))],
+            vec![int(-7), Value::Double(-7.0), big(BigInt::from(-7))],
+            vec![
+                int(1i64 << 53),
+                Value::Double((1i64 << 53) as f64),
+                big(BigInt::from(1i64 << 53)),
+                big(BigInt::from((1i64 << 53) + 1)),
+            ],
+            vec![
+                Value::Double((1u128 << 70) as f64),
+                big(BigInt::from(1u128 << 70)),
+                big(BigInt::from(1u128 << 70) + 1i32),
+            ],
+        ];
+        for g in groups {
+            let n = g.len();
+            let mut counts = Vec::new();
+            // All rotations and their reversals.
+            for r in 0..n {
+                for rev in [false, true] {
+                    let mut perm: Vec<Value> = g[r..].iter().chain(&g[..r]).cloned().collect();
+                    if rev {
+                        perm.reverse();
+                    }
+                    let mut set = PersistentHashSet::empty();
+                    for v in &perm {
+                        set = set.conj(v.clone());
+                    }
+                    for v in &g {
+                        assert!(set.contains(v), "membership of {v:?} in {perm:?}");
+                    }
+                    counts.push(set.count());
+                }
+            }
+            assert!(counts.windows(2).all(|w| w[0] == w[1]), "{g:?}: {counts:?}");
+        }
     }
 
     #[test]
@@ -2050,4 +2284,26 @@ fn type_discriminant(v: &Value) -> u8 {
         Value::Matcher(_) => 44,
         Value::Error(_) => 45,
     }
+}
+
+/// Hash a `BigDecimal` consistently with its numeric equality: values that
+/// differ only in scale (`1M`, `1.0M`, `1.00M`, `10E-1M`) must hash equally,
+/// so the hash is computed over the canonical form with trailing zeros
+/// stripped from the unscaled value and the scale adjusted accordingly.
+/// Every zero (any scale, any sign) hashes the same.
+fn hash_bigdecimal(d: &bigdecimal::BigDecimal) -> u32 {
+    use num_traits::Zero;
+    let (mut digits, mut scale) = d.as_bigint_and_exponent();
+    if digits.is_zero() {
+        return hash_string("0M");
+    }
+    let ten = BigInt::from(10);
+    loop {
+        if !(&digits % &ten).is_zero() {
+            break;
+        }
+        digits = &digits / &ten;
+        scale -= 1;
+    }
+    hash_string(&format!("{digits}E{}", -scale))
 }
