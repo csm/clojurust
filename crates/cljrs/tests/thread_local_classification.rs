@@ -326,6 +326,13 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         Thread("the isolate's async driver"),
     ),
     (
+        "cljrs-value/src/compare.rs",
+        "PENDING",
+        Thread(
+            "sorted-key comparison error, set and drained within one synchronous `checked` call that never parks",
+        ),
+    ),
+    (
         "cljrs-value/src/symbol.rs",
         "INTERNED",
         Thread("interning cache"),
