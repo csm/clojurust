@@ -212,7 +212,9 @@ fn builtin_isolate_put(args: &[Value]) -> ValueResult<Value> {
             "isolate-put!: {e}; the value holds isolate-local state and cannot \
              cross an isolate boundary"
         ))),
-        Err(e @ CloneError::Full { .. }) => Err(ValueError::Other(format!("isolate-put!: {e}"))),
+        Err(e @ (CloneError::Full { .. } | CloneError::Cyclic { .. })) => {
+            Err(ValueError::Other(format!("isolate-put!: {e}")))
+        }
         // Cancellation and resource limits: one mapping for every boundary.
         Err(
             e @ (CloneError::MemoryLimitExceeded(_)

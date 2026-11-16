@@ -965,6 +965,9 @@ pub enum CloneError {
     /// of gas; callers surface these as the uncatchable `ValueError` kinds.
     Cancelled,
     GasExhausted,
+    /// The value contains itself through an object array, lazy seq, delay or
+    /// mutable record field (issue #517); `type_name` names the re-entered node.
+    Cyclic { type_name: &'static str },
     /// A byte-bounded isolate channel has no room for the message.
     Full { bytes: usize, queued: usize, limit: usize },
     /// The strict process governor refused the message's queue charge.
@@ -976,7 +979,12 @@ pub enum CloneError {
 pub fn resource_value_error(error: &CloneError) -> Option<ValueError>;
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
-/// closures, native resources, and other non-shareable types.
+/// closures, native resources, and other non-shareable types.  Object arrays
+/// (and forced delays) are copied out under their lock, which is released
+/// before elements are serialized, so a lazy element may read or write its own
+/// array; the copy is a traced snapshot root.  A cycle through a mutable or
+/// lazy node is rejected with `CloneError::Cyclic`; a repeated acyclic
+/// reference is copied once per occurrence (aliasing is not preserved).
 pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError>;
 
 /// Allocate a fresh Value in the *current* GC heap from a SerializedValue.
