@@ -1130,7 +1130,7 @@ Returned updates acquire caller ownership before the cell can replace its payloa
 This snapshot exposes `value: Value` and keeps its no-GC backing scopes alive until drop.
 Its `protect_current()` method transfers ownership to the caller. Native GC callers still require normal value roots across collections.
 
-`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` rejects an unequal initial snapshot before publication.
+`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` matches by identity (`Value::identical`, Clojure's `compareAndSet` contract), so it never runs user code or realizes lazy values under the atom's lock; a non-identical snapshot is rejected before publication.
 The public `value` field remains available for compatibility. Direct writes bypass ownership preparation.
 Use `reset`, `compare_and_set`, or `Var::bind` for writes.
 Scalar vectors maintain a summary so ownership tracing skips their elements.
