@@ -797,15 +797,15 @@ impl Atom {
         v
     }
 
-    /// Replace the value only if it still equals `expected`.
-    /// Failed attempts do not publish or lease the candidate.
+    /// Replace the value only if the current value is *identical* to
+    /// `expected` (Clojure's identity-based `compareAndSet` contract).
+    ///
+    /// Identity never runs user code or walks collection contents, so the
+    /// check is safe under the storage lock: it cannot realize a lazy value
+    /// whose thunk re-enters this atom. Failed attempts do not publish or
+    /// lease the candidate.
     pub fn compare_and_set(&self, expected: &Value, value: Value) -> bool {
-        // The common vector update compares the exact snapshot just read.
-        // Avoid walking its shared elements for each accumulator update.
-        let matches_expected = |current: &Value| {
-            matches!((current, expected), (Value::Vector(a), Value::Vector(b)) if GcPtr::ptr_eq(a, b))
-                || current == expected
-        };
+        let matches_expected = |current: &Value| current.identical(expected);
         if !matches_expected(&self.value.lock().unwrap()) {
             return false;
         }

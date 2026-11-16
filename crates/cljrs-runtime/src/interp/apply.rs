@@ -1538,12 +1538,10 @@ pub fn eval_compare_and_set_bang(args: Vec<Value>, env: &mut Env) -> EvalResult 
     let previous_payload = atom.get().snapshot();
     let old_val = previous_payload.value.clone();
     let _old_root = crate::env::gc_roots::root_value(&old_val);
-    // Compare against `expected` with the atom's own policy, then commit
-    // against the exact snapshot so the notified transition is the one stored.
-    let matches_expected = matches!(
-        (&old_val, expected),
-        (Value::Vector(a), Value::Vector(b)) if GcPtr::ptr_eq(a, b)
-    ) || &old_val == expected;
+    // Compare against `expected` by identity (Clojure's CAS contract; never
+    // realizes lazy values or runs user code), then commit against the exact
+    // snapshot so the notified transition is the one stored.
+    let matches_expected = old_val.identical(expected);
     if !matches_expected || !atom.get().compare_and_set(&old_val, new_val.clone()) {
         return Ok(Value::Bool(false));
     }
