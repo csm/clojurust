@@ -461,8 +461,18 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
                 applied.extend(spread);
                 return apply_value(&callee, applied, env);
             }
-            if nf.get().name.as_ref() == "swap!" {
-                return crate::interp::apply::eval_swap_bang(args, env);
+            // Atom mutators must run the validator/watch protocol, which needs
+            // the environment; the plain builtins only touch storage.
+            match nf.get().name.as_ref() {
+                "atom" if args.len() > 1 => {
+                    return crate::interp::apply::eval_atom(args, env);
+                }
+                "swap!" => return crate::interp::apply::eval_swap_bang(args, env),
+                "reset!" => return crate::interp::apply::eval_reset_bang(args, env),
+                "compare-and-set!" => {
+                    return crate::interp::apply::eval_compare_and_set_bang(args, env);
+                }
+                _ => {}
             }
             // Register the caller's env as a GC root: native functions may
             // call back into Clojure (via invoke()), which creates a fresh Env

@@ -1087,13 +1087,32 @@ fn handle_atom_call(arg_forms: &[Form], env: &mut Env) -> EvalResult {
     // Atom container outlives all scratch regions.
     #[cfg(feature = "no-gc")]
     let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
-    let initial = eval(&arg_forms[0], env)?;
-
-    // Evaluate and parse keyword options; unknown keys / nil keys are ignored.
-    let options: Vec<Value> = arg_forms[1..]
+    let args: Vec<Value> = arg_forms
         .iter()
         .map(|f| eval(f, env))
         .collect::<EvalResult<_>>()?;
+    eval_atom(args, env)
+}
+
+/// Execute `atom` with already-evaluated args: `[initial & options]`.
+///
+/// Parses the `:meta` / `:validator` options and validates the initial value,
+/// so calls that reach `atom` as a value (`apply`, higher-order use, compiled
+/// dynamic calls) build the same atom as a direct `(atom ...)` form.
+pub fn eval_atom(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "atom".into(),
+            expected: "1+".into(),
+            got: 0,
+        });
+    }
+    #[cfg(feature = "no-gc")]
+    let _static_ctx = cljrs_gc::alloc_ctx::StaticCtxGuard::new();
+    let _args_root = crate::env::gc_roots::root_values(&args);
+    let initial = args[0].clone();
+    // Unknown keys / nil keys are ignored.
+    let options = &args[1..];
 
     let mut meta_opt: Option<Value> = None;
     let mut validator_opt: Option<Value> = None;
@@ -1478,6 +1497,59 @@ pub fn eval_swap_bang(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
             return Ok(new_val);
         }
     }
+}
+
+/// Execute `compare-and-set!` with already-evaluated args:
+/// `[atom, expected, new-val]`.
+///
+/// Mirrors Clojure's `Atom.compareAndSet`: the candidate is validated first
+/// (a rejected candidate throws and leaves the atom untouched), the store is a
+/// single compare-and-set against the snapshot that matched `expected`, and
+/// watches fire with that committed `old -> new` transition only on success.
+/// Validator and watch callbacks run outside the atom's storage lock.
+pub fn eval_compare_and_set_bang(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() != 3 {
+        return Err(EvalError::Arity {
+            name: "compare-and-set!".into(),
+            expected: "3".into(),
+            got: args.len(),
+        });
+    }
+    let atom_val = args[0].clone();
+    let atom = match &atom_val {
+        Value::Atom(a) => a.clone(),
+        // shared-atoms carry no validator or watches; the builtin's lock-free
+        // CAS is already the whole protocol.
+        Value::SharedAtom(_) => {
+            return crate::builtins::builtins::builtin_compare_and_set(&args)
+                .map_err(crate::env::error::value_error_to_eval_error);
+        }
+        v => {
+            return Err(EvalError::Runtime(format!(
+                "compare-and-set! requires an atom, got {}",
+                v.type_name()
+            )));
+        }
+    };
+    let _inputs_root = crate::env::gc_roots::root_values(&args);
+    let expected = &args[1];
+    let new_val = args[2].clone();
+    validate_atom_value(&atom, &new_val, env)?;
+    let previous_payload = atom.get().snapshot();
+    let old_val = previous_payload.value.clone();
+    let _old_root = crate::env::gc_roots::root_value(&old_val);
+    // Compare against `expected` with the atom's own policy, then commit
+    // against the exact snapshot so the notified transition is the one stored.
+    let matches_expected = matches!(
+        (&old_val, expected),
+        (Value::Vector(a), Value::Vector(b)) if GcPtr::ptr_eq(a, b)
+    ) || &old_val == expected;
+    if !matches_expected || !atom.get().compare_and_set(&old_val, new_val.clone()) {
+        return Ok(Value::Bool(false));
+    }
+    fire_watches(&atom.get().watches, &atom_val, &old_val, &new_val, env);
+    check_watch_error()?;
+    Ok(Value::Bool(true))
 }
 
 /// Execute `volatile!` with already-evaluated args: `[init-val]`.
