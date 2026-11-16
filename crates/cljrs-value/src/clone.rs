@@ -56,7 +56,7 @@ use crate::error::ValueError;
 use crate::shared::{ByteBlob, SharedAtom, SharedValue};
 use crate::types::DelayState;
 use crate::{Keyword, MapValue, PersistentList, PersistentQueue, SetValue, Symbol, Value};
-use cljrs_gc::GcPtr;
+use cljrs_gc::{GcPtr, MemoryCharge, MemoryClass};
 
 // ── Error ────────────────────────────────────────────────────────────────────
 
@@ -81,11 +81,22 @@ pub enum CloneError {
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
     /// A byte-bounded channel has no room for the message.
     Full {
-        /// Wire size of the refused message.
+        /// Wire size of the refused message.  When the send was refused
+        /// while the message was still being built, the bytes counted so
+        /// far: a lower bound.
         bytes: usize,
         /// Bytes queued on the channel when the message was refused.
         queued: usize,
         /// The channel's byte limit.
+        limit: usize,
+    },
+    /// The message's wire form would exceed the size limit it was built
+    /// against; serialization stopped before allocating past the limit.
+    TooLarge {
+        /// Wire bytes counted when the limit was crossed — a lower bound on
+        /// the full message size.
+        at_least: usize,
+        /// The limit the message was built against.
         limit: usize,
     },
 }
@@ -109,8 +120,13 @@ impl std::fmt::Display for CloneError {
                 limit,
             } => write!(
                 f,
-                "isolate channel is full: a {bytes}-byte message does not fit \
-                 ({queued} of {limit} bytes queued)"
+                "isolate channel is full: a message of at least {bytes} bytes \
+                 does not fit ({queued} of {limit} bytes queued)"
+            ),
+            CloneError::TooLarge { at_least, limit } => write!(
+                f,
+                "message is too large: at least {at_least} bytes, \
+                 over the {limit}-byte limit"
             ),
         }
     }
@@ -510,72 +526,301 @@ pub fn resource_value_error(error: &CloneError) -> Option<ValueError> {
 
 /// Serialize a `Value` into a `Send + Sync` wire form suitable for crossing an
 /// isolate boundary. Returns [`CloneError`] for non-shareable values.
+///
+/// The result is unbounded: a small value whose parts are shared many times
+/// expands into one copy per occurrence.  Code that admits the result into a
+/// bounded resource should use [`serialize_staged`], which stops as soon as
+/// the copy would exceed its limit.
 pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
+    let mut budget = Budget::unlimited();
+    budget.charge_slots(1)?;
+    ser(v, &mut budget)
+}
+
+/// A serialized message, the exact [`SerializedValue::wire_size`] it owns,
+/// and the governor charge that covers it.
+#[derive(Debug)]
+pub struct StagedMessage {
+    /// The wire form.
+    pub value: SerializedValue,
+    /// `value.wire_size()`, counted while it was built.
+    pub wire_size: usize,
+    /// Governor charge for exactly `wire_size` bytes.
+    pub charge: MemoryCharge,
+}
+
+/// Serialize `v` without letting the copy exceed `limit` wire bytes.
+///
+/// The bytes of every node are counted, and charged to the process governor
+/// under `class`, **before** that node is allocated, so:
+///
+/// - a message larger than `limit` fails with [`CloneError::TooLarge`] after
+///   building at most `limit` bytes, however much shared structure it
+///   expands — the work done is bounded by `limit` too, since every node
+///   costs at least `size_of::<SerializedValue>()` bytes;
+/// - the staging copy is covered by the governor for its whole life, and a
+///   strict-governor refusal fails with [`CloneError::MemoryLimitExceeded`];
+/// - on any failure the partial copy is dropped and its charge returned.
+///
+/// On success the charge holds exactly the message's wire size, ready to be
+/// kept while the message is queued.
+pub fn serialize_staged(
+    v: &Value,
+    limit: usize,
+    class: MemoryClass,
+) -> Result<StagedMessage, CloneError> {
+    let mut budget = Budget {
+        limit,
+        used: 0,
+        staging: Some(Staging {
+            class,
+            charge: None,
+        }),
+    };
+    budget.charge_slots(1)?;
+    let value = ser(v, &mut budget)?;
+    let wire_size = budget.used;
+    debug_assert_eq!(wire_size, value.wire_size(), "staged byte count");
+    let staging = budget.staging.take().expect("staging budget");
+    let charge = match staging.charge {
+        Some(mut charge) => {
+            charge.shrink_to(wire_size);
+            charge
+        }
+        // Every message owns at least its root node, so this only runs for
+        // a governor that hands out zero-byte charges.
+        None => cljrs_gc::governor()
+            .reserve_shared(class, wire_size)
+            .map_err(CloneError::MemoryLimitExceeded)?,
+    };
+    Ok(StagedMessage {
+        value,
+        wire_size,
+        charge,
+    })
+}
+
+/// Governor reservations for a staging copy are taken in chunks of this
+/// size, so building a large message does not hit the governor per node.
+const STAGING_CHUNK: usize = 64 * 1024;
+
+const NODE: usize = std::mem::size_of::<SerializedValue>();
+
+/// Wire bytes a serialization may still use.
+struct Budget {
+    limit: usize,
+    /// Wire bytes counted so far (matches `wire_size` of the finished copy).
+    used: usize,
+    staging: Option<Staging>,
+}
+
+/// Governor charge covering a staging copy.
+struct Staging {
+    class: MemoryClass,
+    charge: Option<MemoryCharge>,
+}
+
+impl Budget {
+    fn unlimited() -> Self {
+        Budget {
+            limit: usize::MAX,
+            used: 0,
+            staging: None,
+        }
+    }
+
+    /// Count `bytes` more, failing before anything is allocated for them.
+    fn charge(&mut self, bytes: usize) -> Result<(), CloneError> {
+        let used = match self.used.checked_add(bytes) {
+            Some(used) if used <= self.limit => used,
+            _ => {
+                return Err(CloneError::TooLarge {
+                    at_least: self.used.saturating_add(bytes),
+                    limit: self.limit,
+                });
+            }
+        };
+        if let Some(staging) = &mut self.staging {
+            staging.cover(used, self.limit)?;
+        }
+        self.used = used;
+        Ok(())
+    }
+
+    /// Count `n` `SerializedValue` slots.
+    fn charge_slots(&mut self, n: usize) -> Result<(), CloneError> {
+        match n.checked_mul(NODE) {
+            Some(bytes) => self.charge(bytes),
+            None => Err(CloneError::TooLarge {
+                at_least: usize::MAX,
+                limit: self.limit,
+            }),
+        }
+    }
+}
+
+impl Staging {
+    /// Make the charge cover at least `used` bytes (`used <= limit`).
+    fn cover(&mut self, used: usize, limit: usize) -> Result<(), CloneError> {
+        let held = self.charge.as_ref().map_or(0, MemoryCharge::bytes);
+        if used <= held {
+            return Ok(());
+        }
+        let need = used - held;
+        let want = need.max(STAGING_CHUNK).min(limit - held);
+        let gov = cljrs_gc::governor();
+        let more = match gov.reserve_shared(self.class, want) {
+            Ok(more) => more,
+            // A strict governor may refuse the chunk yet admit what is
+            // actually needed.
+            Err(_) if want > need => gov
+                .reserve_shared(self.class, need)
+                .map_err(CloneError::MemoryLimitExceeded)?,
+            Err(refused) => return Err(CloneError::MemoryLimitExceeded(refused)),
+        };
+        match &mut self.charge {
+            Some(charge) => charge.absorb(more),
+            None => self.charge = Some(more),
+        }
+        Ok(())
+    }
+}
+
+/// Count a leaf's owned payload.  Leaves own at most one buffer, so this is
+/// constant work.
+fn leaf(sv: SerializedValue, b: &mut Budget) -> Result<SerializedValue, CloneError> {
+    b.charge(sv.owned_bytes())?;
+    Ok(sv)
+}
+
+/// Serialize `len` items into a vector, counting their slots first.
+fn ser_items<'a>(
+    len: usize,
+    items: impl Iterator<Item = &'a Value>,
+    b: &mut Budget,
+) -> Result<Vec<SerializedValue>, CloneError> {
+    b.charge_slots(len)?;
+    let mut out = Vec::with_capacity(len);
+    for item in items {
+        if out.len() >= len {
+            // More items than the collection reported: count the extra slot.
+            b.charge_slots(1)?;
+        }
+        out.push(ser(item, b)?);
+    }
+    Ok(out)
+}
+
+/// Serialize a boxed child, counting its slot first.
+fn ser_boxed(v: &Value, b: &mut Budget) -> Result<Box<SerializedValue>, CloneError> {
+    b.charge_slots(1)?;
+    Ok(Box::new(ser(v, b)?))
+}
+
+/// Serialize a primitive array snapshot, counting its contents first.
+fn ser_array<T: Clone>(
+    p: &std::sync::Mutex<Vec<T>>,
+    wrap: fn(Vec<T>) -> SerializedValue,
+    b: &mut Budget,
+) -> Result<SerializedValue, CloneError> {
+    let guard = p.lock().unwrap();
+    b.charge(std::mem::size_of_val(guard.as_slice()))?;
+    Ok(wrap(guard.clone()))
+}
+
+/// Serialize the node `v`.  Its own slot has already been counted by the
+/// caller; this counts everything the node owns.
+fn ser(v: &Value, b: &mut Budget) -> Result<SerializedValue, CloneError> {
     match v {
         // ── Wrappers ──
         Value::WithMeta(inner, meta) => Ok(SerializedValue::WithMeta {
-            value: Box::new(serialize(inner)?),
-            meta: Box::new(serialize(meta)?),
+            value: ser_boxed(inner, b)?,
+            meta: ser_boxed(meta, b)?,
         }),
-        Value::Reduced(inner) => Ok(SerializedValue::Reduced(Box::new(serialize(inner)?))),
+        Value::Reduced(inner) => Ok(SerializedValue::Reduced(ser_boxed(inner, b)?)),
 
         // ── Scalars ──
         Value::Nil => Ok(SerializedValue::Nil),
-        Value::Bool(b) => Ok(SerializedValue::Bool(*b)),
+        Value::Bool(v) => Ok(SerializedValue::Bool(*v)),
         Value::Long(n) => Ok(SerializedValue::Long(*n)),
         Value::Double(d) => Ok(SerializedValue::Double(*d)),
         Value::Char(c) => Ok(SerializedValue::Char(*c)),
         Value::Uuid(u) => Ok(SerializedValue::Uuid(u.get().0)),
 
-        Value::BigInt(p) => Ok(SerializedValue::BigInt(p.get().clone())),
-        Value::BigDecimal(p) => Ok(SerializedValue::BigDecimal(p.get().clone())),
-        Value::Ratio(p) => Ok(SerializedValue::Ratio(p.get().clone())),
-        Value::Str(p) => Ok(SerializedValue::Str(p.get().clone())),
-        Value::Pattern(p) => Ok(SerializedValue::Pattern(p.get().as_str().to_owned())),
+        Value::BigInt(p) => leaf(SerializedValue::BigInt(p.get().clone()), b),
+        Value::BigDecimal(p) => leaf(SerializedValue::BigDecimal(p.get().clone()), b),
+        Value::Ratio(p) => leaf(SerializedValue::Ratio(p.get().clone()), b),
+        Value::Str(p) => {
+            let s = p.get();
+            b.charge(s.len())?;
+            Ok(SerializedValue::Str(s.clone()))
+        }
+        Value::Pattern(p) => {
+            let src = p.get().as_str();
+            b.charge(src.len())?;
+            Ok(SerializedValue::Pattern(src.to_owned()))
+        }
 
         // ── Identifiers ──
         Value::Symbol(p) => {
             let s = p.get();
-            Ok(SerializedValue::Symbol {
-                namespace: s.namespace.clone(),
-                name: s.name.clone(),
-                version: s.version.clone(),
-            })
+            leaf(
+                SerializedValue::Symbol {
+                    namespace: s.namespace.clone(),
+                    name: s.name.clone(),
+                    version: s.version.clone(),
+                },
+                b,
+            )
         }
         Value::Keyword(p) => {
             let k = p.get();
-            Ok(SerializedValue::Keyword {
-                namespace: k.namespace.clone(),
-                name: k.name.clone(),
-            })
+            leaf(
+                SerializedValue::Keyword {
+                    namespace: k.namespace.clone(),
+                    name: k.name.clone(),
+                },
+                b,
+            )
         }
 
         // ── Collections ──
         Value::List(p) => {
-            let items: Result<Vec<_>, _> = p.get().iter().map(serialize).collect();
-            Ok(SerializedValue::List(items?))
+            let l = p.get();
+            Ok(SerializedValue::List(ser_items(l.count(), l.iter(), b)?))
         }
         Value::Vector(p) => {
-            let items: Result<Vec<_>, _> = p.get().iter().map(serialize).collect();
-            Ok(SerializedValue::Vector(items?))
+            let vec = p.get();
+            Ok(SerializedValue::Vector(ser_items(
+                vec.count(),
+                vec.iter(),
+                b,
+            )?))
         }
-        Value::Map(m) => serialize_map(m),
-        Value::Set(s) => serialize_set(s),
+        Value::Map(m) => ser_map(m, b),
+        Value::Set(s) => {
+            let items = ser_items(s.count(), s.iter(), b)?;
+            Ok(match s {
+                SetValue::Hash(_) => SerializedValue::HashSet(items),
+                SetValue::Sorted(_) => SerializedValue::SortedSet(items),
+            })
+        }
         Value::Queue(p) => {
-            let items: Result<Vec<_>, _> = p.get().iter().map(serialize).collect();
-            Ok(SerializedValue::Queue(items?))
+            let q = p.get();
+            Ok(SerializedValue::Queue(ser_items(q.count(), q.iter(), b)?))
         }
         Value::Cons(p) => {
             let c = p.get();
             Ok(SerializedValue::Cons {
-                head: Box::new(serialize(&c.head)?),
-                tail: Box::new(serialize(&c.tail)?),
+                head: ser_boxed(&c.head, b)?,
+                tail: ser_boxed(&c.tail, b)?,
             })
         }
 
         // ── Records ──
         Value::TypeInstance(p) => {
             let ti = p.get();
+            b.charge(ti.type_tag.len())?;
             // Fold any mutable-field slots into the serialized field map: the
             // snapshot preserves their VALUES. Mutability itself is runtime
             // state and is not restored (deserialize sets `mutable: None`).
@@ -585,9 +830,9 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
                     for (k, v) in mm.iter() {
                         merged = merged.assoc(k.clone(), v.clone());
                     }
-                    serialize_map_pairs(&merged)?
+                    ser_map_pairs(&merged, b)?
                 }
-                _ => serialize_map_pairs(&ti.fields)?,
+                _ => ser_map_pairs(&ti.fields, b)?,
             };
             Ok(SerializedValue::TypeInstance {
                 type_tag: ti.type_tag.clone(),
@@ -596,42 +841,45 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
         }
 
         // ── Errors ──
-        Value::Error(p) => Ok(SerializedValue::Error(Box::new(serialize_error(p.get())?))),
+        Value::Error(p) => Ok(SerializedValue::Error(Box::new(ser_error(p.get(), b)?))),
 
         // ── Primitive arrays (snapshot) ──
-        Value::BooleanArray(p) => Ok(SerializedValue::BooleanArray(
-            p.get().lock().unwrap().clone(),
-        )),
-        Value::ByteArray(p) => Ok(SerializedValue::ByteArray(p.get().lock().unwrap().clone())),
-        Value::ShortArray(p) => Ok(SerializedValue::ShortArray(p.get().lock().unwrap().clone())),
-        Value::IntArray(p) => Ok(SerializedValue::IntArray(p.get().lock().unwrap().clone())),
-        Value::LongArray(p) => Ok(SerializedValue::LongArray(p.get().lock().unwrap().clone())),
-        Value::FloatArray(p) => Ok(SerializedValue::FloatArray(p.get().lock().unwrap().clone())),
-        Value::DoubleArray(p) => Ok(SerializedValue::DoubleArray(
-            p.get().lock().unwrap().clone(),
-        )),
-        Value::CharArray(p) => Ok(SerializedValue::CharArray(p.get().lock().unwrap().clone())),
+        Value::BooleanArray(p) => ser_array(p.get(), SerializedValue::BooleanArray, b),
+        Value::ByteArray(p) => ser_array(p.get(), SerializedValue::ByteArray, b),
+        Value::ShortArray(p) => ser_array(p.get(), SerializedValue::ShortArray, b),
+        Value::IntArray(p) => ser_array(p.get(), SerializedValue::IntArray, b),
+        Value::LongArray(p) => ser_array(p.get(), SerializedValue::LongArray, b),
+        Value::FloatArray(p) => ser_array(p.get(), SerializedValue::FloatArray, b),
+        Value::DoubleArray(p) => ser_array(p.get(), SerializedValue::DoubleArray, b),
+        Value::CharArray(p) => ser_array(p.get(), SerializedValue::CharArray, b),
         Value::ObjectArray(p) => {
             let guard = p.get().0.lock().unwrap();
-            let items: Result<Vec<_>, _> = guard.iter().map(serialize).collect();
-            Ok(SerializedValue::ObjectArray(items?))
+            Ok(SerializedValue::ObjectArray(ser_items(
+                guard.len(),
+                guard.iter(),
+                b,
+            )?))
         }
 
         // ── Lazy sequences: realize first ──
-        Value::LazySeq(p) => serialize(&p.get().try_realize().map_err(|error| match error {
-            // Resource errors and cancellation keep their identity, so they
-            // are not turned into a catchable "not shareable" error.
-            ValueError::Cancelled => CloneError::Cancelled,
-            ValueError::GasExhausted => CloneError::GasExhausted,
-            ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
-            _ => not_shareable("lazy seq whose realization failed"),
-        })?),
+        // The realized value takes this node's (already counted) slot.
+        Value::LazySeq(p) => ser(
+            &p.get().try_realize().map_err(|error| match error {
+                // Resource errors and cancellation keep their identity, so they
+                // are not turned into a catchable "not shareable" error.
+                ValueError::Cancelled => CloneError::Cancelled,
+                ValueError::GasExhausted => CloneError::GasExhausted,
+                ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
+                _ => not_shareable("lazy seq whose realization failed"),
+            })?,
+            b,
+        ),
 
         // ── Delay: force if already realized, else error ──
         Value::Delay(p) => {
             let state = p.get().state.lock().unwrap();
             if let DelayState::Forced(v) = &*state {
-                serialize(v)
+                ser(v, b)
             } else {
                 Err(not_shareable("delay"))
             }
@@ -661,12 +909,15 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
             if shared_empty && var.is_bound() {
                 return Err(not_shareable("var"));
             }
-            Ok(SerializedValue::Var {
-                namespace: var.namespace.clone(),
-                name: var.name.clone(),
-                is_macro: var.is_macro,
-                shared_root: var.shared_root.clone(),
-            })
+            leaf(
+                SerializedValue::Var {
+                    namespace: var.namespace.clone(),
+                    name: var.name.clone(),
+                    is_macro: var.is_macro,
+                    shared_root: var.shared_root.clone(),
+                },
+                b,
+            )
         }
         Value::Atom(_) => Err(not_shareable("atom")),
         Value::Volatile(_) => Err(not_shareable("volatile")),
@@ -683,12 +934,12 @@ pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError> {
 
         // ── Phase B3: cross-isolate shared references (pass Arc through) ──
         Value::SharedAtom(a) => Ok(SerializedValue::SharedAtom(a.clone())),
-        Value::ByteBlob(b) => Ok(SerializedValue::ByteBlob(b.clone())),
+        Value::ByteBlob(blob) => Ok(SerializedValue::ByteBlob(blob.clone())),
     }
 }
 
-fn serialize_map(m: &MapValue) -> Result<SerializedValue, CloneError> {
-    let pairs = serialize_map_pairs(m)?;
+fn ser_map(m: &MapValue, b: &mut Budget) -> Result<SerializedValue, CloneError> {
+    let pairs = ser_map_pairs(m, b)?;
     Ok(match m {
         MapValue::Array(_) => SerializedValue::ArrayMap(pairs),
         MapValue::Hash(_) => SerializedValue::HashMap(pairs),
@@ -696,36 +947,47 @@ fn serialize_map(m: &MapValue) -> Result<SerializedValue, CloneError> {
     })
 }
 
-fn serialize_map_pairs(
+fn ser_map_pairs(
     m: &MapValue,
+    b: &mut Budget,
 ) -> Result<Vec<(SerializedValue, SerializedValue)>, CloneError> {
-    let mut pairs = Vec::with_capacity(m.count());
+    let len = m.count();
+    b.charge_slots(len.saturating_mul(2))?;
+    let mut pairs = Vec::with_capacity(len);
     let mut err: Option<CloneError> = None;
     m.for_each(|k, v| {
         if err.is_some() {
             return;
         }
-        match (serialize(k), serialize(v)) {
-            (Ok(sk), Ok(sv)) => pairs.push((sk, sv)),
-            (Err(e), _) | (_, Err(e)) => err = Some(e),
+        let result = (|| {
+            if pairs.len() >= len {
+                b.charge_slots(2)?;
+            }
+            let sk = ser(k, b)?;
+            let sv = ser(v, b)?;
+            Ok((sk, sv))
+        })();
+        match result {
+            Ok(pair) => pairs.push(pair),
+            Err(e) => err = Some(e),
         }
     });
     if let Some(e) = err { Err(e) } else { Ok(pairs) }
 }
 
-fn serialize_set(s: &SetValue) -> Result<SerializedValue, CloneError> {
-    let items: Result<Vec<_>, _> = s.iter().map(serialize).collect();
-    Ok(match s {
-        SetValue::Hash(_) => SerializedValue::HashSet(items?),
-        SetValue::Sorted(_) => SerializedValue::SortedSet(items?),
-    })
-}
-
-fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, CloneError> {
+fn ser_error(
+    e: &crate::error::ExceptionInfo,
+    b: &mut Budget,
+) -> Result<SerializedError, CloneError> {
+    b.charge(std::mem::size_of::<SerializedError>())?;
+    let owned = |s: &String, b: &mut Budget| -> Result<String, CloneError> {
+        b.charge(s.len())?;
+        Ok(s.clone())
+    };
     let kind = match &e.error {
         ValueError::WrongType { expected, got } => SerializedErrorKind::WrongType {
             expected,
-            got: got.clone(),
+            got: owned(got, b)?,
         },
         ValueError::IndexOutOfBounds { idx, count } => SerializedErrorKind::IndexOutOfBounds {
             idx: *idx,
@@ -736,36 +998,37 @@ fn serialize_error(e: &crate::error::ExceptionInfo) -> Result<SerializedError, C
             expected,
             got,
         } => SerializedErrorKind::ArityError {
-            name: name.clone(),
-            expected: expected.clone(),
+            name: owned(name, b)?,
+            expected: owned(expected, b)?,
             got: *got,
         },
         ValueError::NotCallable { value } => SerializedErrorKind::NotCallable {
-            value: value.clone(),
+            value: owned(value, b)?,
         },
         ValueError::OddMap { count } => SerializedErrorKind::OddMap { count: *count },
         ValueError::Unsupported => SerializedErrorKind::Unsupported,
-        ValueError::Other(s) => SerializedErrorKind::Other(s.clone()),
+        ValueError::Other(s) => SerializedErrorKind::Other(owned(s, b)?),
         ValueError::GasExhausted => SerializedErrorKind::GasExhausted,
         ValueError::Cancelled => SerializedErrorKind::Cancelled,
         ValueError::MemoryLimitExceeded(e) => SerializedErrorKind::MemoryLimitExceeded(*e),
         ValueError::OutOfRange => SerializedErrorKind::OutOfRange,
         ValueError::TransientAlreadyPersisted => SerializedErrorKind::TransientAlreadyPersisted,
         ValueError::Parse => SerializedErrorKind::Parse,
-        ValueError::Thrown(v) => SerializedErrorKind::Thrown(Box::new(serialize(v)?)),
+        ValueError::Thrown(v) => SerializedErrorKind::Thrown(ser_boxed(v, b)?),
     };
 
-    let data = e.data.as_ref().map(serialize_map_pairs).transpose()?;
+    let message = owned(&e.message, b)?;
+    let data = e.data.as_ref().map(|m| ser_map_pairs(m, b)).transpose()?;
 
     let cause = e
         .cause
         .as_ref()
-        .map(|c| serialize_error(c.get()).map(Box::new))
+        .map(|c| ser_error(c.get(), b).map(Box::new))
         .transpose()?;
 
     Ok(SerializedError {
         kind,
-        message: e.message.clone(),
+        message,
         data,
         cause,
     })
@@ -966,7 +1229,75 @@ mod tests {
     use super::*;
 
     fn roundtrip(v: &Value) -> Value {
+        // The staged path must count exactly the bytes `wire_size` reports.
+        let staged = serialize_staged(v, usize::MAX, MemoryClass::MessageQueue).expect("stage");
+        assert_eq!(staged.wire_size, staged.value.wire_size());
+        assert_eq!(staged.charge.bytes(), staged.wire_size);
         deserialize(serialize(v).expect("serialize"))
+    }
+
+    /// `[v v]` nested `depth` times.
+    fn shared_graph(depth: usize) -> Value {
+        let mut v = Value::Long(0);
+        for _ in 0..depth {
+            v = Value::Vector(GcPtr::new(PersistentVector::from_iter([v.clone(), v])));
+        }
+        v
+    }
+
+    #[test]
+    fn staged_counts_every_payload_kind() {
+        let err = crate::error::ExceptionInfo::new(
+            ValueError::ArityError {
+                name: "f".repeat(10),
+                expected: "2".into(),
+                got: 3,
+            },
+            "boom".repeat(20),
+            Some(MapValue::from_pairs(vec![(
+                Value::keyword(Keyword::simple("k")),
+                Value::string("payload"),
+            )])),
+            Some(GcPtr::new(crate::error::ExceptionInfo::new(
+                ValueError::Thrown(Value::string("x".repeat(100))),
+                "cause".into(),
+                None,
+                None,
+            ))),
+        );
+        let v = Value::Vector(GcPtr::new(PersistentVector::from_iter([
+            Value::Error(GcPtr::new(err)),
+            Value::string("hello"),
+            Value::symbol(Symbol::simple("sym")),
+            Value::BigInt(GcPtr::new(BigInt::from(1u64) << 200)),
+            Value::LongArray(GcPtr::new(std::sync::Mutex::new(vec![1, 2, 3]))),
+            Value::Set(SetValue::Hash(GcPtr::new(PersistentHashSet::from_iter([
+                Value::Long(1),
+            ])))),
+            shared_graph(3),
+        ])));
+        roundtrip(&v);
+    }
+
+    #[test]
+    fn staged_stops_at_limit_for_shared_graph() {
+        const NODE: usize = std::mem::size_of::<SerializedValue>();
+        // Fully expanded this is 2^61 - 1 nodes; staging must stop early.
+        let v = shared_graph(60);
+        let limit = 1000 * NODE;
+        let err = serialize_staged(&v, limit, MemoryClass::MessageQueue).unwrap_err();
+        assert!(
+            matches!(err, CloneError::TooLarge { at_least, limit: l } if l == limit && at_least > limit),
+            "{err:?}"
+        );
+        // A limit below one node refuses before anything is built.
+        let err = serialize_staged(&Value::Nil, NODE - 1, MemoryClass::MessageQueue).unwrap_err();
+        assert!(matches!(err, CloneError::TooLarge { at_least: NODE, .. }));
+        // Exactly the wire size fits.
+        let small = shared_graph(5);
+        let size = serialize(&small).unwrap().wire_size();
+        assert!(serialize_staged(&small, size, MemoryClass::MessageQueue).is_ok());
+        assert!(serialize_staged(&small, size - 1, MemoryClass::MessageQueue).is_err());
     }
 
     #[test]

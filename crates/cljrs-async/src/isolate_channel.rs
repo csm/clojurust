@@ -28,6 +28,14 @@
 //! [`IsolateSender::send_async`] waits for room.  The default limit is the
 //! governor's `queue_limit` (`CLJRS_ISOLATE_QUEUE_LIMIT_MB`).
 //!
+//! The send-side copy is bounded and charged while it is built, not only
+//! once it is queued: [`serialize_staged`] counts every node against the
+//! channel's limit (or, for a non-waiting send, the room left in it) and
+//! charges the governor before allocating it.  A value whose shared parts
+//! expand past the limit is refused with [`CloneError::TooLarge`] after
+//! building at most that many bytes, and the staging charge — kept while an
+//! async sender waits for room — becomes the queued message's charge.
+//!
 //! # Usage
 //!
 //! ```rust,ignore
@@ -48,7 +56,9 @@ use web_time::Instant;
 
 use cljrs_gc::{MemoryCharge, MemoryClass, governor};
 use cljrs_value::Value;
-use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize};
+use cljrs_value::clone::{
+    CloneError, SerializedValue, StagedMessage, deserialize, serialize_staged,
+};
 use tokio::sync::Notify;
 
 /// A queued message and the governor charge for its wire bytes.
@@ -162,7 +172,9 @@ impl IsolateSender {
     /// Returns `Err(CloneError::NotShareable { .. })` if `v` contains a
     /// non-shareable type (mutable state, closures, native resources),
     /// `Err(CloneError::Disconnected)` if the receiver has been dropped,
-    /// `Err(CloneError::Full { .. })` if the message does not fit, and
+    /// `Err(CloneError::Full { .. })` if the message does not fit in the
+    /// room left, `Err(CloneError::TooLarge { .. })` if it exceeds the whole
+    /// channel limit, and
     /// `Err(CloneError::MemoryLimitExceeded(_))` if the strict process
     /// governor refuses its queue charge.
     pub fn send(&self, v: &Value) -> Result<(), CloneError> {
@@ -173,23 +185,68 @@ impl IsolateSender {
     /// channel's byte limit has no room for it (`MemoryLimitExceeded` when
     /// the strict process governor refuses it).
     pub fn try_send(&self, v: &Value) -> Result<(), CloneError> {
-        let sv = serialize_metered(v)?;
-        self.enqueue(sv).map_err(|(_, e)| {
-            if is_rejection(&e) {
+        // Build no more than the room left now: a larger copy could not be
+        // enqueued by this call anyway.
+        let (room, queued) = {
+            let st = self.shared.lock();
+            if st.closed {
+                return Err(CloneError::Disconnected);
+            }
+            (
+                self.shared.limit.saturating_sub(st.queued_bytes),
+                st.queued_bytes,
+            )
+        };
+        let result = match serialize_metered(v, room) {
+            Ok(staged) => self.enqueue(staged).map_err(|(_, e)| e),
+            Err(CloneError::TooLarge { at_least, .. }) if at_least <= self.shared.limit => {
+                Err(CloneError::Full {
+                    bytes: at_least,
+                    queued,
+                    limit: self.shared.limit,
+                })
+            }
+            Err(e) => Err(self.too_large(e)),
+        };
+        result.inspect_err(|e| {
+            if is_rejection(e) {
                 governor().record_queue_rejection();
             }
-            e
         })
+    }
+
+    /// Report a `TooLarge` against the channel's own limit.
+    fn too_large(&self, e: CloneError) -> CloneError {
+        match e {
+            CloneError::TooLarge { at_least, .. } => CloneError::TooLarge {
+                at_least,
+                limit: self.shared.limit,
+            },
+            e => e,
+        }
     }
 
     /// Serialize `v` and enqueue it, waiting while the channel is full.
     ///
     /// A message larger than the channel's whole limit can never fit, so it
-    /// returns `CloneError::Full` at once.  A strict-governor refusal
-    /// (`CloneError::MemoryLimitExceeded`) also returns at once: the
-    /// governor has no capacity wakeup to wait on.
+    /// returns `CloneError::TooLarge` as soon as serialization crosses the
+    /// limit.  While waiting, the staged message keeps its governor charge.
+    /// A strict-governor refusal (`CloneError::MemoryLimitExceeded`) also
+    /// returns at once: the governor has no capacity wakeup to wait on.
     pub async fn send_async(&self, v: &Value) -> Result<(), CloneError> {
-        let mut sv = serialize_metered(v)?;
+        if self.shared.lock().closed {
+            return Err(CloneError::Disconnected);
+        }
+        let mut sv = match serialize_metered(v, self.shared.limit) {
+            Ok(staged) => staged,
+            Err(e) => {
+                let e = self.too_large(e);
+                if is_rejection(&e) {
+                    governor().record_queue_rejection();
+                }
+                return Err(e);
+            }
+        };
         let mut waiting_since: Option<Instant> = None;
         loop {
             // Register for the wakeup before checking, so a release between
@@ -204,7 +261,7 @@ impl IsolateSender {
                     }
                     return Ok(());
                 }
-                Err((back, CloneError::Full { bytes, .. })) if bytes <= self.shared.limit => {
+                Err((back, CloneError::Full { .. })) => {
                     sv = back;
                     waiting_since.get_or_insert_with(Instant::now);
                     notified.await;
@@ -229,28 +286,30 @@ impl IsolateSender {
         self.shared.lock().queued_bytes
     }
 
-    /// Reserve the message's wire bytes and enqueue it.  On failure, return
-    /// the message so an async sender can retry.
-    fn enqueue(&self, sv: SerializedValue) -> Result<(), (SerializedValue, CloneError)> {
-        let bytes = sv.wire_size();
+    /// Take the message's wire bytes of channel capacity and enqueue it with
+    /// its staging charge.  On failure, return the message so an async
+    /// sender can retry.
+    // Private; the error hands the message back by value for a retry.
+    #[allow(clippy::result_large_err)]
+    fn enqueue(&self, sv: StagedMessage) -> Result<(), (StagedMessage, CloneError)> {
+        let bytes = sv.wire_size;
         let mut st = self.shared.lock();
         if st.closed {
             return Err((sv, CloneError::Disconnected));
         }
-        let full = CloneError::Full {
-            bytes,
-            queued: st.queued_bytes,
-            limit: self.shared.limit,
-        };
         if st.queued_bytes.saturating_add(bytes) > self.shared.limit {
+            let full = CloneError::Full {
+                bytes,
+                queued: st.queued_bytes,
+                limit: self.shared.limit,
+            };
             return Err((sv, full));
         }
-        let charge = match governor().reserve_shared(MemoryClass::MessageQueue, bytes) {
-            Ok(charge) => charge,
-            Err(refused) => return Err((sv, CloneError::MemoryLimitExceeded(refused))),
-        };
         st.queued_bytes += bytes;
-        st.queue.push_back(AccountedMessage { value: sv, charge });
+        st.queue.push_back(AccountedMessage {
+            value: sv.value,
+            charge: sv.charge,
+        });
         drop(st);
         self.shared.recv_ready.notify_one();
         Ok(())
@@ -262,19 +321,20 @@ impl IsolateSender {
 fn is_rejection(e: &CloneError) -> bool {
     matches!(
         e,
-        CloneError::Full { .. } | CloneError::MemoryLimitExceeded(_)
+        CloneError::Full { .. } | CloneError::TooLarge { .. } | CloneError::MemoryLimitExceeded(_)
     )
 }
 
-/// Serialize `v`, metering the crossing (bytes copied + serialize time) into
-/// the shared GC stats so a silent fan-out copy is observable rather than
-/// mystery latency. The error path is intentionally *not* metered — a
-/// rejected value never crosses, so it copies nothing.
-fn serialize_metered(v: &Value) -> Result<SerializedValue, CloneError> {
+/// Serialize `v` within `limit` wire bytes, charging the staging copy to
+/// the governor as it is built, and meter the crossing (bytes copied +
+/// serialize time) into the shared GC stats so a silent fan-out copy is
+/// observable rather than mystery latency. The error path is intentionally
+/// *not* metered — a rejected value never crosses.
+fn serialize_metered(v: &Value, limit: usize) -> Result<StagedMessage, CloneError> {
     let start = Instant::now();
-    let sv = serialize(v)?;
-    cljrs_gc::GC_STATS.record_boundary_crossing(sv.byte_size() as u64, start.elapsed());
-    Ok(sv)
+    let staged = serialize_staged(v, limit, MemoryClass::MessageQueue)?;
+    cljrs_gc::GC_STATS.record_boundary_crossing(staged.value.byte_size() as u64, start.elapsed());
+    Ok(staged)
 }
 
 impl Clone for IsolateSender {
@@ -445,6 +505,7 @@ mod tests {
     use super::*;
     use crate::isolate::Isolate;
     use cljrs_gc::GcPtr;
+    use cljrs_value::clone::serialize;
     use cljrs_value::{Keyword, MapValue, PersistentList, PersistentVector};
     use std::sync::Arc;
 
@@ -717,7 +778,7 @@ mod tests {
             matches!(
                 full,
                 Err(CloneError::Full { bytes, queued, limit })
-                    if (bytes, queued, limit) == (one, one * 2, one * 2)
+                    if bytes > 0 && bytes <= one && (queued, limit) == (one * 2, one * 2)
             ),
             "the third message must be refused as Full"
         );
@@ -727,11 +788,87 @@ mod tests {
     }
 
     #[test]
-    fn oversized_message_is_full_even_for_async_send() {
+    fn oversized_message_is_too_large_even_for_async_send() {
         let (tx, _rx) = isolate_channel_with_limit(64);
         let err = run_local(async { tx.send_async(&payload(1000)).await }).unwrap_err();
-        assert!(matches!(err, CloneError::Full { .. }));
+        assert!(
+            matches!(err, CloneError::TooLarge { limit: 64, .. }),
+            "{err:?}"
+        );
         assert_eq!(tx.queued_bytes(), 0);
+    }
+
+    /// `[v v]` nested `depth` times: `depth + 1` source objects whose wire
+    /// form has `2^(depth+1) - 1` nodes.
+    fn shared_graph(depth: usize) -> Value {
+        let mut v = Value::Long(0);
+        for _ in 0..depth {
+            v = Value::Vector(GcPtr::new(PersistentVector::from_iter([v.clone(), v])));
+        }
+        v
+    }
+
+    /// Issue #518: a tiny shared graph must be refused without first
+    /// building its exponentially expanded copy.
+    #[test]
+    fn shared_graph_is_refused_before_expansion() {
+        // Expanded, depth 40 would be ~2^41 nodes (~140 TB); this test only
+        // finishes if the send stops at the limit.
+        let v = shared_graph(40);
+        let (tx, _rx) = isolate_channel_with_limit(1);
+        let err = tx.send(&v).unwrap_err();
+        assert!(
+            matches!(err, CloneError::TooLarge { limit: 1, .. }),
+            "{err:?}"
+        );
+
+        let (tx, _rx) = isolate_channel_with_limit(1 << 16);
+        let err = tx.send(&v).unwrap_err();
+        assert!(
+            matches!(err, CloneError::TooLarge { at_least, limit }
+                if limit == 1 << 16 && at_least > limit),
+            "{err:?}"
+        );
+        let err = run_local(async { tx.send_async(&v).await }).unwrap_err();
+        assert!(matches!(err, CloneError::TooLarge { .. }), "{err:?}");
+        assert_eq!(tx.queued_bytes(), 0);
+    }
+
+    /// A send that does not fit the room left is `Full`, and is refused
+    /// after building no more than that room.
+    #[test]
+    fn shared_graph_into_partly_full_channel_is_full() {
+        let one = serialize(&shared_graph(4)).unwrap().wire_size();
+        let (tx, mut rx) = isolate_channel_with_limit(one + one / 2);
+        tx.send(&shared_graph(4)).unwrap();
+        let err = tx.send(&shared_graph(4)).unwrap_err();
+        assert!(
+            matches!(err, CloneError::Full { queued, .. } if queued == one),
+            "{err:?}"
+        );
+        assert_eq!(rx.try_recv(), Some(shared_graph(4)));
+        tx.send(&shared_graph(4)).unwrap();
+    }
+
+    #[test]
+    fn staged_wire_size_matches_and_is_charged() {
+        let v = shared_graph(6);
+        let staged = serialize_staged(&v, usize::MAX, MemoryClass::MessageQueue).unwrap();
+        assert_eq!(staged.wire_size, staged.value.wire_size());
+        assert_eq!(staged.charge.bytes(), staged.wire_size);
+        assert_eq!(staged.charge.class(), MemoryClass::MessageQueue);
+    }
+
+    #[test]
+    fn closed_channel_refuses_before_serializing() {
+        let (tx, rx) = isolate_channel_with_limit(1);
+        drop(rx);
+        assert!(matches!(
+            tx.send(&shared_graph(40)),
+            Err(CloneError::Disconnected)
+        ));
+        let err = run_local(async { tx.send_async(&shared_graph(40)).await }).unwrap_err();
+        assert!(matches!(err, CloneError::Disconnected));
     }
 
     #[test]

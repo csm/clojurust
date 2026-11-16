@@ -1468,6 +1468,34 @@ impl MemoryCharge {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+
+    /// Merge `other` into this charge, so one drop returns both.
+    ///
+    /// # Panics
+    /// Panics if the two charges are of different classes or governors.
+    pub fn absorb(&mut self, other: MemoryCharge) {
+        assert!(
+            self.class == other.class && std::ptr::eq(self.governor, other.governor),
+            "MemoryCharge::absorb: charges must share a class and governor"
+        );
+        self.bytes += other.bytes;
+        // `other`'s bytes now belong to `self`; it must not return them.
+        std::mem::forget(other);
+    }
+
+    /// Return every byte above `bytes` to the governor now.  A no-op when
+    /// the charge already holds `bytes` or fewer.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        if bytes >= self.bytes {
+            return;
+        }
+        let excess = self.bytes - bytes;
+        self.bytes = bytes;
+        self.governor.sub(self.class, excess);
+        if !QUIET_RELEASE.with(Cell::get) {
+            self.governor.evaluate(None, false);
+        }
+    }
 }
 
 impl Drop for MemoryCharge {

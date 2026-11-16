@@ -84,7 +84,14 @@ Done (Phases A–H, A2, B1):
   the governor snapshot). Phase 4: when the strict governor refuses the queue
   charge, every send returns `CloneError::MemoryLimitExceeded` at once (the
   governor has no capacity wakeup to wait on), and `isolate-put!` raises the
-  uncatchable `ValueError::MemoryLimitExceeded`. The default limit is the governor's `queue_limit`
+  uncatchable `ValueError::MemoryLimitExceeded`. Issue #518: the send-side
+  copy is staged with `clone::serialize_staged`, which counts and charges each
+  node before allocating it, against the channel limit (`send_async`) or the
+  room left (`try_send`); a value whose shared structure expands past the
+  limit fails with `CloneError::TooLarge` (or `Full` when only the room is
+  short) after at most that many bytes, and the staging charge becomes the
+  queued message's charge (held while `send_async` waits). A closed channel
+  refuses before serializing. The default limit is the governor's `queue_limit`
   (`CLJRS_ISOLATE_QUEUE_LIMIT_MB`); `isolate_channel_with_limit` sets one per
   channel. Dropping or closing the receiver releases every queued charge.
 - Phase B2 (Clojure surface): `isolate_builtins` exposes the copy boundary to
@@ -562,14 +569,15 @@ pub mod isolate_channel {
         /// Serialize `v`, meter the crossing (bytes + time into GC_STATS), and
         /// enqueue it without waiting. Returns CloneError for non-shareable
         /// values (located at the send site), `Disconnected` if the receiver
-        /// has been dropped, `Full` if the message does not fit, or
+        /// has been dropped, `Full` if the message does not fit the room left,
+        /// `TooLarge` if it exceeds the whole limit (staging stops there), or
         /// `MemoryLimitExceeded` if the strict governor refuses its charge.
         /// Compatibility form of `try_send`.
         pub fn send(&self, v: &Value) -> Result<(), CloneError>;
         /// Same as `send`.
         pub fn try_send(&self, v: &Value) -> Result<(), CloneError>;
         /// Enqueue, waiting while the channel is full. A message larger than
-        /// the whole limit returns `Full` at once.
+        /// the whole limit returns `TooLarge` once staging crosses the limit.
         pub async fn send_async(&self, v: &Value) -> Result<(), CloneError>;
         /// The channel's byte limit.
         pub fn limit(&self) -> usize;
