@@ -1169,7 +1169,7 @@ implement sentinel operations without hitting the stub errors registered in
 | `eval_atom(args, env)` | `atom` — create an atom, honoring `:meta` / `:validator` options (also used by `apply_value` when `atom` is called as a value with options) |
 | `eval_reset_bang(args, env)` | `reset!` — validate, store, fire watches |
 | `eval_swap_bang(args, env)` | `swap!` — apply f to atom, store result |
-| `eval_compare_and_set_bang(args, env)` | `compare-and-set!` — validate the candidate, CAS against the snapshot matching `expected`, fire watches only on success. `apply_value` routes `reset!` / `swap!` / `compare-and-set!` native calls here so no dispatch path bypasses the validator/watch contract |
+| `eval_compare_and_set_bang(args, env)` | `compare-and-set!` — validate the candidate, CAS against the snapshot *identical* to `expected` (equal-but-distinct values do not match), fire watches only on success. `apply_value` routes `reset!` / `swap!` / `compare-and-set!` native calls here so no dispatch path bypasses the validator/watch contract |
 | `eval_volatile(args)` | `volatile!` — create a new volatile |
 | `eval_vreset_bang(args)` | `vreset!` — reset volatile value |
 | `eval_vswap_bang(args, env)` | `vswap!` — apply f to volatile value, store result |

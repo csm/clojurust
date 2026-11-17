@@ -18,7 +18,13 @@
 //! - Heap-allocated *data* values: `Str`, `BigInt`, `BigDecimal`, `Ratio`,
 //!   `Pattern` (source only), `Symbol`, `Keyword`
 //! - All persistent collections: `List`, `Vector`, `Map`, `Set`, `Queue`, `Cons`
-//! - Primitive and object arrays (snapshot of current contents)
+//! - Primitive and object arrays (snapshot of current contents).  An object
+//!   array's elements are copied out under its lock and serialized after the
+//!   lock is released, so a lazy element may read or write its own array.
+//!   A value that contains itself (through an object array, lazy seq, delay
+//!   or mutable record field) is rejected with [`CloneError::Cyclic`]; a
+//!   repeated acyclic reference is copied once per occurrence, so aliasing
+//!   is not preserved across the boundary.
 //! - `TypeInstance` records (fields cloned recursively)
 //! - `Error` (message + data + cause chain, `Thrown` value cloned recursively)
 //! - Lazy sequences: **realized** first; the realized value is then cloned
@@ -51,7 +57,9 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use num_bigint::BigInt;
 
-use crate::collections::{PersistentHashSet, PersistentVector, SortedMap, SortedSet};
+use crate::collections::{
+    PersistentHashSet, PersistentVector, Snapshot, SortedMap, SortedSet, ValueSnapshot,
+};
 use crate::error::ValueError;
 use crate::shared::{ByteBlob, SharedAtom, SharedValue};
 use crate::types::DelayState;
@@ -79,6 +87,12 @@ pub enum CloneError {
     /// The process memory governor refused the message's queue charge
     /// (strict mode).
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
+    /// The value contains itself (through an object array, lazy seq, delay
+    /// or mutable record field), so it has no finite copy.
+    Cyclic {
+        /// Clojure type name of the node that was re-entered.
+        type_name: &'static str,
+    },
     /// A byte-bounded channel has no room for the message.
     Full {
         /// Wire size of the refused message.  When the send was refused
@@ -110,6 +124,11 @@ impl std::fmt::Display for CloneError {
                     "value of type `{type_name}` cannot cross an isolate boundary"
                 )
             }
+            CloneError::Cyclic { type_name } => write!(
+                f,
+                "value is cyclic (it contains itself through a `{type_name}`) and \
+                 cannot cross an isolate boundary"
+            ),
             CloneError::Disconnected => write!(f, "isolate channel is disconnected"),
             CloneError::Cancelled => write!(f, "execution cancelled"),
             CloneError::GasExhausted => write!(f, "gas exhausted"),
@@ -576,6 +595,7 @@ pub fn serialize_staged(
             class,
             charge: None,
         }),
+        active: Default::default(),
     };
     budget.charge_slots(1)?;
     let value = ser(v, &mut budget)?;
@@ -606,12 +626,28 @@ const STAGING_CHUNK: usize = 64 * 1024;
 
 const NODE: usize = std::mem::size_of::<SerializedValue>();
 
-/// Wire bytes a serialization may still use.
+/// Per-call serialization state: the wire-byte budget and the traversal's
+/// active path.
+///
+/// `active` holds the identities of the mutable or lazy nodes (object
+/// arrays, lazy seqs, delays, records with mutable fields) on the path from
+/// the root to the value being serialized.  Persistent collections are
+/// immutable and cannot contain themselves, so any cycle passes through one
+/// of these nodes: re-entering one that is still active is rejected with
+/// [`CloneError::Cyclic`] instead of recursing without bound (issue #517).
+/// A node reached again along a *different* path (a repeated, acyclic
+/// reference) is not a cycle: each occurrence is copied, and the byte budget
+/// bounds how far that expansion may go (issue #518).
+///
+/// The state is threaded through the recursion rather than kept in a
+/// thread-local, so a fiber that parks inside a lazy-seq realization never
+/// sees another fiber's traversal.
 struct Budget {
     limit: usize,
     /// Wire bytes counted so far (matches `wire_size` of the finished copy).
     used: usize,
     staging: Option<Staging>,
+    active: std::collections::HashSet<usize>,
 }
 
 /// Governor charge covering a staging copy.
@@ -626,7 +662,24 @@ impl Budget {
             limit: usize::MAX,
             used: 0,
             staging: None,
+            active: Default::default(),
         }
+    }
+
+    /// Run `f` with the node at `addr` on the active path, rejecting
+    /// re-entry of a node that is already on it.
+    fn within<T>(
+        &mut self,
+        addr: usize,
+        type_name: &'static str,
+        f: impl FnOnce(&mut Self) -> Result<T, CloneError>,
+    ) -> Result<T, CloneError> {
+        if !self.active.insert(addr) {
+            return Err(CloneError::Cyclic { type_name });
+        }
+        let result = f(self);
+        self.active.remove(&addr);
+        result
     }
 
     /// Count `bytes` more, failing before anything is allocated for them.
@@ -830,7 +883,14 @@ fn ser(v: &Value, b: &mut Budget) -> Result<SerializedValue, CloneError> {
                     for (k, v) in mm.iter() {
                         merged = merged.assoc(k.clone(), v.clone());
                     }
-                    ser_map_pairs(&merged, b)?
+                    // A mutable slot can be reset while a lazy field value is
+                    // realized, so root the merged copy; and a slot can hold
+                    // the record itself, so track it on the active path.
+                    let merged = Snapshot::new(Value::Map(merged));
+                    b.within(ti as *const _ as usize, "record", |b| match merged.get() {
+                        Value::Map(m) => ser_map_pairs(m, b),
+                        _ => unreachable!("merged record fields are a map"),
+                    })?
                 }
                 _ => ser_map_pairs(&ti.fields, b)?,
             };
@@ -853,35 +913,52 @@ fn ser(v: &Value, b: &mut Budget) -> Result<SerializedValue, CloneError> {
         Value::DoubleArray(p) => ser_array(p.get(), SerializedValue::DoubleArray, b),
         Value::CharArray(p) => ser_array(p.get(), SerializedValue::CharArray, b),
         Value::ObjectArray(p) => {
-            let guard = p.get().0.lock().unwrap();
-            Ok(SerializedValue::ObjectArray(ser_items(
-                guard.len(),
-                guard.iter(),
-                b,
-            )?))
+            let addr = p.get() as *const _ as usize;
+            b.within(addr, "object-array", |b| {
+                // Copy the elements out under the lock and release it before
+                // recursing: serializing an element can realize a lazy seq,
+                // whose thunk may read or write this same array (and a
+                // self-containing array would re-lock it directly).  The
+                // copy is a traced snapshot root, so elements stay alive even
+                // if the thunk overwrites their slots and a collection runs.
+                // The wire form is the contents at the moment of the copy.
+                let elements = p.get().0.lock().unwrap().clone();
+                let snapshot = Snapshot::new(ValueSnapshot(elements));
+                let items = &snapshot.get().0;
+                Ok(SerializedValue::ObjectArray(ser_items(
+                    items.len(),
+                    items.iter(),
+                    b,
+                )?))
+            })
         }
 
         // ── Lazy sequences: realize first ──
         // The realized value takes this node's (already counted) slot.
-        Value::LazySeq(p) => ser(
-            &p.get().try_realize().map_err(|error| match error {
+        Value::LazySeq(p) => b.within(p.get() as *const _ as usize, "lazy-seq", |b| {
+            let realized = p.get().try_realize().map_err(|error| match error {
                 // Resource errors and cancellation keep their identity, so they
                 // are not turned into a catchable "not shareable" error.
                 ValueError::Cancelled => CloneError::Cancelled,
                 ValueError::GasExhausted => CloneError::GasExhausted,
                 ValueError::MemoryLimitExceeded(fault) => CloneError::MemoryLimitExceeded(fault),
                 _ => not_shareable("lazy seq whose realization failed"),
-            })?,
-            b,
-        ),
+            })?;
+            ser(&realized, b)
+        }),
 
         // ── Delay: force if already realized, else error ──
         Value::Delay(p) => {
-            let state = p.get().state.lock().unwrap();
-            if let DelayState::Forced(v) = &*state {
-                ser(v, b)
-            } else {
-                Err(not_shareable("delay"))
+            // Copy the forced value out and release the state lock before
+            // recursing, for the same re-entry reason as object arrays.  A
+            // forced value never changes, so the delay keeps it alive.
+            let forced = match &*p.get().state.lock().unwrap() {
+                DelayState::Forced(v) => Some(v.clone()),
+                _ => None,
+            };
+            match forced {
+                Some(v) => b.within(p.get() as *const _ as usize, "delay", |b| ser(&v, b)),
+                None => Err(not_shareable("delay")),
             }
         }
 
@@ -1430,6 +1507,137 @@ mod tests {
         let _ = ls.realize(); // force it
         let v = Value::LazySeq(GcPtr::new(ls));
         assert_eq!(roundtrip(&v), Value::Long(99));
+    }
+
+    fn object_array(items: Vec<Value>) -> GcPtr<crate::value::ObjectArray> {
+        GcPtr::new(crate::value::ObjectArray::new(items))
+    }
+
+    fn array_items(sv: &SerializedValue) -> &[SerializedValue] {
+        match sv {
+            SerializedValue::ObjectArray(items) => items,
+            other => panic!("expected an object array, got {other:?}"),
+        }
+    }
+
+    /// A lazy element whose thunk reads and writes the array being
+    /// serialized must not find the array locked (issue #517).  `try_lock`
+    /// keeps a regression from hanging the test suite.
+    #[test]
+    fn object_array_lazy_element_can_reenter_its_array() {
+        use crate::types::{LazySeq, Thunk};
+        #[derive(Debug)]
+        struct ReenterThunk(GcPtr<crate::value::ObjectArray>);
+        impl cljrs_gc::Trace for ReenterThunk {
+            fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
+                cljrs_gc::GcVisitor::visit(visitor, &self.0);
+            }
+        }
+        impl Thunk for ReenterThunk {
+            fn force(&self) -> crate::ValueResult<Value> {
+                let mut items = self
+                    .0
+                    .get()
+                    .0
+                    .try_lock()
+                    .expect("array lock must not be held while realizing an element");
+                let read = items[1].clone();
+                items[1] = Value::Long(-1);
+                Ok(read)
+            }
+        }
+        let arr = object_array(vec![Value::Nil, Value::Long(2), Value::Long(3)]);
+        let lazy = Value::LazySeq(GcPtr::new(LazySeq::new(Box::new(ReenterThunk(
+            arr.clone(),
+        )))));
+        arr.get().0.lock().unwrap()[0] = lazy;
+
+        let sv = serialize(&Value::ObjectArray(arr.clone())).expect("serialize");
+        // The wire form is the snapshot taken before realization; the thunk's
+        // write lands in the source array only.
+        assert!(matches!(
+            array_items(&sv),
+            [
+                SerializedValue::Long(2),
+                SerializedValue::Long(2),
+                SerializedValue::Long(3)
+            ]
+        ));
+        assert_eq!(arr.get().0.lock().unwrap()[1], Value::Long(-1));
+    }
+
+    #[test]
+    fn object_array_direct_cycle_is_rejected() {
+        let arr = object_array(vec![Value::Long(1), Value::Nil]);
+        arr.get().0.lock().unwrap()[1] = Value::ObjectArray(arr.clone());
+        assert!(matches!(
+            serialize(&Value::ObjectArray(arr.clone())),
+            Err(CloneError::Cyclic {
+                type_name: "object-array"
+            })
+        ));
+        // Break the cycle so the test does not leak under refcounting.
+        arr.get().0.lock().unwrap()[1] = Value::Nil;
+    }
+
+    #[test]
+    fn object_array_indirect_cycle_is_rejected() {
+        let a = object_array(vec![Value::Nil]);
+        let b = object_array(vec![Value::Nil]);
+        let through_vector = Value::Vector(GcPtr::new(PersistentVector::from_iter([
+            Value::ObjectArray(b.clone()),
+        ])));
+        a.get().0.lock().unwrap()[0] = through_vector;
+        b.get().0.lock().unwrap()[0] = Value::ObjectArray(a.clone());
+        assert!(matches!(
+            serialize(&Value::ObjectArray(a.clone())),
+            Err(CloneError::Cyclic { .. })
+        ));
+        b.get().0.lock().unwrap()[0] = Value::Nil;
+    }
+
+    /// The same child reached twice, without a cycle, is copied twice.
+    #[test]
+    fn object_array_repeated_child_is_not_a_cycle() {
+        let child = object_array(vec![Value::Long(7)]);
+        let parent = object_array(vec![
+            Value::ObjectArray(child.clone()),
+            Value::ObjectArray(child.clone()),
+        ]);
+        let sv = serialize(&Value::ObjectArray(parent)).expect("repeated child serializes");
+        let items = array_items(&sv);
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert!(matches!(array_items(item), [SerializedValue::Long(7)]));
+        }
+        let Value::ObjectArray(copy) = deserialize(sv) else {
+            panic!("expected an object array");
+        };
+        let copy = copy.get().0.lock().unwrap();
+        let (Value::ObjectArray(first), Value::ObjectArray(second)) = (&copy[0], &copy[1]) else {
+            panic!("expected nested object arrays");
+        };
+        // Aliasing is not preserved: each occurrence is its own copy.
+        assert!(!GcPtr::ptr_eq(first, second));
+        assert!(!GcPtr::ptr_eq(first, &child));
+    }
+
+    #[test]
+    fn nested_acyclic_object_arrays_roundtrip() {
+        let inner = object_array(vec![Value::Long(1), Value::string("x")]);
+        let outer = object_array(vec![Value::ObjectArray(inner), Value::Long(2)]);
+        let Value::ObjectArray(copy) = roundtrip(&Value::ObjectArray(outer)) else {
+            panic!("expected an object array");
+        };
+        let copy = copy.get().0.lock().unwrap();
+        assert_eq!(copy[1], Value::Long(2));
+        let Value::ObjectArray(inner) = &copy[0] else {
+            panic!("expected a nested object array");
+        };
+        assert_eq!(
+            *inner.get().0.lock().unwrap(),
+            vec![Value::Long(1), Value::string("x")]
+        );
     }
 
     #[test]

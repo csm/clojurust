@@ -102,7 +102,7 @@ impl<T: cljrs_gc::Trace + 'static> Drop for Snapshot<T> {
     }
 }
 
-struct ValueSnapshot(Vec<crate::Value>);
+pub(crate) struct ValueSnapshot(pub(crate) Vec<crate::Value>);
 impl cljrs_gc::Trace for ValueSnapshot {
     fn trace(&self, visitor: &mut cljrs_gc::MarkVisitor) {
         for value in &self.0 {

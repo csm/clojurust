@@ -965,6 +965,9 @@ pub enum CloneError {
     /// of gas; callers surface these as the uncatchable `ValueError` kinds.
     Cancelled,
     GasExhausted,
+    /// The value contains itself through an object array, lazy seq, delay or
+    /// mutable record field (issue #517); `type_name` names the re-entered node.
+    Cyclic { type_name: &'static str },
     /// A byte-bounded isolate channel has no room for the message.  `bytes`
     /// is a lower bound when the send was refused while still staging.
     Full { bytes: usize, queued: usize, limit: usize },
@@ -980,7 +983,12 @@ pub enum CloneError {
 pub fn resource_value_error(error: &CloneError) -> Option<ValueError>;
 
 /// Convert a Value to SerializedValue.  Returns CloneError for mutable state,
-/// closures, native resources, and other non-shareable types.
+/// closures, native resources, and other non-shareable types.  Object arrays
+/// (and forced delays) are copied out under their lock, which is released
+/// before elements are serialized, so a lazy element may read or write its own
+/// array; the copy is a traced snapshot root.  A cycle through a mutable or
+/// lazy node is rejected with `CloneError::Cyclic`; a repeated acyclic
+/// reference is copied once per occurrence (aliasing is not preserved).
 pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError>;
 
 /// A staged message: its wire form, exact wire size, and the governor
@@ -1146,7 +1154,7 @@ Returned updates acquire caller ownership before the cell can replace its payloa
 This snapshot exposes `value: Value` and keeps its no-GC backing scopes alive until drop.
 Its `protect_current()` method transfers ownership to the caller. Native GC callers still require normal value roots across collections.
 
-`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` rejects an unequal initial snapshot before publication.
+`Atom::compare_and_set(&self, expected: &Value, value: Value) -> bool` matches by identity (`Value::identical`, Clojure's `compareAndSet` contract), so it never runs user code or realizes lazy values under the atom's lock; a non-identical snapshot is rejected before publication.
 The public `value` field remains available for compatibility. Direct writes bypass ownership preparation.
 Use `reset`, `compare_and_set`, or `Var::bind` for writes.
 Scalar vectors maintain a summary so ownership tracing skips their elements.
