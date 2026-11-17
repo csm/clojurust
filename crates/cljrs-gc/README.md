@@ -505,6 +505,12 @@ impl IsolateControl {
 }
 pub struct CollectionReport { pub bytes_before, pub bytes_after, pub bytes_returned, pub bytes_pending, pub duration }
 pub struct MemoryCharge;   // RAII; Drop returns its bytes once
+impl MemoryCharge {
+    pub fn class(&self) -> MemoryClass;
+    pub fn bytes(&self) -> usize;
+    pub fn absorb(&mut self, other: MemoryCharge);  // merge a same-class charge
+    pub fn shrink_to(&mut self, bytes: usize);      // return the excess now
+}
 pub struct MemoryLimitExceeded { pub class, pub requested, pub committed, pub hard_limit }
 pub struct MemorySnapshot { /* strict flag, limits, pressure, committed/used/free
                                credit and peaks, per class, per isolate, transitions,

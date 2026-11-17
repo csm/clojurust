@@ -21,7 +21,7 @@ plus all persistent (immutable, structurally shared) collection types.  The
 src/
   lib.rs                         — module declarations and re-exports
   compare.rs                     — try_compare: the fallible language comparison policy shared by `compare`, `sort` and sorted-collection keys; crate-private SortKey wrapper + checked() error capture used by SortedMap/SortedSet
-  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
+  clone.rs                       — SerializedValue (Send+Sync wire form), CloneError, serialize/deserialize for cross-isolate copy boundary (Phase B2); SerializedValue::byte_size for boundary metering; SerializedValue::wire_size for the governor's message-queue charge; serialize_staged/StagedMessage for byte-budgeted, governor-charged staging (issue #518); handles SharedAtom/ByteBlob/Var pass-through (B3 — Var shares its root cell, issue #171)
   error.rs                       — ValueError enum (incl. `MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded)` and `Cancelled`, uncatchable like `GasExhausted`), ValueResult<T> alias
   hash.rs                        — ClojureHash trait, Murmur3 helpers, JVM-compatible hash_string
   intern.rs                      — (Phase B3) global keyword/symbol intern tables backed by StaticGcPtr; intern_keyword, intern_symbol
@@ -968,8 +968,12 @@ pub enum CloneError {
     /// The value contains itself through an object array, lazy seq, delay or
     /// mutable record field (issue #517); `type_name` names the re-entered node.
     Cyclic { type_name: &'static str },
-    /// A byte-bounded isolate channel has no room for the message.
+    /// A byte-bounded isolate channel has no room for the message.  `bytes`
+    /// is a lower bound when the send was refused while still staging.
     Full { bytes: usize, queued: usize, limit: usize },
+    /// The wire form would exceed the limit it was staged against; staging
+    /// stopped after counting `at_least` bytes.
+    TooLarge { at_least: usize, limit: usize },
     /// The strict process governor refused the message's queue charge.
     MemoryLimitExceeded(cljrs_gc::MemoryLimitExceeded),
 }
@@ -986,6 +990,18 @@ pub fn resource_value_error(error: &CloneError) -> Option<ValueError>;
 /// lazy node is rejected with `CloneError::Cyclic`; a repeated acyclic
 /// reference is copied once per occurrence (aliasing is not preserved).
 pub fn serialize(v: &Value) -> Result<SerializedValue, CloneError>;
+
+/// A staged message: its wire form, exact wire size, and the governor
+/// charge covering exactly that many bytes.
+pub struct StagedMessage { pub value: SerializedValue, pub wire_size: usize, pub charge: MemoryCharge }
+
+/// Serialize within `limit` wire bytes.  Each node's bytes are counted and
+/// charged to the governor under `class` *before* it is allocated, so a
+/// value whose shared parts expand past `limit` fails with `TooLarge` after
+/// at most `limit` bytes of work and allocation (issue #518); a strict
+/// refusal fails with `MemoryLimitExceeded`; failures return the charge.
+pub fn serialize_staged(v: &Value, limit: usize, class: MemoryClass)
+    -> Result<StagedMessage, CloneError>;
 
 /// Allocate a fresh Value in the *current* GC heap from a SerializedValue.
 /// Infallible — non-shareable types are rejected at serialize time.
