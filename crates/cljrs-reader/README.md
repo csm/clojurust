@@ -130,6 +130,12 @@ namespace that produced it. Clones of a list form share one slot (allocated
 lazily), so a `(fn ...)` body copied into many closures expands once in total;
 a freshly parsed form starts empty.
 
+The same source-site slot also prepares immutable function bodies once.
+`function_bodies` stores only syntax (including pre/post desugaring), never
+captured values, namespace-dependent parameter resolution, or arity ids.
+The owning function site must not be part of the cached bodies, to avoid an
+Arc cycle. Clearing the macro entry does not clear the immutable bodies.
+
 ```rust
 pub struct CachedExpansion { pub macro_id: u64, pub ns: Arc<str>, pub form: Arc<Form> }
 
@@ -137,6 +143,7 @@ impl ExpansionCache {
     pub fn get(&self, macro_id: u64, ns: &str) -> Option<Arc<Form>>
     pub fn store(&self, macro_id: u64, ns: Arc<str>, form: Form) -> Arc<Form>
     pub fn clear(&self)
+    pub fn function_bodies(&self, prepare: impl FnOnce() -> Vec<Arc<[Form]>>) -> Arc<[Arc<[Form]>]>
 }
 ```
 

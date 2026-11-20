@@ -365,12 +365,21 @@ pub struct CachedExpansion {
 #[derive(Default)]
 pub struct ExpansionCache(OnceLock<Arc<ExpansionSlot>>);
 
-type ExpansionSlot = Mutex<Option<Arc<CachedExpansion>>>;
+#[derive(Default)]
+struct ExpansionSlot {
+    expansion: Mutex<Option<Arc<CachedExpansion>>>,
+    function_bodies: OnceLock<Arc<[Arc<[Form]>]>>,
+}
 
 impl ExpansionCache {
     /// The cached expansion, if one was made by `macro_id` in `ns`.
     pub fn get(&self, macro_id: u64, ns: &str) -> Option<Arc<Form>> {
-        let slot = self.0.get()?.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = self
+            .0
+            .get()?
+            .expansion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match slot.as_ref() {
             Some(c) if c.macro_id == macro_id && c.ns.as_ref() == ns => Some(c.form.clone()),
             _ => None,
@@ -387,15 +396,33 @@ impl ExpansionCache {
             ns,
             form: form.clone(),
         });
-        *self.slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+        *self
+            .slot()
+            .expansion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(entry);
         form
     }
 
     /// Drop any cached expansion (for every form sharing this slot).
     pub fn clear(&self) {
         if let Some(slot) = self.0.get() {
-            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *slot.expansion.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
+    }
+
+    /// Prepare immutable bodies once for a stable function source site.
+    /// This cache contains only syntax, never captured values, parameter
+    /// resolution, or arity identities. The owning site must not occur inside
+    /// the returned bodies (which would create an Arc cycle).
+    pub fn function_bodies(
+        &self,
+        prepare: impl FnOnce() -> Vec<Arc<[Form]>>,
+    ) -> Arc<[Arc<[Form]>]> {
+        self.slot()
+            .function_bodies
+            .get_or_init(|| prepare().into())
+            .clone()
     }
 
     /// A handle to the same slot, for a clone of the owning form.

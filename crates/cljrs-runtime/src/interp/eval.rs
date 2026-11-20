@@ -7,7 +7,7 @@ use crate::builtins::special::SPECIAL_FORMS;
 use crate::env::env::{Env, GlobalEnv};
 use crate::env::error::{EvalError, EvalResult};
 use crate::interp::apply::eval_call;
-use crate::interp::special::eval_special;
+use crate::interp::special::eval_special_at_site;
 use crate::interp::syntax_quote::syntax_quote;
 use cljrs_gc::GcPtr;
 use cljrs_reader::Form;
@@ -310,7 +310,7 @@ fn eval_list(site: &Form, forms: &[Form], env: &mut Env) -> EvalResult {
     if let Some(s) = forms[0].as_symbol()
         && is_special_form(s)
     {
-        return eval_special(s, &forms[1..], env);
+        return eval_special_at_site(site, s, &forms[1..], env);
     }
 
     eval_call(site, &forms[0], &forms[1..], env)
