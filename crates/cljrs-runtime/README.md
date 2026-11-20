@@ -120,6 +120,14 @@ tests/
                                      built-in kinds
   bigdecimal_hash.rs               — `1M`/`1.0M`: equal decimals hash equally; map/set
                                      lookup, assoc, dissoc before and after growth (#512)
+  closure_body_sharing.rs          — re-evaluating a `fn` literal shares its body
+                                     `Arc` across instances while captures, arity ids
+                                     and `::kw` param resolution stay per instance, and
+                                     the body is GC-charged once per site (#537)
+  lazy_head_retention_probe.rs     — `#[ignore]`d diagnostic: forces GC while consuming
+                                     a lazy seq and prints live object counts per
+                                     consumer (`PROBE_CASE=reduce|loop|fn|recur|retained`,
+                                     run with `--ignored --nocapture`) (#537)
   no_gc_eval.rs                    — (no-gc) arithmetic, def provenance, region stack
   mutator_state.rs                 — virtual threads Phase 0: MutatorState save/restore
                                      between two live evaluations on one thread keeps
@@ -1187,6 +1195,15 @@ from a zero-arg callable; the above `make_delay_from_fn` is the analogous
 helper for `Delay`.
 
 ### `special.rs` notes
+
+`eval_special_at_site(site, head, args, env)` is the crate-private dispatch
+used by the tree-walker when an immutable source form is available. Function
+literals prepare their desugared bodies once in the source site's cache;
+instances share those `Arc<[Form]>` bodies while retaining fresh captures and
+arity ids. Only the first instance from a site is GC-charged for the shared
+body (`CljxFnArity::charge_body`). Parameter auto-keywords are still resolved per evaluation. The
+public `eval_special` and synthesized `defn`/`letfn` paths keep the uncached
+fallback, and temporary reader-conditional expansions do not populate a site.
 
 `parse_arity` peels primitive type hints (`^long x`, `^doubles a`) off params
 into `CljxFnArity::param_hints`; `let*`/`loop*` binding hints are stripped via

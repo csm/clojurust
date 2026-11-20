@@ -1221,6 +1221,11 @@ pub struct CljxFnArity {
     /// `lazy-seq` wraps a thunk, or a closure is copied) does not deep-copy
     /// its body.
     pub body: Arc<[Form]>,
+    /// Whether this arity's GC allocation is charged for `body`. False when
+    /// the body is shared with other closures instantiated from the same
+    /// source site and one of them already paid for it, so that creating N
+    /// closures accounts one body rather than N.
+    pub charge_body: bool,
     /// Destructuring patterns: (param_index, original_form).
     /// After binding the gensym'd param, these patterns are applied
     /// via `bind_pattern` to destructure the value.
@@ -1244,8 +1249,7 @@ impl CljxFnArity {
         // params Vec buffer (Arc<str> pointers; the str data is shared, skip it)
         self.params.capacity() * mem::size_of::<Arc<str>>()
         // body: the dominant consumer — Form AST trees stored inline
-        + self.body.len() * mem::size_of::<Form>()
-        + self.body.iter().map(|f| f.heap_size()).sum::<usize>()
+        + self.body_heap_size()
         // destructure_params
         + self.destructure_params.capacity() * mem::size_of::<(usize, Form)>()
         + self.destructure_params.iter().map(|(_, f)| f.heap_size()).sum::<usize>()
@@ -1254,6 +1258,16 @@ impl CljxFnArity {
             .map_or(0, |f| mem::size_of::<Form>() + f.heap_size())
         // param_hints (Copy elements, no nested heap)
         + self.param_hints.capacity() * mem::size_of::<Option<TypeHint>>()
+    }
+
+    /// Heap bytes charged for `body`: its full syntax tree, or 0 when another
+    /// closure sharing the same body already pays for it (`charge_body`).
+    pub fn body_heap_size(&self) -> usize {
+        if !self.charge_body {
+            return 0;
+        }
+        self.body.len() * mem::size_of::<Form>()
+            + self.body.iter().map(|f| f.heap_size()).sum::<usize>()
     }
 }
 

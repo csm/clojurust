@@ -23,10 +23,19 @@ use cljrs_value::{
 
 /// Dispatch to the right special-form handler.
 pub fn eval_special(head: &str, args: &[Form], env: &mut Env) -> EvalResult {
+    eval_special_at_site(None, head, args, env)
+}
+
+pub(crate) fn eval_special_at_site(
+    site: Option<&Form>,
+    head: &str,
+    args: &[Form],
+    env: &mut Env,
+) -> EvalResult {
     crate::env::policy::check_special(head)?;
     match head {
         "def" => eval_def(args, env),
-        "fn*" | "fn" => eval_fn(args, env),
+        "fn*" | "fn" => eval_fn_at_site(site, args, env),
         "if" => eval_if(args, env),
         "do" => eval_body(args, env),
         "let*" | "let" => eval_let(args, env),
@@ -200,6 +209,10 @@ pub fn compile_meta_form(meta: &Form, env: &mut Env) -> EvalResult<Value> {
 // ── fn* ───────────────────────────────────────────────────────────────────────
 
 fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
+    eval_fn_at_site(None, args, env)
+}
+
+fn eval_fn_at_site(site: Option<&Form>, args: &[Form], env: &mut Env) -> EvalResult {
     // `:async` may be requested on the first argument, `(fn ^:async [..] ..)`
     // / `(fn ^:async name [..] ..)`, or on the params vector after a name,
     // `(fn name ^:async [..] ..)` (also how `defn name ^:async [..]` arrives).
@@ -234,15 +247,12 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
 
     // A `^hint` on the params vector or on an arity clause is advisory — the
     // structural shape is the form underneath it.
-    let arities = match &rest[0].unmeta().kind {
+    let clauses: Vec<(&Form, &[Form])> = match &rest[0].unmeta().kind {
         FormKind::Vector(_) => {
             // Single arity: (fn* [params] body...)
             // Resolve auto-keywords in patterns in the defining namespace,
             // before either the interpreter or IR consumes the parameters.
-            vec![parse_arity(
-                &resolve_auto_forms(&rest[0], env)?,
-                &rest[1..],
-            )?]
+            vec![(&rest[0], &rest[1..])]
         }
         FormKind::List(_) => {
             // Multi-arity: (fn* ([params] body...) ...)
@@ -252,7 +262,7 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
                         if forms.is_empty() {
                             return Err(EvalError::Runtime("arity clause requires params".into()));
                         }
-                        parse_arity(&resolve_auto_forms(&forms[0], env)?, &forms[1..])
+                        Ok((&forms[0], &forms[1..]))
                     } else {
                         Err(EvalError::Runtime("expected arity clause (list)".into()))
                     }
@@ -265,6 +275,38 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
             ));
         }
     };
+
+    // Re-evaluating a function literal creates fresh closure state, but its
+    // immutable code and pre/post desugaring belong to the source site.
+    let bodies = site.map(|site| {
+        site.expansion.function_bodies(|| {
+            clauses
+                .iter()
+                .map(|(_, body)| desugar_pre_post_conditions(body).into())
+                .collect()
+        })
+    });
+    // A site's forms are immutable, so the prepared bodies always line up
+    // with its clauses; fall back to fresh copies rather than trust a
+    // mismatched entry if that invariant were ever broken.
+    let bodies = bodies.filter(|bodies| bodies.len() == clauses.len());
+    let mut arities = Vec::with_capacity(clauses.len());
+    for (i, (params, body)) in clauses.iter().enumerate() {
+        arities.push(parse_arity_with_body(
+            &resolve_auto_forms(params, env)?,
+            body,
+            bodies.as_ref().map(|bodies| &bodies[i]),
+        )?);
+    }
+    // The shared bodies are charged to the GC once per site, by the first
+    // closure built from them; later instances charge only their own parts.
+    if let (Some(site), Some(_)) = (site, &bodies)
+        && !site.expansion.claim_function_body_charge()
+    {
+        for arity in &mut arities {
+            arity.charge_body = false;
+        }
+    }
 
     let (closed_over_names, closed_over_vals) =
         super::capture::capture_locals(&arities, name.as_deref(), env);
@@ -297,6 +339,14 @@ fn eval_fn(args: &[Form], env: &mut Env) -> EvalResult {
 
 /// Parse one arity: params-form and body forms.
 pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity> {
+    parse_arity_with_body(params_form, body, None)
+}
+
+fn parse_arity_with_body(
+    params_form: &Form,
+    body: &[Form],
+    prepared_body: Option<&Arc<[Form]>>,
+) -> EvalResult<CljxFnArity> {
     let Some(param_forms) = params_form.as_vector() else {
         return Err(EvalError::Runtime(
             "fn arity params must be a vector".into(),
@@ -356,12 +406,15 @@ pub fn parse_arity(params_form: &Form, body: &[Form]) -> EvalResult<CljxFnArity>
         }
     }
 
-    let body = desugar_pre_post_conditions(body);
+    let body = prepared_body
+        .cloned()
+        .unwrap_or_else(|| desugar_pre_post_conditions(body).into());
 
     Ok(CljxFnArity {
         params,
         rest_param,
-        body: body.into(),
+        body,
+        charge_body: true,
         destructure_params,
         destructure_rest,
         ir_arity_id: crate::interp::arity::fresh_arity_id(),
