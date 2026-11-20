@@ -128,6 +128,17 @@ tests/
                                      a lazy seq and prints live object counts per
                                      consumer (`PROBE_CASE=reduce|loop|fn|recur|retained`,
                                      run with `--ignored --nocapture`) (#537)
+  call_frame_liveness.rs           — asserting form of that probe: `reduce` (2/3-arg,
+                                     alias, heap accumulator), fn `recur` and a final
+                                     `loop` keep live counts flat; globals, later uses,
+                                     captures, `finally` and non-final loops still retain
+                                     the head; reduce/recur edge cases (TreeWalk and
+                                     TieredNoJit) (#538)
+  callback_result_retention.rs     — `sort-by` keys built by a keyfn survive a comparator
+                                     that collects (callback results are re-rooted in
+                                     the native caller's allocation frame)
+  into_transducer_gc.rs            — `(into to xform from)` survives collection between
+                                     reducing steps over a lazy input (#420)
   no_gc_eval.rs                    — (no-gc) arithmetic, def provenance, region stack
   mutator_state.rs                 — virtual threads Phase 0: MutatorState save/restore
                                      between two live evaluations on one thread keeps
@@ -370,6 +381,11 @@ pub fn ir_cache(&self) -> &Arc<tiered::ir_cache::IrCache>;
 /// `on_fn_defined` eagerly lowers only for a tiered runtime with IR live.
 pub fn eval(&self, form: &Form, env: &mut Env) -> EvalResult;
 pub fn call_cljrs_fn(&self, f: &CljxFn, args: &[Value], env: &mut Env) -> EvalResult;
+/// Same dispatch, taking the argument vector: the callee becomes its only
+/// owner, so a parameter its body stops using (a lazy-seq head replaced by
+/// `recur`) is collectable. Only the tree walker takes ownership; compiled
+/// tiers borrow it while it is rooted. `Env::call_cljrs_fn_owned` forwards here.
+pub fn call_cljrs_fn_owned(&self, f: &CljxFn, args: Vec<Value>, env: &mut Env) -> EvalResult;
 pub fn on_fn_defined(&self, f: &CljxFn, env: &mut Env);
 
 /// The namespace a qualified symbol's `ns` part names: a `:require … :as`
@@ -716,7 +732,8 @@ Thread-local eval context for Rust→Clojure callbacks (`invoke`, `with_eval_con
 - `install_eval_context(globals, ns)` — push a previously captured context (spawned threads)
 - `install_eval_context_guard(globals, ns) -> EvalContextGuard` — like `install_eval_context`, but pops on drop (including unwind); used by the JIT-native dispatch seam
 - `current_is_async() -> bool` — whether the innermost context is inside an `^:async` body
-- `invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — call a Clojure-callable value through the innermost context. Honors `^:async` dispatch (via `apply::dispatch_if_async`) so a native/compiled caller of an `^:async` fn gets a `Value::Future`, not a synchronously-run body
+- `invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — call a Clojure-callable value through the innermost context. Honors `^:async` dispatch (via `apply::dispatch_if_async`) so a native/compiled caller of an `^:async` fn gets a `Value::Future`, not a synchronously-run body. The result (or thrown value) is re-rooted in the caller's allocation frame (`cljrs_gc::retain_in_alloc_frame`), so native code may buffer results in Rust storage across later callbacks and collections (e.g. `sort-by` keys)
+- `invoke_owned(f: &Value, args: Vec<Value>) -> ValueResult<Value>` — like `invoke`, but the call runs in its own allocation frame and nothing it allocated stays rooted afterwards; the caller must store the result in rooted storage before its next GC-capable operation. Used by `reduce`'s fold so per-step accumulators are not pinned until the fold returns
 - `with_eval_context(f)` — run a closure with a temporary `Env` built from the innermost context
 - `eval_error_to_value_error(error: EvalError) -> ValueError` — preserve thrown values and resource errors; confirm memory faults for compiled entry points
 
@@ -1055,6 +1072,20 @@ current namespace, so re-evaluating the site does not re-run the macro.
 ### `eval_body(forms, env) -> EvalResult`
 
 Evaluate a sequence of forms, returning the value of the last one.
+
+### `call_cljrs_fn(f, args, env)` / `call_cljrs_fn_owned(f, args: Vec<Value>, env)`
+
+Tree-walk a function call with the recur trampoline. The owned form takes the
+argument vector; once parameters are bound (under GC) it overwrites the vector's
+slots with `nil`, because the environment now owns them, so a consumed
+lazy-sequence head replaced by `recur` is collectable (#538). The borrowed form
+copies the caller's slice. A variadic `recur` keeps its replacement values rooted
+while the rest collection is spread. When the body's final form is a direct
+`(loop [...] ...)`/`loop*`, the parameters it shadows with simple binding names are
+set to `nil` in the parameter frame once its initializers have run
+(`special::eval_fn_tail`): they are hidden for the rest of the call. Loops under
+`if`/`let`/`try`/macros, destructured loop bindings, and parameters a closure
+captured keep their references.
 
 ### `eval_loop(args, env) -> EvalResult`
 

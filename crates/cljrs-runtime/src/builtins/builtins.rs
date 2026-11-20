@@ -37,7 +37,6 @@ use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
 use rand::prelude::SliceRandom;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
@@ -1371,7 +1370,6 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
         ("contains?", Arity::Fixed(2), builtin_contains_q),
         ("merge", Arity::Variadic { min: 0 }, builtin_merge),
         ("into", Arity::Variadic { min: 2 }, builtin_into),
-        ("reduce", Arity::Variadic { min: 2 }, builtin_reduce),
         ("empty", Arity::Fixed(1), builtin_empty),
         ("vec", Arity::Fixed(1), builtin_vec),
         ("object-array", Arity::Fixed(1), builtin_object_array),
@@ -1837,6 +1835,12 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
 
     let docs = [BUILTIN_DOCS, EXPERIMENTAL_DOCS].concat();
     intern_builtins(globals, ns, fns, &docs);
+    intern_native(
+        globals,
+        ns,
+        NativeFn::consuming("reduce", Arity::Variadic { min: 2 }, builtin_reduce),
+        &docs,
+    );
 
     // Math constants.
     globals.intern(
@@ -1854,16 +1858,20 @@ fn intern_builtins(
     fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)>,
     docs: &[(&str, &str)],
 ) {
-    let docs: HashMap<&str, &str> = docs.iter().copied().collect();
     for (name, arity, func) in fns {
-        let nf = NativeFn::new(name, arity, func);
-        let var = globals.intern(ns, Arc::from(name), Value::NativeFunction(GcPtr::new(nf)));
-        if let Some(doc) = docs.get(name) {
-            var.get().set_meta(Value::Map(MapValue::empty().assoc(
-                Value::keyword(Keyword::parse("doc")),
-                Value::string((*doc).to_string()),
-            )));
-        }
+        intern_native(globals, ns, NativeFn::new(name, arity, func), docs);
+    }
+}
+
+/// Intern one native function into `ns`, attaching its `:doc` from `docs`.
+fn intern_native(globals: &Arc<GlobalEnv>, ns: &str, nf: NativeFn, docs: &[(&str, &str)]) {
+    let name = nf.name.clone();
+    let var = globals.intern(ns, name.clone(), Value::NativeFunction(GcPtr::new(nf)));
+    if let Some((_, doc)) = docs.iter().find(|(n, _)| *n == &*name) {
+        var.get().set_meta(Value::Map(MapValue::empty().assoc(
+            Value::keyword(Keyword::parse("doc")),
+            Value::string((*doc).to_string()),
+        )));
     }
 }
 
@@ -4875,38 +4883,75 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
     })
 }
 
-fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
+/// `(reduce f coll)` / `(reduce f init coll)`.
+///
+/// Registered with [`NativeFn::consuming`]: when the caller owns the argument
+/// buffer, the collection (and init) slots are retired so the caller's frame
+/// does not pin the head of a lazy sequence while it is consumed (#538). The
+/// cursor then lives in a [`RootedValueIter`], the only reference to the
+/// unconsumed remainder.
+fn builtin_reduce(args: &mut [Value]) -> ValueResult<Value> {
+    let coll_idx = match args.len() {
+        2 | 3 => args.len() - 1,
+        n => {
+            return Err(ValueError::Other(format!(
+                "reduce requires 2 or 3 args, got {n}"
+            )));
+        }
+    };
+    if !is_seqable(&args[coll_idx]) {
+        return Err(ValueError::WrongType {
+            expected: "seqable",
+            got: args[coll_idx].type_name().to_string(),
+        });
+    }
+    // No GC safepoint runs between taking a slot and rooting its new home.
+    let mut iter = RootedValueIter::new(std::mem::replace(&mut args[coll_idx], Value::Nil));
+    if coll_idx == 2 {
+        let init = std::mem::replace(&mut args[1], Value::Nil);
+        return reduce_from(&args[0], init, &mut iter);
+    }
     let f = &args[0];
-    match args.len() {
-        2 => {
-            // (reduce f coll) — no init value
-            if !is_seqable(&args[1]) {
-                return Err(ValueError::WrongType {
-                    expected: "seqable",
-                    got: args[1].type_name().to_string(),
-                });
-            }
-            let mut iter = ValueIter::new(args[1].clone());
-            let Some(first) = iter.next() else {
-                // empty coll: call (f) for init
-                return crate::env::callback::invoke(f, vec![]);
-            };
-            reduce_from(f, first, &mut iter)
+    let Some(first) = iter.next() else {
+        if let Some(err) = iter.take_error() {
+            return Err(err);
         }
-        3 => {
-            // (reduce f init coll)
-            if !is_seqable(&args[2]) {
-                return Err(ValueError::WrongType {
-                    expected: "seqable",
-                    got: args[2].type_name().to_string(),
-                });
-            }
-            let mut iter = ValueIter::new(args[2].clone());
-            reduce_from(f, args[1].clone(), &mut iter)
-        }
-        n => Err(ValueError::Other(format!(
-            "reduce requires 2 or 3 args, got {n}"
-        ))),
+        // empty coll: call (f) for init
+        return crate::env::callback::invoke(f, vec![]);
+    };
+    reduce_from(f, first, &mut iter)
+}
+
+/// A [`ValueIter`] whose cursor is a GC root.
+///
+/// `ValueIter` roots its cursor only while realizing a `LazySeq`; between
+/// steps it relies on someone else (usually the caller's argument slot)
+/// holding the sequence head. A consumer that retires that slot must root the
+/// cursor itself. The iterator is boxed so the rooted slot never moves, and
+/// the root is declared first so it is released before the box is freed.
+struct RootedValueIter {
+    _root: crate::env::gc_roots::ValueRootGuard,
+    iter: Box<ValueIter>,
+}
+
+impl RootedValueIter {
+    fn new(coll: Value) -> Self {
+        let iter = Box::new(ValueIter::new(coll));
+        let _root = crate::env::gc_roots::root_value(&iter.current);
+        RootedValueIter { _root, iter }
+    }
+}
+
+impl std::ops::Deref for RootedValueIter {
+    type Target = ValueIter;
+    fn deref(&self) -> &ValueIter {
+        &self.iter
+    }
+}
+
+impl std::ops::DerefMut for RootedValueIter {
+    fn deref_mut(&mut self) -> &mut ValueIter {
+        &mut self.iter
     }
 }
 
@@ -4915,18 +4960,30 @@ fn builtin_reduce(args: &[Value]) -> ValueResult<Value> {
 /// The accumulator is held in a box rooted for the whole fold: advancing a
 /// lazy `iter` runs code with GC safepoints while nothing else refers to it.
 /// The box is never moved from, so the root always points at a live `Value`.
+///
+/// Each step runs in its own allocation frame and calls `f` through
+/// [`invoke_owned`](crate::env::callback::invoke_owned): the step's result
+/// goes straight into the rooted box, so the per-step temporaries (and
+/// earlier accumulators) are not pinned until the whole fold returns. The
+/// final value is rooted in the caller's frame like any native's result.
 fn reduce_from(f: &Value, init: Value, iter: &mut ValueIter) -> ValueResult<Value> {
     let mut acc = Box::new(init);
     let _acc_root = crate::env::gc_roots::root_value(&acc);
-    for item in iter.by_ref() {
-        *acc = crate::env::callback::invoke(f, vec![(*acc).clone(), item])?;
+    loop {
+        let _step_frame = cljrs_gc::push_alloc_frame();
+        // `item` is rooted by this step's frame or by the cell it came from
+        // until `invoke_owned` roots its arguments.
+        let Some(item) = iter.next() else { break };
+        *acc = crate::env::callback::invoke_owned(f, vec![(*acc).clone(), item])?;
         if let Value::Reduced(inner) = &*acc {
-            return Ok((**inner).clone());
+            *acc = (**inner).clone();
+            break;
         }
     }
     if let Some(err) = iter.take_error() {
         return Err(err);
     }
+    cljrs_gc::retain_in_alloc_frame(&*acc);
     Ok((*acc).clone())
 }
 

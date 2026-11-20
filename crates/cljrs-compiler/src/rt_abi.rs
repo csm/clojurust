@@ -2122,6 +2122,7 @@ pub unsafe extern "C" fn rt_make_fn(
 
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        consuming_func: None,
         diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name: name.clone(),
@@ -2202,6 +2203,7 @@ pub unsafe extern "C" fn rt_make_fn_variadic(
 
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        consuming_func: None,
         diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name: name.clone(),
@@ -2311,6 +2313,7 @@ pub unsafe extern "C" fn rt_make_fn_multi(
     let fn_name = name.clone();
     let native_fn = cljrs_value::NativeFn {
         blocking_func: None,
+        consuming_func: None,
         diagnostic_id: Default::default(),
         captures: captured_values.clone(),
         name,

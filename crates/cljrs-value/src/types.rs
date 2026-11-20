@@ -1069,6 +1069,15 @@ pub type NativeFnPtr = fn(&[Value]) -> crate::error::ValueResult<Value>;
 /// pointers and closures that capture state.
 pub type NativeFnFunc = Arc<dyn Fn(&[Value]) -> crate::error::ValueResult<Value>>;
 
+/// A native callable that may take ownership of its argument slots.
+///
+/// The caller owns a fixed, GC-rooted argument buffer and lends it mutably.
+/// The callee may move a value out (into storage it roots itself) and leave
+/// `Value::Nil` behind, so the caller's frame no longer pins it — e.g. so
+/// `reduce` does not retain the consumed head of a lazy sequence. The slice
+/// cannot be resized, so the caller's root stays valid.
+pub type NativeConsumingFn = Arc<dyn Fn(&mut [Value]) -> crate::error::ValueResult<Value>>;
+
 #[derive(Clone, Debug)]
 pub enum Arity {
     Fixed(usize),
@@ -1085,6 +1094,10 @@ pub struct NativeFn {
     pub captures: Arc<[Value]>,
     /// Optional adapter that marshals owned inputs and offloads native work.
     pub blocking_func: Option<NativeFnFunc>,
+    /// Optional entry point that may retire argument slots it consumes (see
+    /// [`NativeConsumingFn`]). Callers that own a rooted argument buffer use
+    /// it in preference to `func`; `func` stays a borrowing equivalent.
+    pub consuming_func: Option<NativeConsumingFn>,
 }
 
 impl NativeFn {
@@ -1094,6 +1107,7 @@ impl NativeFn {
             name: name.into(),
             arity,
             blocking_func: None,
+            consuming_func: None,
             captures: Default::default(),
             diagnostic_id: Default::default(),
             func: Arc::new(move |args| {
@@ -1116,6 +1130,7 @@ impl NativeFn {
             name: name.into(),
             arity,
             blocking_func: None,
+            consuming_func: None,
             captures: Default::default(),
             diagnostic_id: Default::default(),
             func: Arc::new(move |args| {
@@ -1140,6 +1155,27 @@ impl NativeFn {
         let shared = captures.clone();
         let mut native = Self::with_closure(name, arity, move |args| func(&shared, args));
         native.captures = captures;
+        native
+    }
+
+    /// Create a native function that may consume its argument slots.
+    ///
+    /// `consuming_func` is used when the caller owns a rooted argument buffer.
+    /// Borrowing callers go through `func`, which copies the arguments into a
+    /// scratch buffer first: the caller's own slots keep every argument alive,
+    /// so retiring the copies is harmless there.
+    pub fn consuming(
+        name: impl Into<Arc<str>>,
+        arity: Arity,
+        func: fn(&mut [Value]) -> crate::ValueResult<Value>,
+    ) -> Self {
+        let mut native = Self::with_closure(name, arity, move |args| func(&mut args.to_vec()));
+        native.consuming_func = Some(Arc::new(move |args| {
+            crate::parking::catch_cancelled(|| {
+                crate::realization::catch(|| func(args))
+                    .unwrap_or_else(|message| Err(crate::ValueError::Other(message)))
+            })?
+        }));
         native
     }
 

@@ -38,7 +38,38 @@ pub(crate) fn eager_lower_enabled() -> bool {
 }
 
 pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
-    let arity = select_arity(f, args.len())?;
+    if let Some(result) = try_compiled(f, args, caller_env) {
+        return result;
+    }
+    // 4. Tree-walking interpreter.
+    crate::interp::apply::call_cljrs_fn(f, args, caller_env)
+}
+
+/// [`call_cljrs_fn`] taking ownership of `args`.
+///
+/// Compiled tiers (JIT-native, IR) borrow the arguments and keep their own
+/// conservative roots; only the tree-walking fallback takes ownership, so it
+/// can release parameters the body no longer uses.
+pub fn call_cljrs_fn_owned(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> EvalResult {
+    {
+        // The caller handed its only copy over: root it while compiled tiers
+        // borrow it.
+        let _args_root = crate::env::gc_roots::root_values(&args);
+        if let Some(result) = try_compiled(f, &args, caller_env) {
+            return result;
+        }
+    }
+    // 4. Tree-walking interpreter.
+    crate::interp::apply::call_cljrs_fn_owned(f, args, caller_env)
+}
+
+/// Steps 1–3 of [`call_cljrs_fn`]: run `f` natively or as IR when available.
+/// `None` means the call must be tree-walked.
+fn try_compiled(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> Option<EvalResult> {
+    let arity = match select_arity(f, args.len()) {
+        Ok(arity) => arity,
+        Err(e) => return Some(Err(e)),
+    };
 
     if !f.is_macro {
         let arity_id = arity.ir_arity_id;
@@ -49,21 +80,19 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         if caller_env.globals.tier_state().jit_enabled()
             && let Some((fn_ptr, epoch)) = caller_env.globals.jit().get_native_fn(arity_id)
         {
-            return call_jit_native(f, fn_ptr, epoch, arity, args, caller_env);
+            return Some(call_jit_native(f, fn_ptr, epoch, arity, args, caller_env));
         }
 
         // 2. IR interpreter (also bumps invocation counter).
         if let Some(result) = try_ir_path(f, arity, args, caller_env) {
-            return result;
+            return Some(result);
         }
 
         // 3. No IR yet — count the tree-walked call; crossing the warm
         //    threshold requests background lowering (Phase 10.7).
         maybe_request_lowering(f, arity_id, caller_env);
     }
-
-    // 4. Tree-walking interpreter.
-    crate::interp::apply::call_cljrs_fn(f, args, caller_env)
+    None
 }
 
 // Thread-local guard to prevent recursive IR lowering.

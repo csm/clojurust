@@ -784,6 +784,68 @@ fn eval_chain_normally(
 // ── loop* / recur ─────────────────────────────────────────────────────────────
 
 pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
+    eval_loop_impl(args, env, None)
+}
+
+/// Evaluate the final form of a tree-walked function body whose parameters
+/// are bound in `env.frames[param_frame]`.
+///
+/// A direct `(loop [...] ...)` / `(loop* [...] ...)` in this position is the
+/// last thing the function does, and its simple binding names hide the
+/// parameters of the same name throughout its body. Once its initializers
+/// have run, such shadowed parameters are unobservable, so they are retired
+/// from the parameter frame: `(defn f [s] (loop [s s] ... (recur (next s))))`
+/// then does not pin the head of `s` for the whole loop (#538).
+///
+/// Anything less direct — a loop under `if`, `let`, `try`, a macro, or with
+/// reader conditionals in its head — is evaluated normally and retains its
+/// outer bindings.
+#[cfg(not(feature = "no-gc"))]
+pub(crate) fn eval_fn_tail(form: &Form, env: &mut Env, param_frame: usize) -> EvalResult {
+    let FormKind::List(parts) = &form.kind else {
+        return eval(form, env);
+    };
+    let Some(head @ ("loop" | "loop*")) = parts.first().and_then(Form::as_symbol) else {
+        return eval(form, env);
+    };
+    if parts
+        .iter()
+        .any(|f| matches!(f.kind, FormKind::ReaderCond { .. }))
+    {
+        return eval(form, env);
+    }
+    // Mirror what `eval` does for any list form before dispatching it.
+    cljrs_value::realization::catch(|| {
+        if !crate::env::gas::charge(1) {
+            return Err(EvalError::GasExhausted);
+        }
+        crate::env::policy::check_special(head)?;
+        eval_loop_impl(&parts[1..], env, Some(param_frame))
+    })
+    .unwrap_or_else(|message| {
+        Err(crate::env::error::value_error_to_eval_error(
+            ValueError::Other(message),
+        ))
+    })
+}
+
+/// Replace with `nil` every binding in `env.frames[frame]` named by a simple
+/// symbol in `patterns`.
+#[cfg(not(feature = "no-gc"))]
+fn retire_shadowed(patterns: &[Form], frame: usize, env: &mut Env) {
+    let Some(frame) = env.frames.get_mut(frame) else {
+        return;
+    };
+    for name in patterns.iter().filter_map(Form::as_symbol) {
+        for (bound, value) in frame.bindings.iter_mut() {
+            if bound.as_ref() == name {
+                *value = Value::Nil;
+            }
+        }
+    }
+}
+
+fn eval_loop_impl(args: &[Form], env: &mut Env, retire_frame: Option<usize>) -> EvalResult {
     let bindings = match args.first().and_then(|f| f.as_vector()) {
         Some(v) => expand_pairs(v)
             .map_err(|_| EvalError::Runtime("loop* binding vector must have even length".into()))?
@@ -818,6 +880,14 @@ pub fn eval_loop(args: &[Form], env: &mut Env) -> EvalResult {
     }
     #[cfg(not(feature = "no-gc"))]
     init_result?;
+    // Every initializer has read the outer bindings it needs; from here on
+    // the loop's own bindings hide the shadowed ones (see `eval_fn_tail`).
+    #[cfg(not(feature = "no-gc"))]
+    if let Some(frame) = retire_frame {
+        retire_shadowed(&patterns, frame, env);
+    }
+    #[cfg(feature = "no-gc")]
+    let _ = retire_frame;
     #[cfg(feature = "no-gc")]
     let mut recur_lease = cljrs_gc::region::RegionLease::for_values(&current_vals);
     #[cfg(feature = "no-gc")]
