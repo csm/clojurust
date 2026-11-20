@@ -135,6 +135,9 @@ The same source-site slot also prepares immutable function bodies once.
 captured values, namespace-dependent parameter resolution, or arity ids.
 The owning function site must not be part of the cached bodies, to avoid an
 Arc cycle. Clearing the macro entry does not clear the immutable bodies.
+`claim_function_body_charge` returns `true` exactly once per slot, so the
+first closure built from the shared bodies is charged for them in the GC and
+later instances are not.
 
 ```rust
 pub struct CachedExpansion { pub macro_id: u64, pub ns: Arc<str>, pub form: Arc<Form> }
@@ -144,6 +147,7 @@ impl ExpansionCache {
     pub fn store(&self, macro_id: u64, ns: Arc<str>, form: Form) -> Arc<Form>
     pub fn clear(&self)
     pub fn function_bodies(&self, prepare: impl FnOnce() -> Vec<Arc<[Form]>>) -> Arc<[Arc<[Form]>]>
+    pub fn claim_function_body_charge(&self) -> bool
 }
 ```
 

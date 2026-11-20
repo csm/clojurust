@@ -122,7 +122,8 @@ tests/
                                      lookup, assoc, dissoc before and after growth (#512)
   closure_body_sharing.rs          — re-evaluating a `fn` literal shares its body
                                      `Arc` across instances while captures, arity ids
-                                     and `::kw` param resolution stay per instance (#537)
+                                     and `::kw` param resolution stay per instance, and
+                                     the body is GC-charged once per site (#537)
   lazy_head_retention_probe.rs     — `#[ignore]`d diagnostic: forces GC while consuming
                                      a lazy seq and prints live object counts per
                                      consumer (`PROBE_CASE=reduce|loop|fn|recur|retained`,
@@ -1199,7 +1200,8 @@ helper for `Delay`.
 used by the tree-walker when an immutable source form is available. Function
 literals prepare their desugared bodies once in the source site's cache;
 instances share those `Arc<[Form]>` bodies while retaining fresh captures and
-arity ids. Parameter auto-keywords are still resolved per evaluation. The
+arity ids. Only the first instance from a site is GC-charged for the shared
+body (`CljxFnArity::charge_body`). Parameter auto-keywords are still resolved per evaluation. The
 public `eval_special` and synthesized `defn`/`letfn` paths keep the uncached
 fallback, and temporary reader-conditional expansions do not populate a site.
 

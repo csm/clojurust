@@ -105,3 +105,60 @@ fn sharing_body_does_not_cache_parameter_namespace_resolution() {
         .join()
         .unwrap();
 }
+
+#[test]
+fn shared_body_is_charged_to_the_gc_once_per_site() {
+    use cljrs_gc::Trace as _;
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let _mutator = cljrs_gc::register_mutator();
+            let globals = cljrs_runtime::Runtime::builder()
+                .execution_mode(cljrs_runtime::ExecutionMode::TreeWalk)
+                .build()
+                .unwrap()
+                .into_globals();
+            let mut env = Env::new(globals, "user");
+            let body = (0..100)
+                .map(|i| format!("(+ x n {i})"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eval(&format!("(defn make-fn [n] (fn [x] {body}))"), &mut env);
+
+            let charges: Vec<(usize, usize)> = (0..50)
+                .map(|i| {
+                    let Value::Fn(f) = eval(&format!("(make-fn {i})"), &mut env) else {
+                        panic!("closure")
+                    };
+                    let f = f.get();
+                    (f.gc_size_extra(), f.arities[0].body_heap_size())
+                })
+                .collect();
+
+            // The first instance pays for the live shared body…
+            let (first_total, first_body) = charges[0];
+            assert!(first_body > 10_000, "body is accounted: {first_body}");
+            assert!(first_total > first_body);
+            // …and every later one only for its own per-instance parts, so
+            // instantiating N closures does not report N bodies.
+            for &(total, body) in &charges[1..] {
+                assert_eq!(body, 0);
+                assert_eq!(total, first_total - first_body);
+            }
+            let reported: usize = charges.iter().map(|(t, _)| t).sum();
+            assert!(
+                reported < 2 * first_total,
+                "50 closures reported {reported} bytes; one body is {first_body}"
+            );
+
+            // A fn built without a stable site (here, from `eval` of fresh
+            // data each time) still charges its own body in full.
+            let Value::Fn(g) = eval("(eval '(fn [x] (+ x 1) (+ x 2)))", &mut env) else {
+                panic!("closure")
+            };
+            assert!(g.get().arities[0].body_heap_size() > 0);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -1,4 +1,5 @@
 use std::mem;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cljrs_types::span::Span;
@@ -369,6 +370,8 @@ pub struct ExpansionCache(OnceLock<Arc<ExpansionSlot>>);
 struct ExpansionSlot {
     expansion: Mutex<Option<Arc<CachedExpansion>>>,
     function_bodies: OnceLock<Arc<[Arc<[Form]>]>>,
+    /// Set once a closure instance has been charged for `function_bodies`.
+    function_bodies_charged: AtomicBool,
 }
 
 impl ExpansionCache {
@@ -423,6 +426,21 @@ impl ExpansionCache {
             .function_bodies
             .get_or_init(|| prepare().into())
             .clone()
+    }
+
+    /// Claim the GC charge for this site's shared [`Self::function_bodies`].
+    ///
+    /// Returns `true` exactly once per slot: the first closure instantiated
+    /// from the site pays for the body syntax, and later instances, which
+    /// share the same `Arc`s, pay only for their per-instance parts. When that
+    /// first closure is collected the bodies stay alive in this cache
+    /// uncharged, like the source form itself (the same approximation
+    /// persistent collections make for structurally shared nodes).
+    pub fn claim_function_body_charge(&self) -> bool {
+        !self
+            .slot()
+            .function_bodies_charged
+            .swap(true, Ordering::Relaxed)
     }
 
     /// A handle to the same slot, for a clone of the owning form.

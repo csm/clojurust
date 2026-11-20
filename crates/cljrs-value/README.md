@@ -551,6 +551,7 @@ pub struct CljxFnArity {
     pub params: Vec<Arc<str>>,        // positional param names
     pub rest_param: Option<Arc<str>>, // name after & (if any)
     pub body: Arc<[Form]>,            // forms in this arity's body (shared by clones)
+    pub charge_body: bool,            // false when another closure from the same site pays for `body`
     pub param_hints: Vec<Option<TypeHint>>, // primitive type hint per param (^long, …)
     pub rest_hint: Option<TypeHint>,         // hint on the rest param (rarely used)
     // (also: destructure_params, destructure_rest, ir_arity_id)
@@ -567,6 +568,12 @@ pub struct CljxFn {
     pub self_ptr: Option<GcPtr<CljxFn>>, // back-pointer for named-fn pointer identity (issue #194)
 }
 ```
+
+`CljxFnArity::heap_size()` is what `CljxFn::gc_size_extra` charges per arity;
+`body_heap_size()` is its body share, which is 0 when `charge_body` is false.
+Closures re-instantiated from one `fn` source site share their body `Arc`, and
+only the first is charged for it (see `ExpansionCache::claim_function_body_charge`
+in `cljrs-reader`), so N closures account one body, not N.
 
 `is_async` is set by the interpreter when a `fn`/`defn` carries `^:async` (or an
 `{:async true}` attr-map). `CljxFn::new` defaults it to `false`;

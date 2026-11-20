@@ -298,6 +298,15 @@ fn eval_fn_at_site(site: Option<&Form>, args: &[Form], env: &mut Env) -> EvalRes
             bodies.as_ref().map(|bodies| &bodies[i]),
         )?);
     }
+    // The shared bodies are charged to the GC once per site, by the first
+    // closure built from them; later instances charge only their own parts.
+    if let (Some(site), Some(_)) = (site, &bodies)
+        && !site.expansion.claim_function_body_charge()
+    {
+        for arity in &mut arities {
+            arity.charge_body = false;
+        }
+    }
 
     let (closed_over_names, closed_over_vals) =
         super::capture::capture_locals(&arities, name.as_deref(), env);
@@ -405,6 +414,7 @@ fn parse_arity_with_body(
         params,
         rest_param,
         body,
+        charge_body: true,
         destructure_params,
         destructure_rest,
         ir_arity_id: crate::interp::arity::fresh_arity_id(),
