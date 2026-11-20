@@ -199,7 +199,7 @@ fn scan(v: &Value) -> Scan {
                 return Opaque;
             }
             match &*p.get().state.lock().unwrap() {
-                LazySeqState::Forced(v) => t.join(scan(v)),
+                LazySeqState::Forced(v) | LazySeqState::Thrown(v) => t.join(scan(v)),
                 LazySeqState::Error(_) => t,
                 LazySeqState::Pending(_) | LazySeqState::Realizing { .. } => Opaque,
             }
@@ -210,7 +210,7 @@ fn scan(v: &Value) -> Scan {
                 return Opaque;
             }
             match &*p.get().state.lock().unwrap() {
-                DelayState::Forced(v) => t.join(scan(v)),
+                DelayState::Forced(v) | DelayState::Thrown(v) => t.join(scan(v)),
                 DelayState::Pending(_) | DelayState::Realizing { .. } => Opaque,
                 DelayState::Error(_) => t,
             }

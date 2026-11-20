@@ -688,6 +688,7 @@ pub enum LazySeqState {
     Realizing { owner: Realizer, thunk: Rc<dyn Thunk> },
     Forced(Value),
     Error(String),
+    Thrown(Value), // thunk threw a Clojure value; cached and traced
 }
 pub struct LazySeq { pub state: TrackedMutex<LazySeqState> }
 impl LazySeq {
@@ -704,8 +705,13 @@ The realization state retains the traced thunk while user code runs without the 
 Other fibers wait for the result. Cancellation or a panic restores `Pending` and wakes waiters so another reader can retry.
 A thunk reports cancellation as `ValueError::Cancelled`, which is returned typed and never
 cached; returning an error (rather than unwinding) keeps a caller's locks unpoisoned.
+A thunk error of `ValueError::Thrown(v)` (a Clojure `throw` / `ex-info`) is published like a
+forced result, cached as `Thrown(v)`, and returned as `ValueError::Thrown(v)` to this and
+every later reader, so `catch` sees the original exception with its `ex-data`.
 Any other thunk error is cached as its message and returned as `ValueError::Other`, so a
 real exception raised during cancellation cleanup is still an ordinary, catchable error.
+`LazySeq::error()` reports a cached thrown value by its display form. `Delay` caches
+failures the same way.
 
 `Realizer` identifies both monitor owners and realization owners.
 `ensure_can_wait` rejects a carrier wait on a fiber that needs the same thread to resume.
@@ -803,6 +809,7 @@ pub enum DelayState {
     Realizing { owner: Realizer, thunk: Rc<dyn Thunk> },
     Forced(Value),
     Error(String),
+    Thrown(Value), // as LazySeqState::Thrown
 }
 pub struct Delay { pub state: TrackedMutex<DelayState> }
 impl Delay {

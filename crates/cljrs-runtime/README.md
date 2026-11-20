@@ -124,6 +124,12 @@ tests/
                                      `Arc` across instances while captures, arity ids
                                      and `::kw` param resolution stay per instance, and
                                      the body is GC-charged once per site (#537)
+  lazy_thrown_identity.rs          — an `ex-info` thrown while a lazy seq or
+                                     delay realizes is caught as the original
+                                     value (`ex-message` / `ex-data` exact) through
+                                     reduce, into+xform, doall, seq, deref, in
+                                     TreeWalk and Tiered; a cached failure
+                                     re-throws the identical value
   lazy_head_retention_probe.rs     — `#[ignore]`d diagnostic: forces GC while consuming
                                      a lazy seq and prints live object counts per
                                      consumer (`PROBE_CASE=reduce|loop|fn|recur|retained`,
@@ -447,10 +453,15 @@ installed by `cljrs-tx`.
 - `eval_error_to_thunk_error(error: EvalError) -> ValueError` — the error a
   `Thunk::force` implementation returns: `EvalError::Cancelled` stays
   `ValueError::Cancelled` (so lazy cells leave the thunk pending instead of
-  caching it); every other error becomes `ValueError::Other(message)`.
+  caching it); `EvalError::Thrown(v)` stays `ValueError::Thrown(v)` (so the
+  lazy cell caches and re-throws the original exception, keeping `ex-message`
+  / `ex-data`); every other error becomes `ValueError::Other(message)`.
+  Compiled-code thunks (`rt_lazy_seq` in `cljrs-compiler`) keep `Thrown` the
+  same way.
 - `realize_error_to_eval_error(error: ValueError) -> EvalError` — a
   `LazySeq::try_realize` / `Delay::force` error as an `EvalError::Runtime`,
-  keeping `ValueError::Cancelled` as the uncatchable `EvalError::Cancelled`.
+  keeping `ValueError::Cancelled` as the uncatchable `EvalError::Cancelled`
+  and `ValueError::Thrown(v)` as `EvalError::Thrown(v)`.
 - `value_error_to_eval_error(err: ValueError) -> EvalError` — surface a builtin's
   `ValueError` as a *catchable* `EvalError::Thrown(Value::Error(..))`, preserving
   the original variant and its plain message (no `runtime error:` prefix) so

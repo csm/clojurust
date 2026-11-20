@@ -1382,8 +1382,10 @@ impl cljrs_gc::Trace for BoundFn {
 
 /// A deferred computation that produces a `Value` when forced.
 pub trait Thunk: std::fmt::Debug + cljrs_gc::Trace {
-    /// Errors other than `crate::ValueError::Cancelled` are cached as their message.
-    /// A thunk interrupted by fiber cancellation must return
+    /// A `crate::ValueError::Thrown` error is cached as the thrown value, so
+    /// every reader sees the original exception (`ex-message`, `ex-data`).
+    /// Other errors except `crate::ValueError::Cancelled` are cached as their
+    /// message. A thunk interrupted by fiber cancellation must return
     /// `crate::ValueError::Cancelled`, so the cell stays pending for other readers.
     fn force(&self) -> crate::ValueResult<Value>;
 }
@@ -1462,6 +1464,9 @@ pub enum LazySeqState {
     Forced(Value),
     /// Thunk evaluation failed; error message is cached.
     Error(String),
+    /// Thunk evaluation threw a Clojure value (`throw` / `ex-info`); the
+    /// thrown value is cached so every reader re-throws the same exception.
+    Thrown(Value),
 }
 
 /// A lazy sequence that caches its result and retries interrupted realizations.
@@ -1498,7 +1503,9 @@ impl LazySeq {
 
     /// Realize a sequence with explicit errors, including unsafe carrier waits.
     /// A rejected wait does not change the thunk or its realization state.
-    /// Cached and ordinary errors are `crate::ValueError::Other`; a thunk cancelled
+    /// A thrown Clojure value (fresh or cached) is `crate::ValueError::Thrown`
+    /// with the original value; other cached and ordinary errors are
+    /// `crate::ValueError::Other`; a thunk cancelled
     /// with its fiber returns `crate::ValueError::Cancelled` and stays pending.
     pub fn try_realize(&self) -> crate::ValueResult<Value> {
         let owner = Realizer::current();
@@ -1513,6 +1520,12 @@ impl LazySeq {
                     return Ok(value);
                 }
                 LazySeqState::Error(error) => return Err(crate::ValueError::Other(error.clone())),
+                LazySeqState::Thrown(thrown) => {
+                    let thrown = thrown.clone();
+                    drop(state);
+                    crate::publish::read_slot(self as *const _ as usize, 0);
+                    return Err(crate::ValueError::Thrown(thrown));
+                }
                 LazySeqState::Realizing { owner: active, .. } => {
                     if *active == owner {
                         return Ok(Value::Nil);
@@ -1552,12 +1565,18 @@ impl LazySeq {
                 drop(guard);
                 return Err(crate::ValueError::Cancelled);
             }
+            Err(crate::ValueError::Thrown(thrown)) => {
+                let thrown = crate::publish::publish_for_owner(thrown, self as *const _ as usize);
+                *self.state.lock().unwrap() = LazySeqState::Thrown(thrown.clone());
+                Err(crate::ValueError::Thrown(thrown))
+            }
             Err(error) => {
                 let message = thunk_error_message(error);
                 *self.state.lock().unwrap() = LazySeqState::Error(message.clone());
                 Err(crate::ValueError::Other(message))
             }
         };
+        let published = matches!(result, Ok(_) | Err(crate::ValueError::Thrown(_)));
         drop(thunk);
         #[cfg(feature = "no-gc")]
         cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
@@ -1566,7 +1585,7 @@ impl LazySeq {
             &Default::default(),
         );
         guard.lazy = None;
-        if result.is_ok() {
+        if published {
             crate::publish::read_slot(self as *const _ as usize, 0);
         }
         self.ready.notify_all();
@@ -1574,12 +1593,13 @@ impl LazySeq {
     }
 
     /// Return the cached error message, if the thunk failed.
+    /// For a cached thrown value this is the value's display form.
     pub fn error(&self) -> Option<String> {
         let guard = self.state.lock().unwrap();
-        if let LazySeqState::Error(e) = &*guard {
-            Some(e.clone())
-        } else {
-            None
+        match &*guard {
+            LazySeqState::Error(e) => Some(e.clone()),
+            LazySeqState::Thrown(v) => Some(v.to_string()),
+            _ => None,
         }
     }
 }
@@ -1625,7 +1645,7 @@ impl cljrs_gc::Trace for LazySeq {
             match &*state {
                 LazySeqState::Pending(thunk) => thunk.trace(visitor),
                 LazySeqState::Realizing { thunk, .. } => thunk.trace(visitor),
-                LazySeqState::Forced(v) => v.trace(visitor),
+                LazySeqState::Forced(v) | LazySeqState::Thrown(v) => v.trace(visitor),
                 LazySeqState::Error(_) => {}
             }
         }
@@ -1741,6 +1761,8 @@ impl cljrs_gc::Trace for Volatile {
 /// Internal state of a delay cell.
 pub enum DelayState {
     Error(String),
+    /// The thunk threw a Clojure value; it is cached and re-thrown as is.
+    Thrown(Value),
     Pending(Rc<dyn Thunk>),
     Realizing {
         owner: Realizer,
@@ -1778,6 +1800,12 @@ impl Delay {
                     return Ok(value);
                 }
                 DelayState::Error(e) => return Err(crate::ValueError::Other(e.clone())),
+                DelayState::Thrown(thrown) => {
+                    let thrown = thrown.clone();
+                    drop(state);
+                    crate::publish::read_slot(self as *const _ as usize, 0);
+                    return Err(crate::ValueError::Thrown(thrown));
+                }
                 DelayState::Realizing { owner: active, .. } => {
                     if *active == owner {
                         return Err(crate::ValueError::Other(
@@ -1817,13 +1845,18 @@ impl Delay {
                 drop(guard);
                 return Err(crate::ValueError::Cancelled);
             }
-            Err(error) => Err(thunk_error_message(error)),
+            Err(crate::ValueError::Thrown(thrown)) => Err(crate::ValueError::Thrown(
+                crate::publish::publish_for_owner(thrown, self as *const _ as usize),
+            )),
+            Err(error) => Err(crate::ValueError::Other(thunk_error_message(error))),
         };
         *self.state.lock().unwrap() = match &result {
             Ok(value) => DelayState::Forced(value.clone()),
-            Err(error) => DelayState::Error(error.clone()),
+            Err(crate::ValueError::Thrown(thrown)) => DelayState::Thrown(thrown.clone()),
+            Err(crate::ValueError::Other(error)) => DelayState::Error(error.clone()),
+            Err(_) => unreachable!("delay errors are Thrown or Other"),
         };
-        let result = result.map_err(crate::ValueError::Other);
+        let published = matches!(result, Ok(_) | Err(crate::ValueError::Thrown(_)));
         drop(thunk);
         #[cfg(feature = "no-gc")]
         cljrs_gc::region::AllocationOwner::for_address(self as *const _ as usize).set_slot(
@@ -1832,7 +1865,7 @@ impl Delay {
             &Default::default(),
         );
         guard.delay = None;
-        if result.is_ok() {
+        if published {
             crate::publish::read_slot(self as *const _ as usize, 0);
         }
         self.ready.notify_all();
@@ -1843,7 +1876,7 @@ impl Delay {
     pub fn is_realized(&self) -> bool {
         matches!(
             &*self.state.lock().unwrap(),
-            DelayState::Forced(_) | DelayState::Error(_)
+            DelayState::Forced(_) | DelayState::Error(_) | DelayState::Thrown(_)
         )
     }
 }
@@ -1889,6 +1922,7 @@ impl cljrs_gc::Trace for Delay {
             match &*state {
                 DelayState::Pending(thunk) => thunk.trace(visitor),
                 DelayState::Realizing { thunk, .. } => thunk.trace(visitor),
+                DelayState::Thrown(v) => v.trace(visitor),
                 DelayState::Error(_) => {}
                 DelayState::Forced(v) => v.trace(visitor),
             }
