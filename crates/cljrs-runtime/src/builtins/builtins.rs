@@ -4820,19 +4820,13 @@ fn builtin_into(args: &[Value]) -> ValueResult<Value> {
         )));
         // Apply xform to conj
         let xf_rf = crate::env::callback::invoke(xform, vec![conj_rf])?;
-        // Reduce over from with xf_rf
-        let mut acc = to.clone();
+        // The transformed reducer exists only in this Rust local, which is
+        // not a GC root; realizing a lazy `from` can collect between steps
+        // (#420), so root it across the fold and the completion call.
+        let _xf_rf_root = crate::env::gc_roots::root_value(&xf_rf);
         let mut iter = ValueIter::new(from.clone());
-        for item in iter.by_ref() {
-            acc = crate::env::callback::invoke(&xf_rf, vec![acc, item])?;
-            if let Value::Reduced(inner) = acc {
-                acc = (*inner).clone();
-                break;
-            }
-        }
-        if let Some(err) = iter.take_error() {
-            return Err(err);
-        }
+        // `reduce_from` keeps the accumulator in a rooted, stable box.
+        let mut acc = reduce_from(&xf_rf, to.clone(), &mut iter)?;
         // Call completion arity
         acc = crate::env::callback::invoke(&xf_rf, vec![acc])?;
         if let Value::Reduced(inner) = acc {
