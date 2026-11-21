@@ -166,12 +166,22 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
 /// allocation root the call leaves behind.
 ///
 /// Unlike [`invoke`], nothing the callee allocated — including the returned
-/// or thrown value — stays rooted once this returns. The caller must store the
-/// result in rooted storage before its next GC-capable operation (allocation
-/// alone does not collect; safepoints, callbacks and lazy realization can).
+/// value — stays rooted once this returns. The caller must store the result
+/// in rooted storage before its next GC-capable operation (allocation alone
+/// does not collect; safepoints, callbacks and lazy realization can).
+///
+/// A thrown value is the exception: it is re-rooted in the caller's frame, as
+/// [`invoke`] does, so it survives however far it unwinds before a `catch`
+/// binds it. Throws are rare, so this cannot accumulate in a hot loop.
 pub fn invoke_owned(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
-    let _frame = cljrs_gc::push_alloc_frame();
-    invoke_unscoped(f, args)
+    let result = {
+        let _frame = cljrs_gc::push_alloc_frame();
+        invoke_unscoped(f, args)
+    };
+    if let Err(ValueError::Thrown(value)) = &result {
+        cljrs_gc::retain_in_alloc_frame(value);
+    }
+    result
 }
 
 fn invoke_unscoped(f: &Value, args: Vec<Value>) -> ValueResult<Value> {

@@ -495,7 +495,9 @@ fn apply_value_inner(callee: &Value, mut args: Vec<Value>, env: &mut Env) -> Eva
             }
             // Unroot before handing the vector over: the callee roots it
             // itself, and may free this buffer (on `recur`) while the call
-            // is still running.
+            // is still running. Until it does, `args` is unrooted: no GC
+            // safepoint may run between here and the callee's root (debug
+            // builds assert this; see `gc_roots::unrooted_handoff`).
             drop(_args_root);
             env.call_cljrs_fn_owned(f.get(), args)
         }

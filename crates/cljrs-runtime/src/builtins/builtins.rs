@@ -37,6 +37,7 @@ use num_rational::Ratio;
 use num_traits::{FromPrimitive, Signed as _, ToPrimitive, Zero as _};
 use rand::prelude::SliceRandom;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::num::ParseFloatError;
 use std::ops::{Add, Sub};
 use std::str::FromStr;
@@ -1834,13 +1835,16 @@ pub fn register_all(globals: &Arc<GlobalEnv>, ns: &str) {
     ];
 
     let docs = [BUILTIN_DOCS, EXPERIMENTAL_DOCS].concat();
-    intern_builtins(globals, ns, fns, &docs);
-    intern_native(
-        globals,
-        ns,
-        NativeFn::consuming("reduce", Arity::Variadic { min: 2 }, builtin_reduce),
-        &docs,
-    );
+    let natives = fns
+        .into_iter()
+        .map(|(name, arity, func)| NativeFn::new(name, arity, func))
+        // Natives that may retire the argument slots they consume.
+        .chain([NativeFn::consuming(
+            "reduce",
+            Arity::Variadic { min: 2 },
+            builtin_reduce,
+        )]);
+    intern_natives(globals, ns, natives, &docs);
 
     // Math constants.
     globals.intern(
@@ -1858,20 +1862,30 @@ fn intern_builtins(
     fns: Vec<(&str, Arity, fn(&[Value]) -> ValueResult<Value>)>,
     docs: &[(&str, &str)],
 ) {
-    for (name, arity, func) in fns {
-        intern_native(globals, ns, NativeFn::new(name, arity, func), docs);
-    }
+    let natives = fns
+        .into_iter()
+        .map(|(name, arity, func)| NativeFn::new(name, arity, func));
+    intern_natives(globals, ns, natives, docs);
 }
 
-/// Intern one native function into `ns`, attaching its `:doc` from `docs`.
-fn intern_native(globals: &Arc<GlobalEnv>, ns: &str, nf: NativeFn, docs: &[(&str, &str)]) {
-    let name = nf.name.clone();
-    let var = globals.intern(ns, name.clone(), Value::NativeFunction(GcPtr::new(nf)));
-    if let Some((_, doc)) = docs.iter().find(|(n, _)| *n == &*name) {
-        var.get().set_meta(Value::Map(MapValue::empty().assoc(
-            Value::keyword(Keyword::parse("doc")),
-            Value::string((*doc).to_string()),
-        )));
+/// Intern native functions into `ns`, attaching the `:doc` meta named in
+/// `docs` (the last entry wins for a repeated name).
+fn intern_natives(
+    globals: &Arc<GlobalEnv>,
+    ns: &str,
+    natives: impl IntoIterator<Item = NativeFn>,
+    docs: &[(&str, &str)],
+) {
+    let docs: HashMap<&str, &str> = docs.iter().copied().collect();
+    for nf in natives {
+        let name = nf.name.clone();
+        let var = globals.intern(ns, name.clone(), Value::NativeFunction(GcPtr::new(nf)));
+        if let Some(doc) = docs.get(&*name) {
+            var.get().set_meta(Value::Map(MapValue::empty().assoc(
+                Value::keyword(Keyword::parse("doc")),
+                Value::string((*doc).to_string()),
+            )));
+        }
     }
 }
 

@@ -335,7 +335,10 @@ pub fn eval_call(
             crate::env::gc_roots::gc_safepoint(env)?;
         }
         // Hand the arguments over: keeping a caller copy would pin each
-        // argument (e.g. a lazy-seq head) for the whole call.
+        // argument (e.g. a lazy-seq head) for the whole call. `args` is
+        // unrooted from here until the callee roots it; no GC safepoint may
+        // run in between (debug builds assert this; see
+        // `gc_roots::unrooted_handoff`).
         return env.call_cljrs_fn_owned(f.get(), args);
     }
 
@@ -610,6 +613,9 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 /// pinned by this frame. Callers that pass a vector they still read must use
 /// [`call_cljrs_fn`] instead.
 pub fn call_cljrs_fn_owned(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> EvalResult {
+    // The caller unrooted `args` before handing them over; nothing here may
+    // reach a GC safepoint until the loop below roots them (debug-checked).
+    let mut handoff = Some(crate::env::gc_roots::unrooted_handoff());
     let arity = select_arity(f, args.len())?;
 
     // Register the caller's env as a GC root so its local bindings survive
@@ -627,6 +633,7 @@ pub fn call_cljrs_fn_owned(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -
         // Root current_args on the shadow stack so they survive GC.
         // They haven't been bound into the env yet.
         let _args_root = crate::env::gc_roots::root_values(&current_args);
+        handoff.take();
 
         // GC safepoint before entering function body
         crate::env::gc_roots::gc_safepoint(&env)?;
