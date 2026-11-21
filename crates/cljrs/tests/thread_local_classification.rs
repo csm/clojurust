@@ -214,6 +214,13 @@ const CLASSIFICATION: &[(&str, &str, Class)] = &[
         Fiber("cljrs-runtime/OPTION_VALUE_ROOTS"),
     ),
     (
+        "cljrs-runtime/src/env/gc_roots.rs",
+        "UNROOTED_HANDOFFS",
+        Thread(
+            "debug-only count of open owned-argument hand-offs; each opens and closes within one synchronous call prologue that never parks",
+        ),
+    ),
+    (
         "cljrs-runtime/src/env/dynamics.rs",
         "BINDING_STACK",
         Fiber("cljrs-runtime/BINDING_STACK"),
