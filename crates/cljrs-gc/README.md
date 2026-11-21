@@ -67,7 +67,10 @@ src/
   gc_header       — (GC mode only) GcBoxHeader, drop/trace fns
   gc_full         — (GC mode only) GcHeap, HeapProxy, HEAP (per-isolate proxy),
                     ALLOC_ROOTS, AllocRootGuard (push_alloc_frame();
-                    release() unroots the frame's allocations so far)
+                    release() unroots the frame's allocations so far),
+                    retain_in_alloc_frame(&impl Trace) (roots a value's
+                    immediate references in the current frame without
+                    marking them; a no-op stub under no-gc)
   nogc_stubs      — (no-gc mode) stub GcHeap, GcConfig, cancellation stubs
   static_arena.rs — (no-gc mode) global program-lifetime bump allocator;
                     in debug builds, tracks chunk ranges for is_static_addr()

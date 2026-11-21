@@ -144,6 +144,36 @@ pub fn push_env_root(env: &Env) -> EnvRootGuard {
     EnvRootGuard
 }
 
+// ── Unrooted argument hand-off (debug check) ──────────────────────────────
+//
+// An owned call (`call_cljrs_fn_owned`) receives an argument vector that the
+// caller has already unrooted: the callee may free that buffer on `recur`, so
+// the caller cannot keep a root on it. Until the callee roots the vector
+// itself, no GC safepoint may run. Debug builds count open hand-offs and
+// `gc_safepoint` asserts there are none.
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static UNROOTED_HANDOFFS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks an owned argument vector as unrooted until the guard drops.
+pub(crate) struct UnrootedHandoff(());
+
+/// Open an unrooted hand-off window; drop the guard once the vector is rooted.
+pub(crate) fn unrooted_handoff() -> UnrootedHandoff {
+    #[cfg(debug_assertions)]
+    UNROOTED_HANDOFFS.with(|n| n.set(n.get() + 1));
+    UnrootedHandoff(())
+}
+
+impl Drop for UnrootedHandoff {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        UNROOTED_HANDOFFS.with(|n| n.set(n.get() - 1));
+    }
+}
+
 /// Register a single Value as a GC root.
 pub fn root_value(val: &cljrs_value::Value) -> ValueRootGuard {
     let entry = (val as *const cljrs_value::Value, 1);
@@ -235,6 +265,14 @@ pub fn force_collect(env: &Env) {
 /// [`EvalError::MemoryLimitExceeded`] otherwise.  Under `no-gc` there is no
 /// collection; region scopes release their memory as they exit.
 pub fn gc_safepoint(env: &Env) -> EvalResult<()> {
+    #[cfg(debug_assertions)]
+    UNROOTED_HANDOFFS.with(|n| {
+        debug_assert_eq!(
+            n.get(),
+            0,
+            "GC safepoint reached while an owned argument vector is unrooted"
+        )
+    });
     fiber_safepoint(env)?;
     #[cfg(not(feature = "no-gc"))]
     collect_if_needed(env);

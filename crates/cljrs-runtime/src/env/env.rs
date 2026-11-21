@@ -817,6 +817,33 @@ impl GlobalEnv {
         }
     }
 
+    /// [`call_cljrs_fn`](Self::call_cljrs_fn), handing over ownership of the
+    /// argument vector.
+    ///
+    /// The caller keeps no copy of the arguments, so once the callee has bound
+    /// its parameters the call frame is the only owner: a parameter the body
+    /// stops using (e.g. a consumed lazy-sequence head replaced by `recur`)
+    /// becomes collectable. Paths that cannot take ownership fall back to the
+    /// borrowing call while keeping `args` rooted.
+    #[inline(always)]
+    pub fn call_cljrs_fn_owned(
+        &self,
+        func: &CljxFn,
+        args: Vec<Value>,
+        env: &mut Env,
+    ) -> EvalResult {
+        match self.execution_mode {
+            ExecutionMode::TreeWalk => crate::interp::apply::call_cljrs_fn_owned(func, args, env),
+            ExecutionMode::Tiered | ExecutionMode::TieredNoJit => {
+                crate::tiered::apply::call_cljrs_fn_owned(func, args, env)
+            }
+            ExecutionMode::NoGcTransaction => {
+                let _args_root = crate::env::gc_roots::root_values(&args);
+                crate::env::depth::call_cljrs_fn(func, &args, env)
+            }
+        }
+    }
+
     /// Notify the active tier that a new `fn*` was defined.
     ///
     /// In a tiered runtime with IR enabled this eagerly lowers the function
@@ -1229,6 +1256,13 @@ impl Env {
     pub fn call_cljrs_fn(&mut self, func: &CljxFn, args: &[Value]) -> EvalResult {
         let globals = self.globals.clone();
         globals.call_cljrs_fn(func, args, self)
+    }
+
+    /// See [`GlobalEnv::call_cljrs_fn_owned`].
+    #[inline(always)]
+    pub fn call_cljrs_fn_owned(&mut self, func: &CljxFn, args: Vec<Value>) -> EvalResult {
+        let globals = self.globals.clone();
+        globals.call_cljrs_fn_owned(func, args, self)
     }
 
     #[inline(always)]

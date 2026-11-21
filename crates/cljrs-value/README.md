@@ -1140,6 +1140,22 @@ checks arity and rejects a missing adapter before execution.
 Typed interop exports install an adapter that enforces `Send + 'static` for worker inputs and outputs.
 Ordinary `func` calls retain their original behavior.
 
+## Consuming native functions
+
+`NativeFn` also has an optional `consuming_func: Option<NativeConsumingFn>` field,
+where `NativeConsumingFn = Arc<dyn Fn(&mut [Value]) -> ValueResult<Value>>`.
+Every other constructor leaves it empty; struct literals must set it (usually `None`).
+
+`NativeFn::consuming(name, arity, func: fn(&mut [Value]) -> ValueResult<Value>) -> NativeFn`
+registers a function that may take ownership of argument slots. A caller that owns a
+fixed, GC-rooted argument buffer (the runtime's `apply_value`) lends it mutably; the
+callee may move a value into storage it roots itself and leave `Value::Nil` behind, so
+the caller's frame stops pinning it (core `reduce` retires its collection so a consumed
+lazy prefix is collectable). The slice cannot be resized, so the caller's root stays
+valid. `func` is a borrowing adapter that copies the arguments first; there the caller's
+own slots keep everything alive. The property travels with the function object, so
+aliases keep it.
+
 In `no-gc` builds, `publish::publish_value` retains backing scopes at explicit program-lifetime boundaries.
 All values preserve identity and laziness; publication does not serialize them.
 `publish::publish_return(value)` transfers results into the caller or its active `ReadScope`.

@@ -435,7 +435,7 @@ pub fn apply_value(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResul
     )
 }
 
-fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalResult {
+fn apply_value_inner(callee: &Value, mut args: Vec<Value>, env: &mut Env) -> EvalResult {
     // Root the callee and args so they survive any GC triggered at the safepoint.
     // These values are on the Rust stack but not yet in any Env frame.
     let _callee_root = crate::env::gc_roots::root_value(callee);
@@ -481,13 +481,25 @@ fn apply_value_inner(callee: &Value, args: Vec<Value>, env: &mut Env) -> EvalRes
             let _context = crate::env::callback::scoped_eval_context(env);
             let _native_frame =
                 cljrs_gc::fiber::native_frame(&nf.get().name, &nf.get().diagnostic_id);
-            (nf.get().func)(&args).map_err(crate::env::error::value_error_to_eval_error)
+            // This frame owns the rooted argument buffer, so a consuming
+            // native may retire the slots it takes over (see `NativeFn::consuming`).
+            match &nf.get().consuming_func {
+                Some(consume) => consume(&mut args),
+                None => (nf.get().func)(&args),
+            }
+            .map_err(crate::env::error::value_error_to_eval_error)
         }
         Value::Fn(f) => {
             if let Some(fut) = dispatch_if_async(callee, &args, env) {
                 return Ok(fut);
             }
-            env.call_cljrs_fn(f.get(), &args)
+            // Unroot before handing the vector over: the callee roots it
+            // itself, and may free this buffer (on `recur`) while the call
+            // is still running. Until it does, `args` is unrooted: no GC
+            // safepoint may run between here and the callee's root (debug
+            // builds assert this; see `gc_roots::unrooted_handoff`).
+            drop(_args_root);
+            env.call_cljrs_fn_owned(f.get(), args)
         }
         Value::BoundFn(bf) => {
             let bf_ref = bf.get();

@@ -330,9 +330,16 @@ pub fn eval_call(
         if let Some(fut) = crate::env::apply::dispatch_if_async(&callee, &args, env) {
             return Ok(fut);
         }
-        let _args_root = crate::env::gc_roots::root_values(&args);
-        crate::env::gc_roots::gc_safepoint(env)?;
-        return env.call_cljrs_fn(f.get(), &args);
+        {
+            let _args_root = crate::env::gc_roots::root_values(&args);
+            crate::env::gc_roots::gc_safepoint(env)?;
+        }
+        // Hand the arguments over: keeping a caller copy would pin each
+        // argument (e.g. a lazy-seq head) for the whole call. `args` is
+        // unrooted from here until the callee roots it; no GC safepoint may
+        // run in between (debug builds assert this; see
+        // `gc_roots::unrooted_handoff`).
+        return env.call_cljrs_fn_owned(f.get(), args);
     }
 
     crate::env::apply::apply_value(&callee, args, env)
@@ -594,6 +601,21 @@ pub fn resolve_type_tag(sym: &str) -> Arc<str> {
 
 /// Tree-walking execution path (original implementation).
 pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalResult {
+    // The caller keeps its own slots, so they stay live for the whole call.
+    call_cljrs_fn_owned(f, args.to_vec(), caller_env)
+}
+
+/// Tree-walk `f` applied to `args`, taking ownership of the argument vector.
+///
+/// After the parameters are bound the environment owns them, so (under GC)
+/// the argument slots are cleared: a parameter the body stops using — such as
+/// a lazy-sequence head that `recur` replaces with its `next` — is no longer
+/// pinned by this frame. Callers that pass a vector they still read must use
+/// [`call_cljrs_fn`] instead.
+pub fn call_cljrs_fn_owned(f: &CljxFn, args: Vec<Value>, caller_env: &mut Env) -> EvalResult {
+    // The caller unrooted `args` before handing them over; nothing here may
+    // reach a GC safepoint until the loop below roots them (debug-checked).
+    let mut handoff = Some(crate::env::gc_roots::unrooted_handoff());
     let arity = select_arity(f, args.len())?;
 
     // Register the caller's env as a GC root so its local bindings survive
@@ -604,13 +626,14 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
     // This ensures macros qualify symbols relative to their definition site.
     let mut env = Env::with_closure(caller_env.globals.clone(), &f.defining_ns, f);
 
-    let mut current_args = Vec::from(args);
+    let mut current_args = args;
     #[cfg(feature = "no-gc")]
     let mut recur_lease = cljrs_gc::region::RegionLease::default();
     loop {
         // Root current_args on the shadow stack so they survive GC.
         // They haven't been bound into the env yet.
         let _args_root = crate::env::gc_roots::root_values(&current_args);
+        handoff.take();
 
         // GC safepoint before entering function body
         crate::env::gc_roots::gc_safepoint(&env)?;
@@ -648,6 +671,11 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
 
         // Bind params.
         bind_fn_params(arity, &current_args, &mut env)?;
+        // The frame now owns the parameters; drop this duplicate so a value
+        // the body releases (e.g. a consumed sequence head) is collectable.
+        // Overwrite in place: `_args_root` still points at these slots.
+        #[cfg(not(feature = "no-gc"))]
+        current_args.iter_mut().for_each(|slot| *slot = Value::Nil);
 
         // Eval body, catching Recur.
         // Under no-gc: evaluate in scratch, then transfer the return value's
@@ -667,6 +695,10 @@ pub fn call_cljrs_fn(f: &CljxFn, args: &[Value], caller_env: &mut Env) -> EvalRe
         match result {
             Ok(v) => return Ok(v),
             Err(EvalError::Recur(new_args)) => {
+                // The old parameter frame is gone and `current_args` was
+                // cleared, so these values are rooted only here. Spreading a
+                // variadic tail can realize a lazy seq and collect.
+                let _new_args_root = crate::env::gc_roots::root_values(&new_args);
                 // For variadic arities, recur provides n+1 values where the
                 // last value IS the rest collection (not spread args to be
                 // re-collected). Flatten it so bind_fn_params sees the right
@@ -769,13 +801,19 @@ fn bind_fn_params_impl(
 }
 
 /// Eval a function body, propagating Recur up (does not catch it).
+///
+/// The parameters are bound in the top frame of `env`; a direct final `loop`
+/// may retire the ones it shadows (see `special::eval_fn_tail`).
 #[cfg(not(feature = "no-gc"))]
 fn eval_body_recur_fn(body: &[cljrs_reader::Form], env: &mut Env) -> EvalResult {
-    let mut result = Value::Nil;
-    for form in body {
-        result = eval(form, env)?;
+    let Some((last, init)) = body.split_last() else {
+        return Ok(Value::Nil);
+    };
+    for form in init {
+        eval(form, env)?;
     }
-    Ok(result)
+    let param_frame = env.frames.len() - 1;
+    crate::interp::special::eval_fn_tail(last, env, param_frame)
 }
 
 /// Evaluate the body in scratch, then transfer returned backing scopes to the

@@ -45,14 +45,15 @@ pub use config::{GC_CANCELLATION as CONFIG_CANCELLATION, GcConfig, GcParked};
 
 #[cfg(not(feature = "no-gc"))]
 pub use gc_full::{
-    AllocRootGuard, GcHeap, HEAP, HeapProxy, push_alloc_frame, trace_thread_alloc_roots,
+    AllocRootGuard, GcHeap, HEAP, HeapProxy, push_alloc_frame, retain_in_alloc_frame,
+    trace_thread_alloc_roots,
 };
 #[cfg(feature = "no-gc")]
 pub use nogc_stubs::{
     AllocRootGuard, CONFIG_CANCELLATION, GcConfig, GcHeap, GcParked, HEAP, MutatorGuard, StwGuard,
     begin_stw, check_cancellation, gc_requested, park_thread, push_alloc_frame, register_mutator,
-    registered_threads, request_gc, safepoint, take_gc_request, unpark_thread,
-    wait_for_threads_to_park,
+    registered_threads, request_gc, retain_in_alloc_frame, safepoint, take_gc_request,
+    unpark_thread, wait_for_threads_to_park,
 };
 
 /// Return `true` if `addr` was allocated by the global `StaticArena`.
@@ -276,6 +277,9 @@ mod nogc_box {
 #[derive(Default)]
 pub struct MarkVisitor {
     pub(crate) grey: Vec<*mut GcBoxHeader>,
+    /// Record the immediately reachable headers in `grey` without marking
+    /// them (see [`retain_in_alloc_frame`]).
+    pub(crate) collect_only: bool,
 }
 
 #[cfg(feature = "no-gc")]
@@ -323,6 +327,10 @@ impl MarkVisitor {
 
     pub unsafe fn mark_header(&mut self, header: *mut GcBoxHeader) {
         use gc_header::GC_INITIAL_LIVES;
+        if self.collect_only {
+            self.grey.push(header);
+            return;
+        }
         let h = unsafe { &*header };
         if h.lives.get() < GC_INITIAL_LIVES {
             h.lives.set(GC_INITIAL_LIVES);
@@ -356,6 +364,10 @@ impl GcVisitor for MarkVisitor {
             return;
         }
         let raw = ptr.raw();
+        if self.collect_only {
+            self.grey.push(raw as *mut GcBoxHeader);
+            return;
+        }
         let header = unsafe { &(*raw).header };
         if header.lives.get() < GC_INITIAL_LIVES {
             header.lives.set(GC_INITIAL_LIVES);
@@ -1345,6 +1357,24 @@ mod gc_full {
         ALLOC_ROOTS.with(|roots| roots.borrow_mut().push(header));
     }
 
+    /// Root the objects `value` refers to directly in the current allocation
+    /// frame, as if they had just been allocated there.
+    ///
+    /// A callee that scopes its own allocations in a frame unroots them when
+    /// it returns. A native caller that keeps the result only in Rust storage
+    /// (e.g. buffering keys across further callbacks) uses this to keep it
+    /// alive until the caller's own frame ends. Only the immediate references
+    /// are recorded, and their mark state is left untouched; a collection
+    /// traces their children from these roots as usual.
+    pub fn retain_in_alloc_frame(value: &impl Trace) {
+        let mut visitor = MarkVisitor {
+            grey: Vec::new(),
+            collect_only: true,
+        };
+        value.trace(&mut visitor);
+        ALLOC_ROOTS.with(|roots| roots.borrow_mut().extend(visitor.grey));
+    }
+
     pub fn trace_thread_alloc_roots(visitor: &mut MarkVisitor) {
         ALLOC_ROOTS.with(|roots| {
             let roots = roots.borrow();
@@ -1488,6 +1518,7 @@ mod nogc_stubs {
     pub fn push_alloc_frame() -> AllocRootGuard {
         AllocRootGuard
     }
+    pub fn retain_in_alloc_frame<T: crate::Trace>(_value: &T) {}
 }
 
 // =============================================================================

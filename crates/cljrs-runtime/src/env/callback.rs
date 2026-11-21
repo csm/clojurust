@@ -145,7 +145,46 @@ where
     f(&mut env)
 }
 
+/// Call `f` with `args` from native code.
+///
+/// The result (or thrown value) is rooted in the caller's current allocation
+/// frame, as if the caller had allocated it, so a native caller may keep it
+/// in plain Rust storage — e.g. buffer keys across later callbacks and
+/// collections — until its own frame ends. A hot loop that roots each result
+/// itself should use [`invoke_owned`] instead, so per-call results do not
+/// accumulate in that frame.
 pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
+    let result = invoke_unscoped(f, args);
+    match &result {
+        Ok(value) | Err(ValueError::Thrown(value)) => cljrs_gc::retain_in_alloc_frame(value),
+        Err(_) => {}
+    }
+    result
+}
+
+/// Call `f` with `args`, transferring the arguments and releasing every
+/// allocation root the call leaves behind.
+///
+/// Unlike [`invoke`], nothing the callee allocated — including the returned
+/// value — stays rooted once this returns. The caller must store the result
+/// in rooted storage before its next GC-capable operation (allocation alone
+/// does not collect; safepoints, callbacks and lazy realization can).
+///
+/// A thrown value is the exception: it is re-rooted in the caller's frame, as
+/// [`invoke`] does, so it survives however far it unwinds before a `catch`
+/// binds it. Throws are rare, so this cannot accumulate in a hot loop.
+pub fn invoke_owned(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
+    let result = {
+        let _frame = cljrs_gc::push_alloc_frame();
+        invoke_unscoped(f, args)
+    };
+    if let Err(ValueError::Thrown(value)) = &result {
+        cljrs_gc::retain_in_alloc_frame(value);
+    }
+    result
+}
+
+fn invoke_unscoped(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
     let (globals, ns) = EVAL_CONTEXT.with(|stack| {
         let s = stack.borrow();
         let ec = s
@@ -166,7 +205,7 @@ pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
             if let Some(fut) = crate::env::apply::dispatch_if_async(f, &args, &env) {
                 Ok(fut)
             } else {
-                env.call_cljrs_fn(cljx_fn.get(), &args)
+                env.call_cljrs_fn_owned(cljx_fn.get(), args)
             }
         } else {
             crate::env::apply::apply_value(f, args, &mut env)
