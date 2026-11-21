@@ -22,6 +22,14 @@ src/
              SuspendKind.  Async-state-machine instructions (StateStore,
              StateLoad, AsyncSuspend, AsyncResume) and the poll-function markers
              on IrFunction (is_async_poll_fn, async_resume_blocks) live here.
+  fnref.rs — the one exhaustive definition of function-reference sites
+             (subfunction names, AllocClosure arity names, CallWithRegion /
+             CallDirect targets): visitors and the tree remapper that every
+             clone/rename pass must use (issue #509)
+  verify.rs — function-reference verifier: unique definitions, targets
+             resolve under the engines' lookup rules, calling conventions
+             (hidden region param, arity) match; PassChecker runs it at every
+             optimize_with_externals pass boundary in debug builds
   osr.rs  — OSR-entry transform (Phase 10.4): build_osr_function rewrites a
              function so its entry jumps straight to a hot loop header, with
              live-in values (loop φs + pre-loop defs) arriving as parameters
@@ -81,6 +89,8 @@ tests/
   core_shadowing.rs       — call-position core resolution: locals, namespace
                             shadows and qualified symbols (issue #337)
   escape_regression.rs    — escape-analysis regression tests
+  fnref_verify.rs         — references stay valid across nested and sibling
+                            stage-4 specialisations; dangling targets rejected
   numeric_literals.rs     — numeric-literal lowering regression tests
 ```
 
@@ -494,6 +504,60 @@ pub struct OsrFunction {
 /// Tier 1) if the header is unknown or live-ins exceed MAX_OSR_PARAMS.
 pub fn build_osr_function(orig: &IrFunction, header: BlockId) -> Result<OsrFunction, String>;
 ```
+
+### Function references (`fnref` module)
+
+```rust
+pub enum FnRefKind { Definition, ClosureArity { index: usize }, CallWithRegion, CallDirect }
+
+/// `.method` interop markers in `CallDirect` are not function references.
+pub fn is_interop_marker(name: &str) -> bool;
+/// Visit the reference uses in one instruction (exhaustive match, no `_` arm).
+pub fn for_each_inst_fn_ref(inst: &Inst, f: impl FnMut(FnRefKind, &Arc<str>));
+pub fn for_each_inst_fn_ref_mut(inst: &mut Inst, f: impl FnMut(FnRefKind, &mut Arc<str>));
+/// Visit definitions (root included) and uses throughout a tree.
+pub fn for_each_fn_ref(root: &IrFunction, f: &mut impl FnMut(&IrFunction, FnRefKind, &Arc<str>));
+/// Rename definitions *and* uses together through `map`.
+pub fn remap_fn_refs(root: &mut IrFunction, map: &HashMap<Arc<str>, Arc<str>>);
+pub fn remap_fn_refs_with(root: &mut IrFunction, f: &mut impl FnMut(FnRefKind, &str) -> Option<Arc<str>>);
+/// Names of every subfunction at any depth (root excluded).
+pub fn subfunction_names(root: &IrFunction) -> Vec<Arc<str>>;
+```
+
+`ClosureTemplate::name` (the fn value's display name) and
+`LoadGlobal`/`LoadVar`/`DefVar` names are deliberately *not* function
+references.
+
+### Function-reference verification (`verify` module)
+
+```rust
+pub struct FnRefError { pub function: String, pub location: Option<(BlockId, usize)>,
+                        pub inst: Option<String>, pub problem: FnRefProblem }
+pub enum FnRefProblem {
+    DuplicateDefinition { name },
+    Unresolved { kind, target },
+    Incompatible { kind, target, reason },
+    MalformedTemplate { reason },
+}
+/// All failures in the tree (not just the first).
+pub fn verify_fn_refs(root: &IrFunction) -> Result<(), Vec<FnRefError>>;
+pub fn format_errors(errors: &[FnRefError]) -> String;
+/// `RegionParam` in the entry block ⇒ region-parameterised variant.
+pub fn takes_region(f: &IrFunction) -> bool;
+/// Debug checkpoint: `new(source, input)` then `after(pass, f)`; panics
+/// naming the stage that broke a reference.
+pub struct PassChecker;
+```
+
+Rules (mirroring the engines): named functions are unique across the tree
+(codegen declares them all); `CallWithRegion` targets and `AllocClosure`
+arity names resolve among the *direct* subfunctions of the containing fn
+(the IR interpreter's rule); a `CallWithRegion` target takes the hidden
+region param and matches the call's arity, and its region operand is a
+`RegionStart`/`RegionParam` handle; a closure arity takes
+`captures + fixed (+ rest)` params and no region; a `CallDirect` name not
+defined in the tree is a legitimate external, otherwise it must match the
+target's arity and must not target a region variant.
 
 ### Source mapping
 

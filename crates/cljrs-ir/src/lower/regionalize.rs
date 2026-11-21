@@ -308,68 +308,30 @@ fn alloc_operands(inst: &Inst) -> Vec<VarId> {
 }
 
 /// Recursively rename every named subfunction in `func` (and its nested
-/// subfunctions) by appending `suffix`, and rewrite every by-name reference to
-/// a renamed function: `AllocClosure` `arity_fn_names`, and `CallWithRegion` /
-/// `CallDirect` targets.
+/// subfunctions) by appending `suffix`, together with every reference to a
+/// renamed function.
+///
+/// The definition/reference pairing is delegated to
+/// [`crate::fnref::remap_fn_refs`], the single exhaustive list of
+/// function-reference sites (closure arities, `CallWithRegion` and
+/// `CallDirect` targets), so a new reference-bearing instruction cannot be
+/// missed here (issue #506 / #509).
 ///
 /// Without this rename the cloned IR tree would contain duplicates of every
 /// inner closure's arity-fn, and codegen's `declare_subfunctions` would call
 /// `declare_function` twice with the same name → `Module(DuplicateDefinition)`.
 fn rename_inner_subfunctions(func: &mut IrFunction, suffix: &str) {
-    // Pass 1: collect old → new name mapping by walking every subfunction
-    // (including recursively nested ones).
-    let mut name_map: HashMap<Arc<str>, Arc<str>> = HashMap::new();
-    fn collect(f: &IrFunction, suffix: &str, map: &mut HashMap<Arc<str>, Arc<str>>) {
-        for sub in &f.subfunctions {
-            if let Some(name) = &sub.name {
-                let new_name: Arc<str> = Arc::from(format!("{name}{suffix}").as_str());
-                map.insert(name.clone(), new_name);
-            }
-            collect(sub, suffix, map);
-        }
-    }
-    collect(func, suffix, &mut name_map);
-    if name_map.is_empty() {
-        return;
-    }
-
-    // Pass 2: rewrite `arity_fn_names` references in every `AllocClosure`
-    // throughout the tree, and update each subfunction's own `name` field.
-    fn rewrite(f: &mut IrFunction, map: &HashMap<Arc<str>, Arc<str>>) {
-        for block in &mut f.blocks {
-            for inst in block.phis.iter_mut().chain(block.insts.iter_mut()) {
-                match inst {
-                    Inst::AllocClosure(_, tmpl, _) => {
-                        for n in &mut tmpl.arity_fn_names {
-                            if let Some(new_name) = map.get(n) {
-                                *n = new_name.clone();
-                            }
-                        }
-                    }
-                    // Direct by-name calls into a renamed subfunction — e.g. a
-                    // `CallWithRegion` to a region-specialised callee that an
-                    // earlier promotion attached to this (now cloned) function.
-                    // Leaving these stale makes the target unresolvable
-                    // (issue #506).
-                    Inst::CallWithRegion(_, target, _, _) | Inst::CallDirect(_, target, _) => {
-                        if let Some(new_name) = map.get(target) {
-                            *target = new_name.clone();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        for sub in &mut f.subfunctions {
-            if let Some(name) = &sub.name
-                && let Some(new_name) = map.get(name)
-            {
-                sub.name = Some(new_name.clone());
-            }
-            rewrite(sub, map);
-        }
-    }
-    rewrite(func, &name_map);
+    let name_map: HashMap<Arc<str>, Arc<str>> = crate::fnref::subfunction_names(func)
+        .into_iter()
+        .map(|name| {
+            let new_name: Arc<str> = Arc::from(format!("{name}{suffix}").as_str());
+            (name, new_name)
+        })
+        .collect();
+    // The root keeps its name here — `specialize` assigns the variant's name.
+    let root_name = func.name.take();
+    crate::fnref::remap_fn_refs(func, &name_map);
+    func.name = root_name;
 }
 
 /// Clone `original` and rewrite each `Returns` alloc in `targets` as

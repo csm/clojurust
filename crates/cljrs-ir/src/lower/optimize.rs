@@ -1018,13 +1018,29 @@ pub fn optimize_with_externals(
     ir_func: IrFunction,
     externals: &[super::escape::ExternalDefn],
 ) -> (IrFunction, UsedExternals) {
+    // Debug builds verify function references at every pass boundary, so a
+    // dangling or mis-convention target is reported against the pass that
+    // created it instead of surfacing later as an interpreter lookup failure
+    // or codegen error (issue #509).
+    #[cfg(debug_assertions)]
+    let checker = crate::verify::PassChecker::new("lowering", &ir_func);
+    macro_rules! checkpoint {
+        ($pass:literal, $f:expr) => {
+            #[cfg(debug_assertions)]
+            checker.after($pass, &$f);
+        };
+    }
+
     let ir_func = fuse_eager_hofs(ir_func);
+    checkpoint!("fuse_eager_hofs", ir_func);
     // Inlining is deliberately unit-local (it builds its own registry):
     // splicing an external body into the caller would carry the same
     // staleness obligations for a much larger set of call shapes.
     let ir_func = inline_pass(ir_func);
+    checkpoint!("inline", ir_func);
     let ctx = make_context_with_externals(&ir_func, externals);
     let ir_func = optimize_tree(ir_func, &ctx);
+    checkpoint!("optimize_tree", ir_func);
     let mut used = ctx.take_used_externals();
 
     // Stage 4 needs a fresh analysis context because the local pass may have
@@ -1032,8 +1048,11 @@ pub fn optimize_with_externals(
     // per-function summaries the original `ctx` carries.
     let ctx2 = make_context_with_externals(&ir_func, externals);
     let ir_func = promote_cross_fn_allocs(ir_func, &ctx2);
+    checkpoint!("promote_cross_fn_allocs", ir_func);
     used.extend(ctx2.take_used_externals());
 
     // Stage 5: function-scope regions for scalar-returning functions.
-    (wrap_scalar_returning(ir_func), used)
+    let ir_func = wrap_scalar_returning(ir_func);
+    checkpoint!("wrap_scalar_returning", ir_func);
+    (ir_func, used)
 }
