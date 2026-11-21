@@ -91,19 +91,23 @@ impl EvalError {
 }
 
 /// A `Thunk::force` error: cancellation stays typed, so lazy cells do not
-/// cache it; every other failure becomes its message, as before.
+/// cache it; a thrown value stays `ValueError::Thrown`, so the lazy cell
+/// caches and re-throws the original exception (`ex-message` / `ex-data`
+/// intact); every other failure becomes its message, as before.
 pub fn eval_error_to_thunk_error(error: EvalError) -> ValueError {
     match error {
         EvalError::Cancelled => ValueError::Cancelled,
+        EvalError::Thrown(value) => ValueError::Thrown(value),
         other => ValueError::Other(other.to_string()),
     }
 }
 
 /// A realization error (`LazySeq::try_realize`, `Delay::force`) as a runtime
-/// error, keeping cancellation uncatchable.
+/// error, keeping cancellation uncatchable and a thrown value as itself.
 pub fn realize_error_to_eval_error(error: ValueError) -> EvalError {
     match error {
         ValueError::Cancelled => EvalError::Cancelled,
+        ValueError::Thrown(value) => EvalError::Thrown(value),
         other => EvalError::Runtime(other.to_string()),
     }
 }
