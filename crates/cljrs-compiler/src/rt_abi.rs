@@ -3275,7 +3275,7 @@ pub unsafe extern "C" fn rt_lazy_seq(thunk_fn: *const Value) -> *const Value {
         fn force(&self) -> cljrs_value::ValueResult<Value> {
             let _root = cljrs_runtime::env::gc_roots::root_value(&self.0);
             cljrs_runtime::env::callback::invoke(&self.0, vec![]).map_err(|e| match e {
-                cljrs_value::ValueError::Cancelled => e,
+                cljrs_value::ValueError::Cancelled | cljrs_value::ValueError::Thrown(_) => e,
                 other => cljrs_value::ValueError::Other(format!("{other}")),
             })
         }
