@@ -28,6 +28,7 @@ histories! {
     retained_old_warmed_after_consumer => RETAINED_OLD_WARMED_AFTER_CONSUMER,
     rebind_between_snapshot_and_publish => REBIND_BETWEEN_SNAPSHOT_AND_PUBLISH,
     rebind_while_queued => REBIND_WHILE_QUEUED,
+    rebind_after_dequeue => REBIND_AFTER_DEQUEUE,
     rebind_between_publish_and_register => REBIND_BETWEEN_PUBLISH_AND_REGISTER,
     nested_region_bottom_up => NESTED_REGION_BOTTOM_UP,
     nested_region_top_down => NESTED_REGION_TOP_DOWN,
@@ -42,7 +43,7 @@ histories! {
 fn matrix_is_covered() {
     assert_eq!(
         ALL.len(),
-        11,
+        12,
         "add a `histories!` entry for the new history"
     );
 }

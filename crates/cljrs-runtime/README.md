@@ -1582,6 +1582,7 @@ pub struct SyncTimeout { waiting_for, last_phase, pending_lower, pending_jit } /
 
 pub fn note_enqueued(Worker);        // count a request before handing it over
 pub fn note_finished(Worker);        // ... and when it is done (or refused)
+pub fn pending(Worker) -> usize;     // accepted and not yet finished
 pub fn checkpoint(Phase, name: Option<&str>); // worker side; parks if the phase is armed
 pub fn note_invalidated();           // a rebind dropped dependent IR
 pub fn invalidations() -> u64;

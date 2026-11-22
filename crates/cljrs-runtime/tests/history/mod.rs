@@ -164,6 +164,10 @@ pub enum Op {
     AwaitPaused(Phase),
     /// Let a parked worker continue.
     Release,
+    /// Exactly this many lowering requests are queued or running.  Checked
+    /// only where lowering is in the background; with the worker parked it
+    /// proves a later request is still waiting in the queue.
+    AssertQueued(usize),
     /// Record the outcome of `form` for cross-configuration comparison.
     Observe(&'static str),
     /// Record the outcome of `form` and check it against the specification.
@@ -222,11 +226,18 @@ fn replay_thread() -> &'static Mutex<Sender<Job>> {
                     let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         check(&history, &configs, &mut runtimes, &mut next_ns)
                     }))
-                    .unwrap_or_else(|p| {
-                        // Never leave the worker parked for the next history.
-                        sync::release();
-                        Err(panic_text(&p))
-                    });
+                    .unwrap_or_else(|p| Err(panic_text(&p)));
+                    // Never leave the worker parked, or its request pending,
+                    // for the next history: a failed step returns early from
+                    // `replay` without reaching its own release.  Whatever
+                    // the verdict, disarm and drain so a later history's
+                    // first wait reports its own state, not this one's.
+                    sync::release();
+                    let verdict = match (verdict, sync::wait_idle(STEP_TIMEOUT)) {
+                        (Err(e), _) => Err(e),
+                        (Ok(()), Err(t)) => Err(format!("after the history: {t}")),
+                        (Ok(()), Ok(())) => Ok(()),
+                    };
                     let _ = reply.send(verdict);
                 }
             })
@@ -364,9 +375,15 @@ fn replay(
                 sync::wait_paused(phase, STEP_TIMEOUT).map_err(|e| fail(e.to_string()))?
             }
             Op::Release if config.background => sync::release(),
+            Op::AssertQueued(n) if config.background => {
+                let got = sync::pending(sync::Worker::Lower);
+                if got != n {
+                    return Err(fail(format!("{got} lowering requests pending")));
+                }
+            }
             // Nothing lowers in the background here: the pause would never
             // be reached, and the history's other ops still run in order.
-            Op::PauseAt(_) | Op::AwaitPaused(_) | Op::Release => {}
+            Op::PauseAt(_) | Op::AwaitPaused(_) | Op::Release | Op::AssertQueued(_) => {}
             Op::Observe(form) => transcript.push((step, form, outcome(env, form))),
             Op::Expect(form, want) => {
                 let got = outcome(env, form);
@@ -482,11 +499,39 @@ pub const REBIND_BETWEEN_SNAPSHOT_AND_PUBLISH: History = History {
     ],
 };
 
-/// `leaf`'s own lowering request is queued when `leaf` is rebound: the old
-/// body's IR may be published for the old value, but must never be
-/// registered as the implementation a consumer specializes against.
+/// `leaf`'s own lowering request is still waiting in the queue — the worker
+/// is held on an earlier request — when `leaf` is rebound.  The old body's IR
+/// may be published for the old value, but must never be registered as the
+/// implementation a consumer specializes against.
 pub const REBIND_WHILE_QUEUED: History = History {
     name: "rebind-while-queued",
+    ops: &[
+        Eval("(defn blocker [x] [x])"),
+        Eval("(defn leaf [x] [x])"),
+        PauseAt(Phase::Dequeued),
+        Call("(blocker 7)", PROMOTE_CALLS),
+        AwaitPaused(Phase::Dequeued),
+        Call("(leaf 7)", PROMOTE_CALLS),
+        // The parked `blocker` request plus `leaf`'s, still in the channel.
+        AssertQueued(2),
+        Eval("(defn leaf [x] [x x])"),
+        Release,
+        Settle,
+        // The current `leaf` is never promoted, so if the stale request had
+        // registered the old body, `consumer` would specialize against it.
+        Eval("(defn consumer [x] (count (leaf x)))"),
+        Promote("(consumer 7)"),
+        AssertPromoted("consumer"),
+        Expect("(consumer 7)", V("2")),
+        Expect("(blocker 7)", V("[7]")),
+    ],
+};
+
+/// `leaf`'s lowering request has been taken off the queue but not yet
+/// lowered when `leaf` is rebound — the window just after
+/// [`REBIND_WHILE_QUEUED`]'s.
+pub const REBIND_AFTER_DEQUEUE: History = History {
+    name: "rebind-after-dequeue",
     ops: &[
         Eval("(defn leaf [x] [x])"),
         PauseAt(Phase::Dequeued),
@@ -495,8 +540,9 @@ pub const REBIND_WHILE_QUEUED: History = History {
         Eval("(defn leaf [x] [x x])"),
         Release,
         Settle,
+        // The current `leaf` is never promoted, so if the stale request had
+        // registered the old body, `consumer` would specialize against it.
         Eval("(defn consumer [x] (count (leaf x)))"),
-        Promote("(leaf 7)"),
         Promote("(consumer 7)"),
         AssertPromoted("consumer"),
         Expect("(consumer 7)", V("2")),
@@ -660,6 +706,7 @@ pub const ALL: &[History] = &[
     RETAINED_OLD_WARMED_AFTER_CONSUMER,
     REBIND_BETWEEN_SNAPSHOT_AND_PUBLISH,
     REBIND_WHILE_QUEUED,
+    REBIND_AFTER_DEQUEUE,
     REBIND_BETWEEN_PUBLISH_AND_REGISTER,
     NESTED_REGION_BOTTOM_UP,
     NESTED_REGION_TOP_DOWN,

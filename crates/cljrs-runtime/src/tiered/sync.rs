@@ -152,6 +152,15 @@ pub fn note_enqueued(worker: Worker) {
     }
 }
 
+/// Requests `worker` has accepted and not yet finished.
+pub fn pending(worker: Worker) -> usize {
+    let st = state();
+    match worker {
+        Worker::Lower => st.pending_lower,
+        Worker::Jit => st.pending_jit,
+    }
+}
+
 /// Count a request `worker` has finished (or failed to accept).
 pub fn note_finished(worker: Worker) {
     let mut st = state();
