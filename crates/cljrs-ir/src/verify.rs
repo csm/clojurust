@@ -117,6 +117,11 @@ pub fn verify_fn_refs(root: &IrFunction) -> Result<(), Vec<FnRefError>> {
 
     // Tree-wide definitions.
     let mut defs: HashMap<Arc<str>, &IrFunction> = HashMap::new();
+    // The root is a definition too: codegen declares it alongside its
+    // subfunctions, and a `CallDirect` naming it must be convention-checked.
+    if let Some(name) = &root.name {
+        defs.insert(name.clone(), root);
+    }
     collect_defs(root, &mut defs, &mut errors);
 
     verify_fn(root, &defs, &mut errors);
@@ -218,7 +223,12 @@ fn verify_fn(f: &IrFunction, defs: &HashMap<Arc<str>, &IrFunction>, errors: &mut
 
             if let Inst::AllocClosure(_, tmpl, _) = inst {
                 let n = tmpl.arity_fn_names.len();
-                if n != 0 && (tmpl.param_counts.len() != n || tmpl.is_variadic.len() != n) {
+                // The per-arity vectors must always agree — with no arity
+                // names the interpreter falls back to positional subfunctions
+                // and still indexes `is_variadic` by `param_counts`.
+                if tmpl.param_counts.len() != tmpl.is_variadic.len()
+                    || (n != 0 && tmpl.param_counts.len() != n)
+                {
                     site_errors.push(FnRefProblem::MalformedTemplate {
                         reason: format!(
                             "{n} arity names, {} param counts, {} variadic flags",
@@ -447,6 +457,54 @@ mod tests {
         assert!(matches!(
             &errs[0].problem,
             FnRefProblem::DuplicateDefinition { name } if name.as_ref() == "dup"
+        ));
+    }
+
+    #[test]
+    fn root_name_counts_as_a_definition() {
+        // Root and child share a name.
+        let mut root = func("dup", 0, vec![]);
+        root.subfunctions.push(func("dup", 0, vec![]));
+        let errs = verify_fn_refs(&root).unwrap_err();
+        assert!(matches!(
+            &errs[0].problem,
+            FnRefProblem::DuplicateDefinition { name } if name.as_ref() == "dup"
+        ));
+
+        // A CallDirect to the root is convention-checked, not external.
+        let root = func(
+            "root",
+            1,
+            vec![Inst::CallDirect(VarId(1), Arc::from("root"), vec![])],
+        );
+        let errs = verify_fn_refs(&root).unwrap_err();
+        assert!(matches!(
+            &errs[0].problem,
+            FnRefProblem::Incompatible { target, .. } if target.as_ref() == "root"
+        ));
+    }
+
+    #[test]
+    fn nameless_template_lengths_are_checked() {
+        let root = func(
+            "root",
+            0,
+            vec![Inst::AllocClosure(
+                VarId(20),
+                ClosureTemplate {
+                    name: None,
+                    arity_fn_names: vec![],
+                    param_counts: vec![1],
+                    is_variadic: vec![],
+                    capture_names: vec![],
+                },
+                vec![],
+            )],
+        );
+        let errs = verify_fn_refs(&root).unwrap_err();
+        assert!(matches!(
+            errs[0].problem,
+            FnRefProblem::MalformedTemplate { .. }
         ));
     }
 
