@@ -474,6 +474,7 @@ pub fn install_invalidation_hook() {
             if deps.is_empty() {
                 return;
             }
+            crate::tiered::sync::note_invalidated();
             for tiers in crate::tiered::tiers::live() {
                 for &dep in &deps {
                     // Remove the stale cached IR; `try_ir_path` re-lowers on

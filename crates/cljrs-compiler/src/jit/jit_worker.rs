@@ -81,6 +81,7 @@ fn worker_loop(rx: Receiver<CompileRequest>) {
                 }
             }
         }
+        cljrs_runtime::tiered::sync::note_finished(cljrs_runtime::tiered::sync::Worker::Jit);
     }
 }
 

@@ -390,6 +390,12 @@ Everything else here is crate-private: `jit_compiler::compile_jit` (and
 `compile_jit_poll`, test-only, for the `^:async` state-machine ABI) and
 `jit_worker`.
 
+Compile requests are counted through `cljrs_runtime::tiered::sync`
+(`note_enqueued` / `note_finished`), so `sync::wait_idle` covers the JIT
+worker too.  `tests/tier_histories_jit.rs` replays the runtime crate's
+execution-history matrix (issue #510) with this backend attached, asserting
+each promoted function actually reached native code.
+
 Environment: `CLJRS_JIT_THRESHOLD` (Tier-1 calls before compiling, default
 1000), `CLJRS_OSR_THRESHOLD` (loop back-edges before an OSR-entry compile),
 `CLJRS_JIT_NO_SPEC=1` (compile generically), `CLJRS_JIT_DEOPT_LIMIT` (entry-guard

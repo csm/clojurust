@@ -31,6 +31,7 @@ pub mod ir_interp;
 pub mod jit_state;
 pub mod lower;
 mod lower_worker;
+pub mod sync;
 pub mod tiers;
 
 pub use crate::env::callback::invoke;

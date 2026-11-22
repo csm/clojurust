@@ -100,7 +100,12 @@ pub(crate) fn enqueue(req: LowerRequest) -> bool {
             .expect("failed to spawn IR lowering worker thread");
         tx
     });
-    tx.try_send(req).is_ok()
+    crate::tiered::sync::note_enqueued(crate::tiered::sync::Worker::Lower);
+    let accepted = tx.try_send(req).is_ok();
+    if !accepted {
+        crate::tiered::sync::note_finished(crate::tiered::sync::Worker::Lower);
+    }
+    accepted
 }
 
 fn worker_loop(rx: Receiver<LowerRequest>) {
@@ -118,6 +123,7 @@ fn worker_loop(rx: Receiver<LowerRequest>) {
                 req.name
             );
         }
+        crate::tiered::sync::note_finished(crate::tiered::sync::Worker::Lower);
     }
 }
 
@@ -131,6 +137,8 @@ fn process_request(req: &LowerRequest) {
     };
     let ir_cache = tiers.ir_cache();
     let globals_id = tiers.globals_id();
+    let checkpoint = |phase| crate::tiered::sync::checkpoint(phase, req.name.as_deref());
+    checkpoint(crate::tiered::sync::Phase::Dequeued);
 
     // Arities lowered (or already cached), collected for the cross-defn
     // registry: (arity_id, param_count, is_variadic, ir).
@@ -173,6 +181,9 @@ fn process_request(req: &LowerRequest) {
             ) {
                 Ok((mut ir, _used)) => {
                     ir.seed_reprs = crate::tiered::lower::seed_reprs_from_hints(&arity.param_hints);
+                    // The externals are snapshotted; a rebind from here on
+                    // must be caught by the re-check below.
+                    checkpoint(crate::tiered::sync::Phase::Lowered);
                     let ir = Arc::new(ir);
                     ir_cache.store(id, ir.clone());
                     if crate::tiered::defn_registry::relower_marked(id) {
@@ -182,6 +193,7 @@ fn process_request(req: &LowerRequest) {
                         continue;
                     }
                     tiers.jit().on_ir_published(id);
+                    checkpoint(crate::tiered::sync::Phase::Published);
                     registered.push((id, arity.params.len(), arity.rest_param.is_some(), ir));
                     tracing::debug!(
                         target: "ir",
