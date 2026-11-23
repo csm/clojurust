@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use cljrs_gc::{GcPtr, MarkVisitor, Trace};
 use cljrs_runtime::env::env::GlobalEnv;
 use cljrs_runtime::env::error::{EvalError, EvalResult};
-use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize};
+use cljrs_value::clone::{CloneError, StagedMessage, deserialize, serialize_staged};
 use cljrs_value::{
     Arity, NativeFn, NativeObject, NativeObjectBox, PersistentVector, Value, ValueError,
     ValueResult, gc_native_object,
@@ -286,8 +286,9 @@ fn builtin_isolate_take(args: &[Value]) -> ValueResult<Value> {
 /// One `spawn-isolate` argument in the form that crosses to the new thread.
 #[cfg(not(target_arch = "wasm32"))]
 enum ArgWire {
-    /// Plain data, deep-copied.
-    Value(SerializedValue),
+    /// Plain data, deep-copied; its governor charge is held until the new
+    /// isolate decodes it.
+    Value(StagedMessage),
     /// A clone of an isolate-channel sender.
     Tx(IsolateSender),
     /// An isolate-channel receiver, moved out of the spawning isolate.
@@ -298,13 +299,30 @@ enum ArgWire {
 #[cfg(not(target_arch = "wasm32"))]
 enum IsolateFailure {
     /// The entry function threw a value that could be copied back.
-    Thrown(SerializedValue),
+    Thrown(StagedMessage),
     /// Anything else, as text.
     Message(String),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-type IsolateOutcome = Result<SerializedValue, IsolateFailure>;
+type IsolateOutcome = Result<StagedMessage, IsolateFailure>;
+
+/// Stage a value that crosses a `spawn-isolate` boundary (an argument, the
+/// result, or a thrown value) within `limit` wire bytes, charged to the
+/// governor as a message (issue #518): shared structure that would expand
+/// past the limit is refused after building at most `limit` bytes.
+#[cfg(not(target_arch = "wasm32"))]
+fn stage_crossing(v: &Value, limit: usize) -> Result<StagedMessage, CloneError> {
+    serialize_staged(v, limit, cljrs_gc::MemoryClass::MessageQueue)
+}
+
+/// The byte limit for one `spawn-isolate` crossing: the governor's
+/// `queue_limit`, the same default bound as one isolate-channel queue.  All
+/// arguments of one call share it.
+#[cfg(not(target_arch = "wasm32"))]
+fn crossing_limit() -> usize {
+    cljrs_gc::governor().config().queue_limit
+}
 
 /// Stack size of a spawned isolate's OS thread. Matches the CLI's main thread
 /// so code that runs on the main isolate also fits on a spawned one.
@@ -378,6 +396,8 @@ fn builtin_spawn_isolate(args: &[Value]) -> ValueResult<Value> {
     // argument leaves the caller's channels as they were.
     let start = web_time::Instant::now();
     let mut copied_bytes = 0u64;
+    let limit = crossing_limit();
+    let mut staged_bytes = 0usize;
     let mut wire = Vec::with_capacity(args.len() - 1);
     let mut receivers: Vec<GcPtr<NativeObjectBox>> = Vec::new();
     for (index, arg) in args[1..].iter().enumerate() {
@@ -406,10 +426,22 @@ fn builtin_spawn_isolate(args: &[Value]) -> ValueResult<Value> {
                 receivers.push(obj.clone());
                 wire.push(None);
             }
-            other => match serialize(other) {
-                Ok(sv) => {
-                    copied_bytes += sv.byte_size() as u64;
-                    wire.push(Some(ArgWire::Value(sv)));
+            other => match stage_crossing(other, limit - staged_bytes) {
+                Ok(staged) => {
+                    copied_bytes += staged.value.byte_size() as u64;
+                    staged_bytes += staged.wire_size;
+                    wire.push(Some(ArgWire::Value(staged)));
+                }
+                Err(CloneError::TooLarge { at_least, .. }) => {
+                    return Err(ValueError::Other(format!(
+                        "spawn-isolate: argument {}: {}; the arguments of one call may \
+                         copy at most {limit} bytes",
+                        index + 1,
+                        CloneError::TooLarge {
+                            at_least: at_least + staged_bytes,
+                            limit,
+                        }
+                    )));
                 }
                 Err(e @ CloneError::NotShareable { .. }) => {
                     return Err(ValueError::Other(format!(
@@ -457,8 +489,10 @@ fn builtin_spawn_isolate(args: &[Value]) -> ValueResult<Value> {
 
     Ok(spawn_future(async move {
         match result.await {
-            Ok(Ok(sv)) => Ok(deserialize(sv)),
-            Ok(Err(IsolateFailure::Thrown(sv))) => Err(EvalError::Thrown(deserialize(sv))),
+            Ok(Ok(staged)) => Ok(deserialize(staged.value)),
+            Ok(Err(IsolateFailure::Thrown(staged))) => {
+                Err(EvalError::Thrown(deserialize(staged.value)))
+            }
             Ok(Err(IsolateFailure::Message(message))) => Err(EvalError::Runtime(format!(
                 "isolate {entry} failed: {message}"
             ))),
@@ -513,7 +547,7 @@ fn run_isolate_entry(
     let args: Vec<Value> = wire
         .into_iter()
         .map(|arg| match arg {
-            ArgWire::Value(sv) => deserialize(sv),
+            ArgWire::Value(staged) => deserialize(staged.value),
             ArgWire::Tx(tx) => Value::NativeObject(gc_native_object(CljIsolateTx { tx })),
             ArgWire::Rx(rx) => Value::NativeObject(gc_native_object(CljIsolateRx {
                 rx: Mutex::new(Some(rx)),
@@ -531,18 +565,27 @@ fn run_isolate_entry(
         Ok(value) => {
             let _root = cljrs_runtime::env::gc_roots::root_value(&value);
             let start = web_time::Instant::now();
-            let sv = serialize(&value).map_err(|e| {
+            let staged = stage_crossing(&value, crossing_limit()).map_err(|e| {
                 IsolateFailure::Message(format!(
                     "the result cannot be returned to the spawning isolate: {e}"
                 ))
             })?;
-            cljrs_gc::GC_STATS.record_boundary_crossing(sv.byte_size() as u64, start.elapsed());
-            Ok(sv)
+            cljrs_gc::GC_STATS
+                .record_boundary_crossing(staged.value.byte_size() as u64, start.elapsed());
+            Ok(staged)
         }
         Err(EvalError::Thrown(thrown)) => {
             let _root = cljrs_runtime::env::gc_roots::root_value(&thrown);
-            Err(match serialize(&thrown) {
-                Ok(sv) => IsolateFailure::Thrown(sv),
+            Err(match stage_crossing(&thrown, crossing_limit()) {
+                Ok(staged) => IsolateFailure::Thrown(staged),
+                // Printing the value would expand it just the same.
+                Err(e @ (CloneError::TooLarge { .. } | CloneError::MemoryLimitExceeded(_))) => {
+                    IsolateFailure::Message(format!(
+                        "Unhandled exception of type `{}` that cannot be returned to the \
+                         spawning isolate: {e}",
+                        thrown.type_name()
+                    ))
+                }
                 Err(_) => IsolateFailure::Message(format!("Unhandled exception: {thrown}")),
             })
         }

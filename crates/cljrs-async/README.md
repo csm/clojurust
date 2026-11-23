@@ -194,6 +194,13 @@ fiber until the entry function returns.
 - **Arguments and result.** Deep-copied with the rules of `isolate-put!`, and
   metered the same way. A `shared-atom` crosses by reference. An unshareable
   argument throws at the `spawn-isolate` call, before a thread starts.
+  Each crossing (all arguments of one call together, the result, a thrown
+  value) is staged with `clone::serialize_staged` against the governor's
+  `queue_limit` and charged as `MessageQueue` until the other side decodes
+  it (issue #518), so a small value whose shared parts would expand past the
+  limit is refused after at most that many bytes: a "too large" error at the
+  call site for arguments, or a failed future for the result or a thrown
+  value (the thrown value is then reported by type, not printed).
 - **Channel ends.** An isolate-channel end passed as a direct argument (not
   nested in a collection) crosses as itself. A sender is cloned. A receiver
   *moves*: it works in the new isolate, and using it afterwards in the
@@ -477,7 +484,7 @@ The fiber module and corosensei dependency are excluded on `wasm32`.
 | `tests/error_propagation.rs` | integration tests for the `<?` family and `clojure.rust.error` helpers |
 | `tests/async_fn.rs` | integration tests for dispatch, `await`, `deref` enforcement, `timeout`/`alts`/`alt`, channels, Phase F utilities, and `<!!`/`>!!` |
 | `tests/worker_pool.rs` | Phase A2 integration tests: offload, concurrent tasks, handle spawning, LocalSet context, singleton invariant, byte processing round-trip |
-| `tests/spawn_isolate.rs` | Clojure-level `spawn-isolate` tests: result copy-back, parallel spawns, `^:async` entry points, nested spawns, thrown `ex-info`, moved channel ends, spawn-site argument errors, in-isolate failures, refusal without a factory |
+| `tests/spawn_isolate.rs` | Clojure-level `spawn-isolate` tests: result copy-back, parallel spawns, `^:async` entry points, nested spawns, thrown `ex-info`, moved channel ends, spawn-site argument errors, in-isolate failures, refusal without a factory, shared-structure arguments/results/throws refused at the queue limit (#518) |
 | `tests/isolate_channel_clj.rs` | Clojure-level Phase B2 tests: `isolate-chan` pair, put/poll round-trip, FIFO order, located error on a non-shareable value, async `isolate-take!`, byte-limited channel reports `Full` at the put site |
 | `tests/no_gc_lifetimes.rs` | No-GC lifetime tests for task results, lazy sequences, top-level accumulators, and replacement of cell contents |
 | `tests/thread_limits.rs` | Resource failures bypass catch clauses through every channel consumer. Unread thread failures report once at destruction or teardown |

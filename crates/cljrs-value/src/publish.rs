@@ -13,6 +13,9 @@
 //! * **Dirty** — a region-tagged box was found.  The value is deep-copied to
 //!   the GC heap via the structured-clone machinery (`crate::clone`) and the
 //!   copy is stored instead; the region originals die with their region.
+//!   The copy is staged with [`crate::clone::serialize_staged`] against the
+//!   governor's `queue_limit`; a value whose shared parts would expand past
+//!   it (or a strict-governor refusal) poisons the regions instead.
 //! * **Opaque** — the value (or a part of it) cannot be scanned or copied
 //!   (closures, unrealized lazy seqs, native objects, region-allocated
 //!   mutable cells whose identity a copy would break).  The publisher then
@@ -31,7 +34,7 @@
 
 use crate::Value;
 #[cfg(not(feature = "no-gc"))]
-use crate::clone::{deserialize, serialize};
+use crate::clone::{deserialize, serialize_staged};
 #[cfg(not(feature = "no-gc"))]
 use crate::types::{DelayState, LazySeqState};
 #[cfg(not(feature = "no-gc"))]
@@ -82,14 +85,14 @@ fn tag_opaque<T: Trace + 'static>(p: &GcPtr<T>) -> Scan {
 }
 
 #[cfg(not(feature = "no-gc"))]
-fn scan_map(m: &MapValue) -> Scan {
+fn scan_map(m: &MapValue, seen: &mut Seen) -> Scan {
     let mut acc = match m {
         MapValue::Array(p) => tag(p),
         MapValue::Hash(p) => tag(p),
         MapValue::Sorted(p) => tag(p),
     };
     m.for_each(|k, v| {
-        acc = acc.join(scan(k)).join(scan(v));
+        acc = acc.join(scan_in(k, seen)).join(scan_in(v, seen));
     });
     acc
 }
@@ -104,7 +107,52 @@ fn scan_map(m: &MapValue) -> Scan {
 /// captured environments are invisible here.
 #[cfg(not(feature = "no-gc"))]
 fn scan(v: &Value) -> Scan {
+    scan_in(v, &mut Seen::default())
+}
+
+/// Addresses of the compound nodes a scan has already visited.
+#[cfg(not(feature = "no-gc"))]
+type Seen = std::collections::HashSet<usize>;
+
+/// The identity of a node with children, for [`Seen`].
+#[cfg(not(feature = "no-gc"))]
+fn node_addr(v: &Value) -> Option<usize> {
+    fn addr<T>(p: &T) -> usize {
+        p as *const T as usize
+    }
+    Some(match v {
+        Value::List(p) => addr(p.get()),
+        Value::Vector(p) => addr(p.get()),
+        Value::Queue(p) => addr(p.get()),
+        Value::Map(MapValue::Array(p)) => addr(p.get()),
+        Value::Map(MapValue::Hash(p)) => addr(p.get()),
+        Value::Map(MapValue::Sorted(p)) => addr(p.get()),
+        Value::Set(SetValue::Hash(p)) => addr(p.get()),
+        Value::Set(SetValue::Sorted(p)) => addr(p.get()),
+        Value::Cons(p) => addr(p.get()),
+        Value::ObjectArray(p) => addr(p.get()),
+        Value::TypeInstance(p) => addr(p.get()),
+        Value::Error(p) => addr(p.get()),
+        Value::LazySeq(p) => addr(p.get()),
+        Value::Delay(p) => addr(p.get()),
+        Value::WithMeta(inner, _) => addr(&**inner),
+        _ => return None,
+    })
+}
+
+/// [`scan`] with memo: a node reached again (shared structure, or a cycle
+/// through a mutable array) was or is being scanned already, and its result
+/// is joined in from that visit, so it counts as `Clean` here.  Without
+/// this, a small graph that shares its parts many times would be walked
+/// once per path (issue #518).
+#[cfg(not(feature = "no-gc"))]
+fn scan_in(v: &Value, seen: &mut Seen) -> Scan {
     use Scan::*;
+    if let Some(addr) = node_addr(v)
+        && !seen.insert(addr)
+    {
+        return Clean;
+    }
     match v {
         // Immediates and Arc-backed values: nothing region-allocated.
         Value::Nil
@@ -127,20 +175,31 @@ fn scan(v: &Value) -> Scan {
         Value::Keyword(p) => tag(p),
 
         // Collections: box tag plus children.
-        Value::List(p) => p.get().iter().fold(tag(p), |acc, e| acc.join(scan(e))),
-        Value::Vector(p) => p.get().iter().fold(tag(p), |acc, e| acc.join(scan(e))),
-        Value::Queue(p) => p.get().iter().fold(tag(p), |acc, e| acc.join(scan(e))),
-        Value::Map(m) => scan_map(m),
+        Value::List(p) => p
+            .get()
+            .iter()
+            .fold(tag(p), |acc, e| acc.join(scan_in(e, seen))),
+        Value::Vector(p) => p
+            .get()
+            .iter()
+            .fold(tag(p), |acc, e| acc.join(scan_in(e, seen))),
+        Value::Queue(p) => p
+            .get()
+            .iter()
+            .fold(tag(p), |acc, e| acc.join(scan_in(e, seen))),
+        Value::Map(m) => scan_map(m, seen),
         Value::Set(s) => {
             let t = match s {
                 SetValue::Hash(p) => tag(p),
                 SetValue::Sorted(p) => tag(p),
             };
-            s.iter().fold(t, |acc, e| acc.join(scan(e)))
+            s.iter().fold(t, |acc, e| acc.join(scan_in(e, seen)))
         }
         Value::Cons(p) => {
             let c = p.get();
-            tag(p).join(scan(&c.head)).join(scan(&c.tail))
+            tag(p)
+                .join(scan_in(&c.head, seen))
+                .join(scan_in(&c.tail, seen))
         }
 
         // Primitive arrays: contents are scalars; only the box matters.
@@ -154,19 +213,21 @@ fn scan(v: &Value) -> Scan {
         Value::CharArray(p) => tag(p),
         Value::ObjectArray(p) => {
             let guard = p.get().0.lock().unwrap();
-            guard.iter().fold(tag(p), |acc, e| acc.join(scan(e)))
+            guard
+                .iter()
+                .fold(tag(p), |acc, e| acc.join(scan_in(e, seen)))
         }
 
         // Wrappers.
-        Value::WithMeta(inner, meta) => scan(inner).join(scan(meta)),
-        Value::Reduced(inner) => scan(inner),
+        Value::WithMeta(inner, meta) => scan_in(inner, seen).join(scan_in(meta, seen)),
+        Value::Reduced(inner) => scan_in(inner, seen),
 
         // Records.
         Value::TypeInstance(p) => {
             if p.get().mutable.is_some() {
                 Opaque
             } else {
-                tag(p).join(scan_map(&p.get().fields))
+                tag(p).join(scan_map(&p.get().fields, seen))
             }
         }
 
@@ -175,16 +236,16 @@ fn scan(v: &Value) -> Scan {
             let mut acc = tag(p);
             let e = p.get();
             if let Some(data) = &e.data {
-                acc = acc.join(scan_map(data));
+                acc = acc.join(scan_map(data, seen));
             }
             if let crate::error::ValueError::Thrown(t) = &e.error {
-                acc = acc.join(scan(t));
+                acc = acc.join(scan_in(t, seen));
             }
             let mut cause = e.cause.clone();
             while let Some(c) = cause {
                 acc = acc.join(tag(&c));
                 if let Some(data) = &c.get().data {
-                    acc = acc.join(scan_map(data));
+                    acc = acc.join(scan_map(data, seen));
                 }
                 cause = c.get().cause.clone();
             }
@@ -199,7 +260,7 @@ fn scan(v: &Value) -> Scan {
                 return Opaque;
             }
             match &*p.get().state.lock().unwrap() {
-                LazySeqState::Forced(v) | LazySeqState::Thrown(v) => t.join(scan(v)),
+                LazySeqState::Forced(v) | LazySeqState::Thrown(v) => t.join(scan_in(v, seen)),
                 LazySeqState::Error(_) => t,
                 LazySeqState::Pending(_) | LazySeqState::Realizing { .. } => Opaque,
             }
@@ -210,7 +271,7 @@ fn scan(v: &Value) -> Scan {
                 return Opaque;
             }
             match &*p.get().state.lock().unwrap() {
-                DelayState::Forced(v) | DelayState::Thrown(v) => t.join(scan(v)),
+                DelayState::Forced(v) | DelayState::Thrown(v) => t.join(scan_in(v, seen)),
                 DelayState::Pending(_) | DelayState::Realizing { .. } => Opaque,
                 DelayState::Error(_) => t,
             }
@@ -268,8 +329,18 @@ pub fn publish_value(v: Value) -> Value {
     // scan: every active region is already guaranteed to outlive its values.
     match scan(&v) {
         Scan::Clean => v,
-        Scan::Dirty => match serialize(&v) {
-            Ok(wire) => deserialize(wire),
+        // The promotion copy is bounded like any other wire copy (issue
+        // #518): a small region graph with shared parts would otherwise
+        // expand into one copy per occurrence.  Past the governor's
+        // `queue_limit`, or on a strict-governor refusal, keeping the
+        // regions alive (poisoning) is the cheaper safe answer.
+        Scan::Dirty => match serialize_staged(
+            &v,
+            cljrs_gc::governor().config().queue_limit,
+            cljrs_gc::MemoryClass::Runtime,
+        ) {
+            // The staging charge covers the wire copy until it is decoded.
+            Ok(staged) => deserialize(staged.value),
             Err(_) => {
                 cljrs_gc::region::poison_active_regions();
                 v
@@ -841,6 +912,52 @@ mod tests {
         );
         cljrs_gc::region::close_region(region);
         assert_eq!(format!("{out}"), "[[42]]");
+    }
+
+    /// `[v v]` nested `depth` times on the heap over a region-allocated
+    /// leaf vector: `depth + 2` boxes whose copy has ~2^depth nodes.
+    fn shared_graph_over(region: &mut Region, depth: usize) -> Value {
+        let mut v = region_vec(region, vec![Value::Long(7)]);
+        for _ in 0..depth {
+            v = Value::Vector(GcPtr::new(PersistentVector::from_iter([v.clone(), v])));
+        }
+        v
+    }
+
+    /// Issue #518: a tiny dirty graph whose shared parts would expand past
+    /// the staging limit poisons the regions instead of being copied (and
+    /// is scanned once per node, not once per path).  Finishes only if both
+    /// the scan and the copy are bounded.
+    #[test]
+    fn shared_dirty_graph_poisons_instead_of_expanding() {
+        let mut region = Box::new(Region::new());
+        let v = shared_graph_over(&mut region, 40);
+        unsafe { cljrs_gc::region::push_region_raw(region.as_mut() as *mut Region) };
+        assert!(!cljrs_gc::region::active_regions_are_poisoned());
+        let out = publish_value(v.clone());
+        assert!(
+            cljrs_gc::region::active_regions_are_poisoned(),
+            "an over-limit promotion must poison the active regions"
+        );
+        let (Value::Vector(before), Value::Vector(after)) = (&v, &out) else {
+            panic!()
+        };
+        assert!(GcPtr::ptr_eq(before, after), "the value is stored as-is");
+        cljrs_gc::region::close_region(region);
+    }
+
+    #[test]
+    fn small_shared_dirty_graph_is_still_promoted() {
+        let mut region = Region::new();
+        let v = shared_graph_over(&mut region, 3);
+        let _guard = unsafe { RegionGuard::new(&mut region) };
+        let out = publish_value(v);
+        assert!(!cljrs_gc::region::active_regions_are_poisoned());
+        assert_eq!(scan(&out), Scan::Clean, "promoted copy must be heap-only");
+        assert_eq!(
+            format!("{out}"),
+            "[[[[7] [7]] [[7] [7]]] [[[7] [7]] [[7] [7]]]]"
+        );
     }
 
     #[test]

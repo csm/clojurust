@@ -20,6 +20,9 @@ const WORKER_NS: &str = r#"
 (defn closure-result [] (fn [] 1))
 (defn ^:async async-add [a b] (+ a b))
 (defn nested [n] @(spawn-isolate 'test.worker/add n 1))
+(defn shared [n] (loop [i 0 v 0] (if (= i n) v (recur (inc i) [v v]))))
+(defn throw-shared [n] (throw (ex-info "big" {:v (shared n)})))
+(defn ignore [_] :ignored)
 (defn echo [rx tx]
   (loop [n 0]
     (if-let [m @(isolate-take! rx)]
@@ -187,4 +190,41 @@ fn a_runtime_without_a_factory_refuses_to_spawn() {
         .expect_err("expected an error")
         .to_string();
     assert!(message.contains("cannot start isolates"), "{message}");
+}
+
+// Issue #518: `[v v]` nested 40 deep is 41 objects whose copy would have
+// ~2^41 nodes. Each crossing must be refused at the governor's queue limit
+// instead of expanding; these tests finish only if the copy is bounded.
+
+#[test]
+fn shared_graph_argument_is_refused_at_the_spawn_site() {
+    let message = error(
+        "(spawn-isolate 'test.worker/ignore
+           (loop [i 0 v 0] (if (= i 40) v (recur (inc i) [v v]))))",
+    );
+    assert!(message.contains("argument 1"), "{message}");
+    assert!(message.contains("too large"), "{message}");
+    // A small shared graph still crosses.
+    assert_eq!(
+        printed("(let [v [0 0]] @(spawn-isolate 'test.worker/ignore [v v]))"),
+        ":ignored"
+    );
+}
+
+#[test]
+fn shared_graph_result_fails_the_future() {
+    let message = error("@(spawn-isolate 'test.worker/shared 40)");
+    assert!(message.contains("cannot be returned"), "{message}");
+    assert!(message.contains("too large"), "{message}");
+    assert_eq!(
+        printed("@(spawn-isolate 'test.worker/shared 2)"),
+        "[[0 0] [0 0]]"
+    );
+}
+
+#[test]
+fn shared_graph_thrown_value_fails_the_future_without_printing_it() {
+    let message = error("@(spawn-isolate 'test.worker/throw-shared 40)");
+    assert!(message.contains("Unhandled exception"), "{message}");
+    assert!(message.contains("too large"), "{message}");
 }

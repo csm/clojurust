@@ -65,12 +65,19 @@ pub fn execute_with_host(
 `execute` creates and bootstraps a new interpreter environment inside one
 bounded arena, structured-clones arguments in, invokes the function under a
 gas meter and transaction capability policy, clones a pure-data result out,
-and then destroys the whole environment.
+and then destroys the whole environment. The result copy is staged with
+`clone::serialize_staged` against 4 × `TxLimits::memory_bytes` wire bytes
+(a wire node is under 3× the arena slot it copies, so anything the arena could
+hold without sharing fits; issue #518): a result whose shared structure would
+expand past that fails with `TxError::MemoryExhausted` (`requested` is the
+wire bytes counted so far) instead of being built outside the arena.
 
 `execute_with_host` additionally interns each `HostApi` entry as a namespaced
 native function (e.g. `my.host/lookup`) in the invocation environment. Host
 calls are the only seam through the isolation boundary: arguments are
-serialized out of the arena and validated as pure data, the result is
+serialized out of the arena (together bounded like the result; over it, the
+call fails with a catchable "too large" evaluation error) and validated as
+pure data, the result is
 validated and structured-cloned back in (arena allocation, so the invocation's
 managed-memory budget covers it). Host functions should be deterministic,
 side-effect-free reads; a returned `Err` surfaces inside the transaction as an

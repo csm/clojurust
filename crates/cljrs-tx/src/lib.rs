@@ -5,10 +5,11 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use cljrs_gc::MemoryClass;
 use cljrs_reader::{Form, Parser};
 use cljrs_runtime::env::env::Env;
 use cljrs_runtime::env::error::EvalError;
-use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize};
+use cljrs_value::clone::{CloneError, SerializedValue, deserialize, serialize_staged};
 use cljrs_value::{Arity, NativeFn, Value, ValueError};
 
 /// A parsed transaction function expression.
@@ -190,6 +191,21 @@ pub enum TxError {
     Panic,
 }
 
+/// Wire bytes one copy out of the arena (the result, or one host call's
+/// arguments) may take, per byte of the invocation's memory budget.
+///
+/// A wire node (`size_of::<SerializedValue>()`, 64 bytes on 64-bit targets)
+/// is under three times the arena slot of the `Value` it copies, so any
+/// value the arena could hold without sharing fits; the bound exists to
+/// stop shared structure from expanding into one copy per occurrence
+/// (issue #518), which this cuts off after a few budgets' worth of work.
+const WIRE_BYTES_PER_BUDGET_BYTE: usize = 4;
+
+/// The wire-byte limit for one copy out of an arena with `memory_bytes`.
+fn wire_limit(memory_bytes: usize) -> usize {
+    memory_bytes.saturating_mul(WIRE_BYTES_PER_BUDGET_BYTE)
+}
+
 /// Execute `program` in a fresh GC-less arena and return an owned data value.
 ///
 /// Inputs are structured-cloned into the invocation. The environment, inputs,
@@ -260,7 +276,7 @@ fn execute_inner(
         globals.intern(
             &entry.namespace,
             Arc::clone(&entry.name),
-            host_native(entry),
+            host_native(entry, limits.memory_bytes),
         );
     }
     let mut env = Env::new(globals, "user");
@@ -274,9 +290,25 @@ fn execute_inner(
     let function = env.eval(program.form()).map_err(map_eval_error)?;
     let result = cljrs_runtime::env::apply::apply_value(&function, args, &mut env)
         .map_err(map_eval_error)?;
-    let result = serialize(&result).map_err(|error| {
+    // The result copy is bounded by the invocation's memory budget (issue
+    // #518): shared structure in the arena would otherwise expand into one
+    // copy per occurrence, outside the arena and uncharged.
+    let result = serialize_staged(
+        &result,
+        wire_limit(limits.memory_bytes),
+        MemoryClass::Runtime,
+    )
+    .map(|staged| staged.value)
+    .map_err(|error| {
         // Resource limits keep their own TxError kinds, as on the host-call
         // argument path, instead of reading as a data (clone) error.
+        if let CloneError::TooLarge { at_least, limit } = error {
+            return TxError::MemoryExhausted {
+                limit,
+                used: invocation.accounted_bytes(),
+                requested: at_least,
+            };
+        }
         match cljrs_value::clone::resource_value_error(&error) {
             Some(ValueError::Cancelled) => TxError::Cancelled,
             Some(ValueError::GasExhausted) => TxError::GasExhausted,
@@ -302,27 +334,49 @@ fn execute_inner(
 /// isolation seam: arguments are serialized out of the arena and validated,
 /// the result is validated and deserialized back in (arena allocation, so
 /// the managed-memory budget covers it).
-fn host_native(entry: &HostEntry) -> Value {
+///
+/// The arguments of one host call together copy at most
+/// [`wire_limit`]`(memory_bytes)`, counted and charged before allocation.
+fn host_native(entry: &HostEntry, memory_bytes: usize) -> Value {
     let function = Arc::clone(&entry.function);
+    let limit = wire_limit(memory_bytes);
     let native = NativeFn::with_closure(
         Arc::clone(&entry.name),
         Arity::Variadic { min: 0 },
         move |args| {
+            let mut copied = 0usize;
+            let mut charges = Vec::with_capacity(args.len());
             let args: Vec<SerializedValue> = args
                 .iter()
-                .map(serialize)
-                .collect::<Result<_, _>>()
+                .map(|arg| {
+                    let staged = serialize_staged(arg, limit - copied, MemoryClass::Runtime)
+                        .map_err(|error| match error {
+                            CloneError::TooLarge { at_least, .. } => CloneError::TooLarge {
+                                at_least: at_least + copied,
+                                limit,
+                            },
+                            error => error,
+                        })?;
+                    copied += staged.wire_size;
+                    charges.push(staged.charge);
+                    Ok(staged.value)
+                })
+                .collect::<Result<_, CloneError>>()
                 .map_err(|error| {
-                // Cancellation and resource limits stay uncatchable.
-                cljrs_value::clone::resource_value_error(&error)
-                    .unwrap_or_else(|| ValueError::Other(format!("host call argument: {error}")))
-            })?;
+                    // Cancellation and resource limits stay uncatchable.
+                    cljrs_value::clone::resource_value_error(&error).unwrap_or_else(|| {
+                        ValueError::Other(format!("host call argument: {error}"))
+                    })
+                })?;
             for arg in &args {
                 validate_pure_data(arg).map_err(|what| {
                     ValueError::Other(format!("host call argument is not pure data: {what}"))
                 })?;
             }
-            let result = function.call(&args).map_err(ValueError::Other)?;
+            let result = function.call(&args).map_err(ValueError::Other);
+            // The staging charges cover the argument copies for the call.
+            drop(charges);
+            let result = result?;
             validate_pure_data(&result).map_err(|what| {
                 ValueError::Other(format!("host result is not pure data: {what}"))
             })?;
@@ -528,7 +582,9 @@ mod tests {
     fn impure_host_result_is_rejected() {
         let mut host = HostApi::new();
         host.define("test.host", "leak", |_: &[SerializedValue]| {
-            Ok(SerializedValue::ByteBlob(Arc::from(&b"shared"[..])))
+            Ok(SerializedValue::ByteBlob(Arc::new(
+                cljrs_value::ByteBlob::new(&b"shared"[..]),
+            )))
         });
         let program = TxProgram::parse("(fn [] (test.host/leak))").unwrap();
         let error = execute_with_host(&program, vec![], TxLimits::default(), &host).unwrap_err();
@@ -609,5 +665,39 @@ mod tests {
             other => panic!("expected symbol, got {other:?}"),
         };
         assert_eq!(symbol_name(&first), symbol_name(&second));
+    }
+
+    /// `[v v]` nested 40 deep: 41 arena objects whose wire form would have
+    /// ~2^41 nodes.
+    const SHARED_GRAPH: &str = "(loop [i 0 v 0] (if (= i 40) v (recur (inc i) [v v])))";
+
+    /// Issue #518: a tiny shared result is refused at the memory budget
+    /// instead of expanding outside the arena.  Finishes only if bounded.
+    #[test]
+    fn shared_graph_result_is_refused_at_the_memory_budget() {
+        let program = TxProgram::parse(&format!("(fn [] {SHARED_GRAPH})")).unwrap();
+        let limits = TxLimits::default();
+        let error = execute(&program, vec![], limits).unwrap_err();
+        assert!(
+            matches!(error, TxError::MemoryExhausted { limit, requested, .. }
+                if limit == wire_limit(limits.memory_bytes) && requested > limit),
+            "got {error:?}"
+        );
+    }
+
+    /// Issue #518: host-call arguments are bounded by the same budget.
+    #[test]
+    fn shared_graph_host_argument_is_refused_at_the_memory_budget() {
+        let mut host = HostApi::new();
+        host.define("test.host", "sink", |_: &[SerializedValue]| {
+            Ok(SerializedValue::Nil)
+        });
+        let program =
+            TxProgram::parse(&format!("(fn [] (test.host/sink {SHARED_GRAPH}))")).unwrap();
+        let error = execute_with_host(&program, vec![], TxLimits::default(), &host).unwrap_err();
+        assert!(
+            matches!(&error, TxError::Evaluation(text) if text.contains("too large")),
+            "got {error:?}"
+        );
     }
 }
