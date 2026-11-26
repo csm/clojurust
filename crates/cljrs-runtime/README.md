@@ -98,6 +98,7 @@ src/
     ir_cache.rs         — IrCache: per-runtime cache of lowered IR keyed by arity ID
     lower.rs            — orchestrates the pure-Rust cljrs_ir::lower pipeline
     lower_worker.rs     — background IR-lowering worker thread ("cljrs-ir-lower")
+    sync.rs             — observable/pausable worker state: idle tracking, phase checkpoints (#510)
     defn_registry.rs    — cross-defn IR registry and invalidation edges
     jit_state.rs        — JitState: per-runtime JIT counters, native-fn table, epochs, OSR slots
     tiers.rs            — Tiers: one runtime's IrCache + JitState, and the index of live ones
@@ -198,6 +199,19 @@ tests/
   auto_resolution_properties.rs   — tree-walker behavior
   gas_meter_ir.rs, versioned_ir.rs, partition_ir.rs, destructure_lowering.rs,
   osr_transfer.rs, region_phi_uaf.rs — tiered behavior
+  history/mod.rs                   — execution-history differential harness and
+                                     its deterministic matrix (issue #510):
+                                     histories of define / capture / promote /
+                                     rebind / pause-worker / observe steps,
+                                     replayed under several tier configs and
+                                     checked against explicit expectations and
+                                     each other
+  tier_histories.rs                — the matrix under tree-walk, background IR
+                                     and the default tiered path
+  tier_histories_eager.rs          — the matrix under forced eager lowering
+                                     (process-wide switch, own binary); the
+                                     native-JIT run is
+                                     cljrs-compiler/tests/tier_histories_jit.rs
   loop_binding_scope.rs            — `loop` initializers see earlier loop-locals
                                      and `recur` rebinds in parallel, in the
                                      tree-walker and the IR tier (issue #477)
@@ -1555,6 +1569,36 @@ Tier 1 IR ──(jit_threshold, 1000 calls; counter restarts at IR publish)─�
   (kills all IR), `CLJRS_EAGER_LOWER=1` (restores eager lowering — also the
   escape hatch for the known limitation that a long-running loop entered at
   Tier 0 cannot tier up mid-call, since the tree-walker has no OSR).
+
+### Worker synchronization (`sync`, issue #510)
+
+Process-wide, observable state for the background lowering and JIT compile
+workers, so tests can order events against them without sleeping.
+
+```rust
+pub enum Phase { Dequeued, Lowered, Published }   // lowering-worker checkpoints
+pub enum Worker { Lower, Jit }
+pub struct SyncTimeout { waiting_for, last_phase, pending_lower, pending_jit } // Display + Error
+
+pub fn note_enqueued(Worker);        // count a request before handing it over
+pub fn note_finished(Worker);        // ... and when it is done (or refused)
+pub fn pending(Worker) -> usize;     // accepted and not yet finished
+pub fn checkpoint(Phase, name: Option<&str>); // worker side; parks if the phase is armed
+pub fn note_invalidated();           // a rebind dropped dependent IR
+pub fn invalidations() -> u64;
+
+pub fn pause_at(Phase);              // the next request to reach Phase parks
+pub fn release();                    // disarm and unpark
+pub fn wait_paused(Phase, Duration) -> Result<(), SyncTimeout>;
+pub fn wait_idle(Duration) -> Result<(), SyncTimeout>; // nothing queued or running
+```
+
+`Lowered` is reached once per arity after its externals are snapshotted and
+before its IR is stored; `Published` after the rebind re-check succeeded and
+before the defn is registered for cross-defn optimization.  The JIT backend in
+`cljrs-compiler` counts its compile requests through `note_enqueued` /
+`note_finished`.  With no pause armed the cost is one uncontended mutex
+acquisition per request per phase.
 
 ### Per-runtime tier state (`tiers`)
 

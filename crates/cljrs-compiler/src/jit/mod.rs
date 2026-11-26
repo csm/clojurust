@@ -70,11 +70,22 @@ pub struct Jit {
     queue: SyncSender<jit_worker::CompileRequest>,
 }
 
+impl Jit {
+    /// Hand `req` to the worker, counted for `tiered::sync::wait_idle`.
+    fn send(&self, req: jit_worker::CompileRequest) {
+        use cljrs_runtime::tiered::sync;
+        sync::note_enqueued(sync::Worker::Jit);
+        if self.queue.try_send(req).is_err() {
+            sync::note_finished(sync::Worker::Jit);
+        }
+    }
+}
+
 impl JitBackend for Jit {
     fn enqueue_function(&self, tiers: Weak<Tiers>, arity_id: u64, ir_func: Arc<IrFunction>) {
         // Non-blocking: if the queue is full, skip this compile request.
         // The function keeps running at Tier 1 until the queue drains.
-        let _ = self.queue.try_send(jit_worker::CompileRequest::Function {
+        self.send(jit_worker::CompileRequest::Function {
             tiers,
             arity_id,
             ir_func,
@@ -88,7 +99,7 @@ impl JitBackend for Jit {
         header: u32,
         ir_func: Arc<IrFunction>,
     ) {
-        let _ = self.queue.try_send(jit_worker::CompileRequest::Osr {
+        self.send(jit_worker::CompileRequest::Osr {
             tiers,
             arity_id,
             header,
